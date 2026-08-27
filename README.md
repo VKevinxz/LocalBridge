@@ -6,7 +6,7 @@ explícita, auditable y revocable.
 **Versión actual:** `v1.1.0` · **Plataforma:** Windows x64 · **Estado:** preview ·
 **Licencia:** `UNLICENSED`
 
-[Descargar la última versión](https://github.com/VKevinxz/LocalBridge/releases/latest) ·
+[Descargar la preview](https://github.com/VKevinxz/LocalBridge/releases/tag/preview-v1.1.0.1) ·
 [Repositorio oficial](https://github.com/VKevinxz/LocalBridge) ·
 [Instalación](docs/GETTING_STARTED.md) ·
 [Avisos de Windows](docs/WINDOWS_INSTALLATION.md) ·
@@ -76,9 +76,11 @@ vinculan a referencias opacas y listeners cuya propiedad vuelve a comprobar Loca
 
 ## Instalación rápida
 
-1. Abre [Releases](https://github.com/VKevinxz/LocalBridge/releases/latest).
+1. Abre [Releases](https://github.com/VKevinxz/LocalBridge/releases) y elige la preview
+   indicada en la documentación de descargas.
 2. Descarga el instalador de Windows y `SHA256SUMS.txt` de la misma versión.
-3. Verifica el hash y la firma digital antes de ejecutar el archivo.
+3. Verifica el hash. Las versiones estables exigen firma digital; el prerelease de
+   evaluación actual está identificado expresamente como **sin firma**.
 4. Completa el asistente y selecciona una carpeta de prueba.
 5. Registra el conector MCP en ChatGPT siguiendo la guía mostrada por la aplicación.
 
