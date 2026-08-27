@@ -28,7 +28,7 @@ describe.runIf(process.platform === "win32")("toolchains canónicos", () => {
   it("fija ruta, versión y hash; un cambio posterior invalida la evidencia", async () => {
     const { root, executable } = await fakeNpmRoot();
     const resolved = await resolveSetupToolchain("npm", [root]);
-    expect(resolved.executablePath.toLocaleLowerCase()).toBe(executable.toLocaleLowerCase());
+    expect(resolved.executablePath.toLocaleLowerCase()).toBe((await realpath(executable)).toLocaleLowerCase());
     expect(resolved.version).toBe("10.9.0");
     expect(await revalidateSetupToolchain(resolved)).toBe(true);
     await writeFile(executable, "console.log('changed');\n");
