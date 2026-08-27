@@ -6,7 +6,7 @@ explícita, auditable y revocable.
 **Versión actual:** `v1.1.0` · **Plataforma:** Windows x64 · **Estado:** preview ·
 **Licencia:** `UNLICENSED`
 
-[Descargar la preview](https://github.com/VKevinxz/LocalBridge/releases/tag/preview-v1.1.0.1) ·
+[Descargar la preview](https://github.com/VKevinxz/LocalBridge/releases/tag/preview-v1.1.0.2) ·
 [Repositorio oficial](https://github.com/VKevinxz/LocalBridge) ·
 [Instalación](docs/GETTING_STARTED.md) ·
 [Avisos de Windows](docs/WINDOWS_INSTALLATION.md) ·

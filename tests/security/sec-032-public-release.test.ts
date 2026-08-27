@@ -59,7 +59,7 @@ describe('SEC-032 — publicación fail-closed', () => {
 
   it('el prerelease sin firma está aislado, rotulado y conserva evidencias', async () => {
     const workflow = await source('.github/workflows/preview-release.yml');
-    const notes = await source('docs/releases/preview-v1.1.0.1.md');
+    const notes = await source('docs/releases/preview-v1.1.0.2.md');
     const stableWorkflow = await source('.github/workflows/release.yml');
 
     expect(workflow).toContain('preview-v*.*.*.*');

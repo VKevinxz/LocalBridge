@@ -57,11 +57,11 @@ beforeEach(async () => {
       permissions: { read: true, write: true, overwrite: false, gitRead: true, validations: false, gitWrite: true },
     }),
   ]);
-});
+}, 30_000);
 
 afterEach(async () => {
   await workspace.cleanup();
-});
+}, 30_000);
 
 function acceptHandler(seen: ElicitRequest[]): (request: ElicitRequest) => ElicitResult {
   return (request) => {

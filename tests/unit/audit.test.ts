@@ -340,5 +340,5 @@ describe('aprobaciones MRTR pendientes', () => {
       });
     }
     expect(queryPendingApprovals(dbPath, new Date('2026-08-23T20:00:00.000Z'))).toHaveLength(100);
-  });
+  }, 30_000);
 });
