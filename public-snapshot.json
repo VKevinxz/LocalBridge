@@ -44,7 +44,8 @@
     "docs/assets/screenshots/activity.png",
     "docs/assets/screenshots/dashboard.png",
     "docs/assets/screenshots/projects.png",
-    "docs/releases/v1.1.0.md"
+    "docs/releases/v1.1.0.md",
+    "docs/releases/preview-v1.1.0.1.md"
   ],
   "excludedDirectoryNames": [
     ".git",

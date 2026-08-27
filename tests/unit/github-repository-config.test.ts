@@ -39,7 +39,9 @@ describe.skipIf(process.platform !== 'win32')('configuración del repositorio Gi
     expect(tags).toMatchObject({
       target: 'tag',
       enforcement: 'active',
-      conditions: { ref_name: { include: ['refs/tags/v*'], exclude: [] } },
+      conditions: {
+        ref_name: { include: ['refs/tags/v*', 'refs/tags/preview-v*'], exclude: [] },
+      },
     });
     expect(tags.rules.map(({ type }) => type)).toEqual(['creation', 'update', 'deletion']);
   });

@@ -1,0 +1,173 @@
+name: Unsigned Windows evaluation preview
+
+on:
+  push:
+    tags:
+      - "preview-v*.*.*.*"
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+concurrency:
+  group: preview-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  preview:
+    name: Build unsigned evaluation preview
+    runs-on: windows-latest
+    timeout-minutes: 50
+
+    steps:
+      - name: Checkout exact preview tag
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+
+      - name: Validate preview tag, versions and notes
+        id: preview
+        shell: pwsh
+        run: |
+          $tag = $env:GITHUB_REF_NAME
+          if ($tag -notmatch '^preview-v(?<version>\d+\.\d+\.\d+)\.(?<sequence>[1-9]\d*)$') {
+            throw "Preview tags must use preview-vMAJOR.MINOR.PATCH.SEQUENCE."
+          }
+          $version = $Matches['version']
+          $sequence = $Matches['sequence']
+          git merge-base --is-ancestor HEAD origin/main
+          if ($LASTEXITCODE -ne 0) {
+            throw "Preview tags must point to a commit contained in main."
+          }
+          $manifests = @(
+            'package.json',
+            'apps/desktop/package.json',
+            'apps/server/package.json'
+          )
+          foreach ($manifest in $manifests) {
+            $actual = (Get-Content -LiteralPath $manifest -Raw | ConvertFrom-Json).version
+            if ($actual -ne $version) {
+              throw "$manifest has version $actual; expected $version."
+            }
+          }
+          $notes = "docs/releases/$tag.md"
+          if (-not (Test-Path -LiteralPath $notes -PathType Leaf)) {
+            throw "Missing preview notes: $notes"
+          }
+          ./scripts/check-publication-readiness.ps1
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "sequence=$sequence" >> $env:GITHUB_OUTPUT
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@008330803749db0355799c700092d9a85fd074e9 # v6.0.9
+        with:
+          version: 9.12.0
+
+      - name: Install Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: 22.18.0
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+
+      - name: Install locked dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build verified Windows process host
+        run: pnpm build:native:test
+
+      - name: Verify source
+        shell: pwsh
+        run: |
+          ./scripts/check-github-workflows.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          pnpm lint
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          pnpm typecheck
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          pnpm test
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          pnpm test:sec
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          pnpm audit --audit-level moderate
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          ./scripts/audit-public-history.ps1
+
+      - name: Build unsigned Windows installer
+        run: pnpm --filter @localbridge/desktop package:win
+
+      - name: Smoke packaged desktop window
+        shell: pwsh
+        run: |
+          ./scripts/smoke-packaged-desktop.ps1 `
+            -ExecutablePath 'apps/desktop/release/win-unpacked/LocalBridge MCP.exe'
+
+      - name: Verify installer is explicitly unsigned
+        id: installer
+        shell: pwsh
+        run: |
+          $installers = @(Get-ChildItem -LiteralPath apps/desktop/release -Filter '*Setup*.exe' -File)
+          if ($installers.Count -ne 1) {
+            throw "Expected exactly one installer; found $($installers.Count)."
+          }
+          $signature = Get-AuthenticodeSignature -LiteralPath $installers[0].FullName
+          if ($signature.Status -ne 'NotSigned') {
+            throw "Evaluation preview must be explicitly unsigned; found $($signature.Status)."
+          }
+          "installer=$($installers[0].FullName)" >> $env:GITHUB_OUTPUT
+
+      - name: Download pinned Syft
+        id: syft
+        uses: anchore/sbom-action/download-syft@fbfd9c6c189226748411491745178e0c2017392d # v0.20.10
+        with:
+          syft-version: v1.51.0
+
+      - name: Generate SPDX SBOM
+        shell: pwsh
+        run: |
+          $version = '${{ steps.preview.outputs.version }}'
+          & '${{ steps.syft.outputs.cmd }}' scan `
+            'dir:apps/desktop/release/win-unpacked' `
+            --source-name 'localbridge-desktop-windows' `
+            --source-version $version `
+            --output "spdx-json=apps/desktop/release/localbridge-v$version.spdx.json"
+
+      - name: Generate release checksums
+        shell: pwsh
+        run: |
+          ./scripts/generate-release-checksums.ps1 `
+            -ReleaseDirectory apps/desktop/release `
+            -Version '${{ steps.preview.outputs.version }}'
+
+      - name: Attest installer and SBOM
+        uses: actions/attest@c32b4b8b198b65d0bd9d63490e847ff7b53989d4 # v4.0.0
+        with:
+          subject-path: ${{ steps.installer.outputs.installer }}
+          sbom-path: apps/desktop/release/localbridge-v${{ steps.preview.outputs.version }}.spdx.json
+
+      - name: Publish evaluation prerelease
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = $env:GITHUB_REF_NAME
+          $version = '${{ steps.preview.outputs.version }}'
+          $sequence = '${{ steps.preview.outputs.sequence }}'
+          $releaseDir = (Resolve-Path -LiteralPath apps/desktop/release).Path
+          $assetNames = @(
+            "LocalBridge MCP Setup $version.exe",
+            "LocalBridge MCP Setup $version.exe.blockmap",
+            "localbridge-v$version.spdx.json",
+            'SHA256SUMS.txt'
+          )
+          $assets = foreach ($name in $assetNames) {
+            $asset = Join-Path $releaseDir $name
+            if (-not (Test-Path -LiteralPath $asset -PathType Leaf)) {
+              throw "Missing preview asset: $name"
+            }
+            $asset
+          }
+          gh release create $tag @assets --verify-tag --prerelease `
+            --title "LocalBridge MCP v$version - Preview $sequence (sin firma)" `
+            --notes-file "docs/releases/$tag.md"

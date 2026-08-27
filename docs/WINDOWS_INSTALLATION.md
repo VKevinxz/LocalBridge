@@ -9,7 +9,9 @@ repositorio.
 1. Descarga el instalador y `SHA256SUMS.txt` de la misma release.
 2. Calcula el hash SHA-256 y comprueba que coincida exactamente.
 3. Analiza el archivo con Microsoft Defender actualizado.
-4. Abre **Propiedades → Firmas digitales** y confirma una firma válida con timestamp.
+4. En una release estable, abre **Propiedades → Firmas digitales** y confirma una firma
+   válida con timestamp. En un prerelease sin firma, confirma que la nota lo declare de
+   forma explícita y que el archivo coincida con su checksum y atestación.
 5. Revisa las notas de versión y prueba primero con una carpeta sin datos sensibles.
 
 ## SmartScreen y Smart App Control
@@ -44,7 +46,9 @@ Hasta que un certificado Authenticode válido firme el ejecutable, Windows puede
 
 Un candidato no firmado sirve únicamente para evaluación controlada y no debe anunciarse
 como release estable. La opción recomendada es una VM o Windows Sandbox sin proyectos ni
-credenciales reales. Conserva SmartScreen y Defender activos.
+credenciales reales. Conserva SmartScreen y Defender activos. El checksum, el SBOM y la
+atestación de GitHub ayudan a comprobar integridad y procedencia, pero no otorgan identidad
+Authenticode al editor.
 
 ## Después de instalar
 

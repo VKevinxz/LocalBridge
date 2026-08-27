@@ -1,19 +1,17 @@
 # Descargas y verificación
 
-## Versión recomendada
+## Preview disponible
 
-- [Última release publicada](https://github.com/VKevinxz/LocalBridge/releases/latest)
+- [Preview v1.1.0.1 sin firma](https://github.com/VKevinxz/LocalBridge/releases/tag/preview-v1.1.0.1)
 - [Repositorio oficial](https://github.com/VKevinxz/LocalBridge)
-- [Release v1.1.0](https://github.com/VKevinxz/LocalBridge/releases/tag/v1.1.0)
-- [Instalador Windows x64 v1.1.0](https://github.com/VKevinxz/LocalBridge/releases/download/v1.1.0/LocalBridge%20MCP%20Setup%201.1.0.exe)
-- [Checksums v1.1.0](https://github.com/VKevinxz/LocalBridge/releases/download/v1.1.0/SHA256SUMS.txt)
+- [Instalador Windows x64 v1.1.0 — sin firma](https://github.com/VKevinxz/LocalBridge/releases/download/preview-v1.1.0.1/LocalBridge%20MCP%20Setup%201.1.0.exe)
+- [Checksums de la preview](https://github.com/VKevinxz/LocalBridge/releases/download/preview-v1.1.0.1/SHA256SUMS.txt)
 
-Los enlaces estarán disponibles cuando el mantenedor publique la release correspondiente.
 No descargues instaladores desde issues, adjuntos, mirrors o repositorios de terceros.
 
-Las releases estables exigen firma digital. Un candidato local o artefacto de evaluación
-sin firma no debe presentarse como release oficial. Consulta
-[Instalación segura en Windows](WINDOWS_INSTALLATION.md) antes de probarlo.
+Esta descarga es un **prerelease de evaluación sin firma Authenticode**, no una versión
+estable. Windows puede mostrar `Editor desconocido` o bloquearla. Mantén las protecciones
+del sistema activas y consulta [Instalación segura en Windows](WINDOWS_INSTALLATION.md).
 
 ## Verificar integridad
 
@@ -21,9 +19,10 @@ sin firma no debe presentarse como release oficial. Consulta
 Get-FileHash -Algorithm SHA256 '.\LocalBridge MCP Setup 1.1.0.exe'
 ```
 
-Compara el resultado completo con `SHA256SUMS.txt`. Después verifica en las propiedades del
-archivo que la firma Authenticode sea válida y tenga timestamp. Una release pública de
-LocalBridge falla cerrada si no dispone de firma, checksum, SBOM y procedencia.
+Compara el resultado completo con `SHA256SUMS.txt`. La preview publicada se verifica además
+con SBOM y atestación de GitHub, pero aparecerá como `NotSigned`: esas evidencias no
+sustituyen una firma Authenticode. Una release **estable** de LocalBridge sigue fallando
+cerrada si no dispone de firma válida con timestamp, checksum, SBOM y procedencia.
 
 ## Compatibilidad
 

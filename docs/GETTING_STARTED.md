@@ -5,7 +5,8 @@ publicados en la sección oficial de Releases del repositorio.
 
 ## 1. Descargar y verificar
 
-1. Abre [la última release oficial](https://github.com/VKevinxz/LocalBridge/releases/latest).
+1. Abre [la página oficial de Releases](https://github.com/VKevinxz/LocalBridge/releases)
+   y selecciona la preview indicada en [Descargas](DOWNLOADS.md).
 2. Descarga `LocalBridge MCP Setup <versión>.exe` y `SHA256SUMS.txt`.
 3. Calcula el hash:
 
@@ -14,10 +15,12 @@ Get-FileHash -Algorithm SHA256 '.\LocalBridge MCP Setup 1.1.0.exe'
 ```
 
 4. Comprueba que coincide exactamente con `SHA256SUMS.txt`.
-5. Abre **Propiedades → Firmas digitales** y verifica una firma válida con timestamp.
+5. Si es una release estable, verifica su firma válida con timestamp. Si la nota la marca
+   como preview sin firma, comprueba el checksum y la atestación y evalúala solo en un
+   entorno no crítico.
 
-Si el hash o la firma no coinciden, no ejecutes el instalador y repórtalo mediante el canal
-de seguridad.
+Si el hash no coincide, o una release estable carece de la firma prometida, no ejecutes el
+instalador y repórtalo mediante el canal de seguridad.
 
 Un candidato no firmado puede mostrar advertencias o ser bloqueado por Windows. No
 desactives protecciones del sistema para instalarlo; sigue
