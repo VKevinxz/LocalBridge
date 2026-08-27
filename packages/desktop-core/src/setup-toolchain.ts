@@ -107,9 +107,19 @@ export async function resolveSetupToolchain(
   roots: readonly string[] = approvedRoots(manager),
 ): Promise<ResolvedSetupToolchain> {
   for (const directory of roots) {
-    const rootKey = canonicalKey(directory);
+    let canonicalRoot: string;
+    try {
+      const suppliedRoot = await lstat(directory);
+      if (!suppliedRoot.isDirectory() || suppliedRoot.isSymbolicLink()) continue;
+      canonicalRoot = await realpath(directory);
+      const canonicalRootStat = await lstat(canonicalRoot);
+      if (!canonicalRootStat.isDirectory() || canonicalRootStat.isSymbolicLink()) continue;
+    } catch {
+      continue;
+    }
+    const rootKey = canonicalKey(canonicalRoot);
     for (const fileName of MANAGER_FILES[manager]) {
-      const candidate = path.join(directory, fileName);
+      const candidate = path.join(canonicalRoot, fileName);
       try {
         const link = await lstat(candidate);
         if (!link.isFile() || link.isSymbolicLink()) continue;
