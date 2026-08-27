@@ -1,0 +1,59 @@
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
+
+$insideWorktree = git rev-parse --is-inside-work-tree
+if ($LASTEXITCODE -ne 0 -or $insideWorktree -ne 'true') {
+  throw 'Run this script inside a Git worktree.'
+}
+
+$sensitivePathPattern = '(?i)(^|/)(\.env($|\.)|workspaces\.json$|desktop-settings\.json$|tunnel-key\.enc$|[^/]+\.(pfx|p12|pem|key|exe|zip)$)'
+$secretPattern = '(-----BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY-----|gh[pousr]_[A-Za-z0-9]{20,}|sk-[A-Za-z0-9_-]{20,}|AKIA[A-Z0-9]{16})'
+$knownSyntheticFixtureBlobs = @{
+  # Contiene deliberadamente un encabezado ficticio para probar la denylist.
+  'tests/helpers/fixtures.ts' = '954e7af24d02cc8f37a884b0bca7e1642fede8ce'
+}
+$findings = [Collections.Generic.List[string]]::new()
+$commits = @(git rev-list --all)
+if ($LASTEXITCODE -ne 0) {
+  throw 'Could not enumerate Git history.'
+}
+
+foreach ($commit in $commits) {
+  $short = $commit.Substring(0, 12)
+  $paths = @(git ls-tree -r --name-only $commit)
+  if ($LASTEXITCODE -ne 0) {
+    throw "Could not inspect paths in $short."
+  }
+  $sensitivePaths = @($paths | Where-Object { $_ -match $sensitivePathPattern })
+  if ($sensitivePaths.Count -gt 0) {
+    $findings.Add("$short contains sensitive artifact paths: $($sensitivePaths -join ', ')")
+  }
+
+  $rawMatches = @(git grep -I -l -E -e $secretPattern $commit -- 2>$null)
+  if ($LASTEXITCODE -gt 1) {
+    throw "Could not scan content in $short."
+  }
+  $matchedFiles = @(
+    foreach ($match in $rawMatches) {
+      $separator = $match.IndexOf(':')
+      $filePath = if ($separator -ge 0) { $match.Substring($separator + 1) } else { $match }
+      $allowedBlob = $knownSyntheticFixtureBlobs[$filePath]
+      if ($null -ne $allowedBlob) {
+        $actualBlob = git rev-parse "$($commit):$filePath"
+        if ($LASTEXITCODE -ne 0) { throw "Could not verify fixture blob in $short." }
+        if ($actualBlob -eq $allowedBlob) { continue }
+      }
+      $filePath
+    }
+  )
+  if ($matchedFiles.Count -gt 0) {
+    $findings.Add("$short contains possible secret material in: $($matchedFiles -join ', ')")
+  }
+}
+
+if ($findings.Count -gt 0) {
+  $findings | ForEach-Object { Write-Error $_ }
+  throw 'Public history audit failed. Findings list file names only; inspect locally.'
+}
+
+Write-Output "Public history audit passed across $($commits.Count) commit(s)."

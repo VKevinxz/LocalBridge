@@ -1,0 +1,8 @@
+{
+  "extends": "./tsconfig.base.json",
+  "include": ["apps/**/*.ts", "packages/**/*.ts", "tests/**/*.ts", "*.config.ts"],
+  // `apps/desktop` tiene su propio par de tsconfigs (proceso main/preload en Node,
+  // renderer en DOM) — sus libs son incompatibles entre sí y con este tsconfig
+  // plano, así que se typechecka aparte (`pnpm --filter @localbridge/desktop typecheck`).
+  "exclude": ["**/node_modules", "**/dist", "apps/desktop/**"]
+}

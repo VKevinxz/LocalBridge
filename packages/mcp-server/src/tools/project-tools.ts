@@ -1,0 +1,113 @@
+import type { McpServer } from "@modelcontextprotocol/server";
+import { z } from "zod";
+
+import { DevelopmentBrokerError } from "@localbridge/development";
+import { ERROR_CODES, LocalBridgeError, type ErrorCode } from "@localbridge/shared";
+
+import type { ToolContext } from "../tool-context.js";
+import { toolError, toolSuccess } from "../tool-result.js";
+
+const projectIdSchema = z.string().regex(/^project_[a-f0-9]{24}$/);
+const projectSchema = z.object({
+  projectId: projectIdSchema,
+  name: z.string().max(80),
+  description: z.string().max(240),
+  workspaceIds: z.array(z.string().max(160)).min(1).max(16),
+  applicationId: z.string().regex(/^app_[a-f0-9]{16,32}$/).optional(),
+  setupStatus: z.enum(["draft", "review-required", "ready", "interrupted"]),
+}).strict();
+const planSummarySchema = z.object({
+  planSha256: z.string().regex(/^[a-f0-9]{64}$/),
+  topology: z.enum(["single", "monorepo", "multi-repo"]),
+  workspaceCount: z.number().int().min(1).max(16),
+  installCount: z.number().int().min(0).max(64),
+  packageManagers: z.array(z.enum(["npm", "pnpm", "yarn"])).max(3),
+  directDependencyCount: z.number().int().min(0).max(100_000),
+  directDevDependencyCount: z.number().int().min(0).max(100_000),
+  serverCount: z.number().int().min(0).max(128),
+  validationCount: z.number().int().min(0).max(128),
+  serviceCount: z.number().int().min(0).max(8),
+  actionKinds: z.array(z.enum(["node-install", "git-init", "persist-profiles", "persist-application", "finalize-topology"])).max(5),
+}).strict();
+const statusSchema = z.object({
+  project: projectSchema,
+  setup: z.object({
+    phase: z.enum(["draft", "analyzing", "awaiting-local-review", "installing", "finalizing", "ready", "failed", "interrupted", "cancelled"]),
+    policy: z.enum(["restricted", "compatible", "manual"]),
+    errorCode: z.string().regex(/^[A-Z][A-Z0-9_]{1,63}$/).optional(),
+    plan: planSummarySchema.optional(),
+  }).strict().optional(),
+}).strict();
+
+function client(ctx: ToolContext) {
+  if (ctx.developmentClient === undefined) throw new LocalBridgeError("FEATURE_UNAVAILABLE");
+  return ctx.developmentClient;
+}
+
+function mapBrokerError(error: unknown): unknown {
+  if (!(error instanceof DevelopmentBrokerError)) return error;
+  if ((ERROR_CODES as readonly string[]).includes(error.code)) return new LocalBridgeError(error.code as ErrorCode);
+  return new LocalBridgeError("INTERNAL_ERROR");
+}
+
+function audit(ctx: ToolContext, tool: string, projectId?: string) {
+  return {
+    dbPath: ctx.config.auditDbPath,
+    tool,
+    riskLevel: tool === "project.setup.refresh" ? "R2" : "R1",
+    startedAt: Date.now(),
+    ...(projectId === undefined ? {} : { resource: projectId }),
+  };
+}
+
+export function registerProjectListTool(server: McpServer, ctx: ToolContext): void {
+  const outputSchema = z.object({ projects: z.array(projectSchema).max(500) }).strict();
+  server.registerTool("project.list", {
+    title: "List assisted local projects",
+    description: "Lists user-created project groupings and readiness. It returns opaque references only and never returns roots, commands, manifests, dependencies, logs, environment values or permissions.",
+    inputSchema: z.object({}).strict(),
+    outputSchema,
+    annotations: { readOnlyHint: true, idempotentHint: true, destructiveHint: false, openWorldHint: false },
+  }, async () => {
+    const auditBase = audit(ctx, "project.list");
+    try {
+      return toolSuccess(outputSchema.parse(await client(ctx).call("project.list", {})), { context: auditBase, logger: ctx.logger });
+    } catch (error) {
+      return toolError(mapBrokerError(error), ctx.logger, { tool: "project.list" }, auditBase);
+    }
+  });
+}
+
+export function registerProjectSetupStatusTool(server: McpServer, ctx: ToolContext): void {
+  server.registerTool("project.setup.status", {
+    title: "Read assisted project setup status",
+    description: "Returns a bounded setup summary. It cannot approve, install, execute, change permissions or expose the frozen plan contents.",
+    inputSchema: z.object({ projectId: projectIdSchema }).strict(),
+    outputSchema: statusSchema,
+    annotations: { readOnlyHint: true, idempotentHint: true, destructiveHint: false, openWorldHint: false },
+  }, async ({ projectId }) => {
+    const auditBase = audit(ctx, "project.setup.status", projectId);
+    try {
+      return toolSuccess(statusSchema.parse(await client(ctx).call("project.setup.status", { projectId })), { context: auditBase, logger: ctx.logger });
+    } catch (error) {
+      return toolError(mapBrokerError(error), ctx.logger, { tool: "project.setup.status", projectId }, auditBase);
+    }
+  });
+}
+
+export function registerProjectSetupRefreshTool(server: McpServer, ctx: ToolContext): void {
+  server.registerTool("project.setup.refresh", {
+    title: "Refresh a project setup proposal",
+    description: "Re-scans manifests inside an already authorized project and refreshes its local proposal. It never installs dependencies, runs commands, initializes Git, changes permissions, approves a plan or finalizes profiles. The human must review and execute the proposal in LocalBridge.",
+    inputSchema: z.object({ projectId: projectIdSchema }).strict(),
+    outputSchema: statusSchema,
+    annotations: { readOnlyHint: false, idempotentHint: true, destructiveHint: false, openWorldHint: false },
+  }, async ({ projectId }) => {
+    const auditBase = audit(ctx, "project.setup.refresh", projectId);
+    try {
+      return toolSuccess(statusSchema.parse(await client(ctx).call("project.setup.refresh", { projectId })), { context: auditBase, logger: ctx.logger });
+    } catch (error) {
+      return toolError(mapBrokerError(error), ctx.logger, { tool: "project.setup.refresh", projectId }, auditBase);
+    }
+  });
+}

@@ -1,0 +1,61 @@
+# Changelog
+
+Los cambios relevantes de LocalBridge MCP se documentan aquí. El proyecto sigue
+[Semantic Versioning](https://semver.org/lang/es/) y publica artefactos mediante GitHub
+Releases.
+
+## [1.1.0] — 2026-08-27
+
+### Añadido
+
+- onboarding project-first de seis pasos;
+- detección read-only de carpeta vacía, repositorio, monorepo y multirepo;
+- selección de confianza y presets Guiados antes de registrar el proyecto;
+- estado de onboarding reanudable y compatible con downgrade.
+
+### Mejorado
+
+- comprobación automática del runtime incluido;
+- finalización transaccional con rollback e idempotencia;
+- interfaz compacta y recuperación orientada a acciones.
+
+### Seguridad
+
+- selector nativo representado mediante token efímero ligado a la ventana;
+- `Agente en proyecto` continúa cerrado sin sandbox demostrado;
+- no cambió el catálogo MCP ni el protocolo `2026-07-28`.
+
+## [1.0.0] — 2026-08-26
+
+- proyectos como unidad principal de producto;
+- terminal interactiva opcional bajo confianza local explícita;
+- listeners verificados y navegador multiservicio derivado de procesos administrados;
+- intervención humana temporal y vista en vivo no interactiva.
+
+## [0.9.0] — 2026-08-25
+
+- creación y adopción asistida de proyectos;
+- detección de topología y preparación mediante acciones cerradas;
+- compatibilidad aditiva con configuraciones existentes.
+
+## [0.3.0] — 2026-08-23
+
+- runtime de desarrollo controlado;
+- procesos aprobados, logs, puertos verificados y navegador local aislado.
+
+## [0.2.0] — 2026-08-22
+
+- operaciones Git de escritura con aprobación humana;
+- aplicación de escritorio autocontenida y administración de conexión.
+
+## [0.1.0] — 2026-08-21
+
+- baseline funcional de filesystem, Git de lectura, validaciones, auditoría y Secure MCP
+  Tunnel.
+
+[1.1.0]: https://github.com/VKevinxz/LocalBridge/releases/tag/v1.1.0
+[1.0.0]: https://github.com/VKevinxz/LocalBridge/releases/tag/v1.0.0
+[0.9.0]: https://github.com/VKevinxz/LocalBridge/releases/tag/v0.9.0
+[0.3.0]: https://github.com/VKevinxz/LocalBridge/releases/tag/v0.3.0
+[0.2.0]: https://github.com/VKevinxz/LocalBridge/releases/tag/v0.2.0
+[0.1.0]: https://github.com/VKevinxz/LocalBridge/releases/tag/v0.1.0

@@ -1,0 +1,17 @@
+node_modules/
+dist/
+*.log
+*.tsbuildinfo
+
+# Salidas de build de la UI de escritorio
+apps/desktop/out/
+apps/desktop/release/
+# Artefactos de terceros verificados y copiados al instalador
+apps/desktop/vendor/
+
+# Nunca versionar configuración local con rutas de workspaces ni credenciales
+.env
+.env.*
+localbridge.db
+localbridge.db-*
+data/

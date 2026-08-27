@@ -1,0 +1,165 @@
+import { mkdtemp, rm } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+
+import { afterEach, describe, expect, it } from "vitest";
+
+import { TerminalSupervisor } from "@localbridge/development";
+import type { ProjectCatalogRecord, ProjectTrustRecord } from "@localbridge/workspace";
+
+const roots: string[] = [];
+const supervisors: TerminalSupervisor[] = [];
+afterEach(async () => {
+  await Promise.all(supervisors.splice(0).map((supervisor) => supervisor.close()));
+  await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
+});
+
+async function fixture(mode: ProjectTrustRecord["mode"] = "full-host", onProjectActivity?: (projectId: string) => void) {
+  const root = await mkdtemp(path.join(os.tmpdir(), "localbridge-terminal-"));
+  roots.push(root);
+  const project: ProjectCatalogRecord = {
+    id: "project_aaaaaaaaaaaaaaaaaaaaaaaa",
+    displayName: "Terminal",
+    description: "",
+    selectedRoot: root,
+    state: "ready",
+    topology: "empty",
+    nodes: [],
+    derivedScopes: [{ relativePath: ".", source: "root", status: "active" }],
+    compatibilityRefs: [],
+    scanFingerprint: "a".repeat(64),
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  };
+  const trust: ProjectTrustRecord = {
+    projectId: project.id,
+    mode,
+    deviceBinding: "b".repeat(64),
+    status: "active",
+    networkPolicy: mode === "full-host" ? "user-session" : "closed",
+    acceptedRiskVersion: mode === "full-host" ? "1.0.0" : null,
+    reviewedAt: new Date().toISOString(),
+  };
+  const supervisor = new TerminalSupervisor({
+    helperPath: path.resolve("apps/desktop/vendor/process-host/localbridge-process-host.exe"),
+    parentPid: process.pid,
+    deviceBinding: "b".repeat(64),
+    loadProject: async (id) => id === project.id ? project : undefined,
+    loadTrust: async (id) => id === project.id ? trust : undefined,
+    ...(onProjectActivity === undefined ? {} : { onProjectActivity }),
+  });
+  supervisors.push(supervisor);
+  return { project, trust, supervisor };
+}
+
+async function waitForOutput(supervisor: TerminalSupervisor, projectId: string, sessionId: string, expected: string) {
+  const deadline = Date.now() + 8_000;
+  let observed = "";
+  while (Date.now() < deadline) {
+    const result = await supervisor.read(projectId, sessionId, 0, 65_536);
+    observed = result.entries.map((entry) => entry.text).join("");
+    if (observed.includes(expected)) return result;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  throw new Error(`No apareció ${expected}; salida=${JSON.stringify(observed)}`);
+}
+
+describe.skipIf(process.platform !== "win32")("terminal supervisor Windows", () => {
+  it("TERM-001/003: inicia ConPTY, acepta stdin y detiene el árbol", async () => {
+    const { project, supervisor } = await fixture();
+    const session = await supervisor.start(project.id, "start-1");
+    await supervisor.write(project.id, session.sessionId, "Write-Output TERMINAL_OK\r\n", "write-1");
+    const output = await waitForOutput(supervisor, project.id, session.sessionId, "TERMINAL_OK");
+    expect(output.entries.map((entry) => entry.text).join("")).toContain("TERMINAL_OK");
+    expect((await supervisor.stop(project.id, session.sessionId)).state).toBe("stopped");
+  });
+
+  it("TRUST-001/SEC-124: guided y project-agent sin sandbox fallan cerrados", async () => {
+    const guided = await fixture("guided");
+    await expect(guided.supervisor.start(guided.project.id)).rejects.toMatchObject({ code: "CAPABILITY_DISABLED" });
+    const sandboxed = await fixture("project-agent");
+    await expect(sandboxed.supervisor.start(sandboxed.project.id)).rejects.toMatchObject({ code: "SANDBOX_UNAVAILABLE" });
+  });
+
+  it("TERM-006: operationId es idempotente y no cruza sesiones", async () => {
+    const { project, supervisor } = await fixture();
+    const first = await supervisor.start(project.id, "same-start");
+    expect((await supervisor.start(project.id, "same-start")).sessionId).toBe(first.sessionId);
+    await supervisor.write(project.id, first.sessionId, "Write-Output ONCE\r\n", "same-write");
+    await supervisor.write(project.id, first.sessionId, "Write-Output ONCE\r\n", "same-write");
+    await expect(supervisor.write(project.id, first.sessionId, "Write-Output OTHER\r\n", "same-write"))
+      .rejects.toMatchObject({ code: "IDEMPOTENCY_CONFLICT" });
+  });
+
+  it("INT-003/005: atribuye un listener real al árbol de la terminal", async () => {
+    const { project, supervisor } = await fixture();
+    const session = await supervisor.start(project.id, "listener-start");
+    await supervisor.write(
+      project.id,
+      session.sessionId,
+      `node -e "const s=require('http').createServer((q,r)=>r.end('ok'));s.listen(0,'::1',()=>console.log('Local: http://localhost:'+s.address().port+'/'))"\r\n`,
+      "listener-write",
+    );
+    const deadline = Date.now() + 8_000;
+    let listener: Awaited<ReturnType<TerminalSupervisor["status"]>>["listeners"][number] | undefined;
+    while (Date.now() < deadline && listener === undefined) {
+      listener = (await supervisor.status(project.id, session.sessionId)).listeners[0];
+      if (listener === undefined) await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    await waitForOutput(supervisor, project.id, session.sessionId, "Local: http://localhost:");
+    expect(listener).toMatchObject({ bindScope: "loopback", addressFamily: "ipv6", exclusive: true });
+    const resolved = await supervisor.resolveListener(project.id, session.sessionId, listener!.listenerRef);
+    expect(resolved).toMatchObject({
+      processId: session.sessionId,
+      profile: "terminal",
+      origin: listener!.origin,
+      technicalOrigin: `http://[::1]:${listener!.port}`,
+      browserOrigin: `http://localhost:${listener!.port}`,
+      trustMode: "full-host",
+    });
+    await supervisor.stop(project.id, session.sessionId);
+  });
+
+  it("DISC-003/INT-001: notifica actividad para reconciliar nuevos hijos", async () => {
+    const observed: string[] = [];
+    const { project, supervisor } = await fixture("full-host", (projectId) => observed.push(projectId));
+    const session = await supervisor.start(project.id, "graph-start");
+    await supervisor.write(project.id, session.sessionId, "Write-Output GRAPH_CHANGED\r\n", "graph-write");
+    await waitForOutput(supervisor, project.id, session.sessionId, "GRAPH_CHANGED");
+    expect(observed).toContain(project.id);
+  });
+
+  it("TERM-011: no hereda secretos internos ni flags del host Electron", async () => {
+    const previousSecret = process.env["LOCALBRIDGE_SYNTHETIC_SECRET"];
+    const previousElectron = process.env["ELECTRON_SYNTHETIC_FLAG"];
+    process.env["LOCALBRIDGE_SYNTHETIC_SECRET"] = "terminal-secret-must-not-leak";
+    process.env["ELECTRON_SYNTHETIC_FLAG"] = "electron-flag-must-not-leak";
+    try {
+      const { project, supervisor } = await fixture();
+      const session = await supervisor.start(project.id, "secret-start");
+      await supervisor.write(
+        project.id,
+        session.sessionId,
+        'Write-Output "$env:LOCALBRIDGE_SYNTHETIC_SECRET|$env:ELECTRON_SYNTHETIC_FLAG|ENV_DONE"\r\n',
+        "secret-write",
+      );
+      const output = await waitForOutput(supervisor, project.id, session.sessionId, "ENV_DONE");
+      const text = output.entries.map((entry) => entry.text).join("");
+      expect(text).not.toContain("terminal-secret-must-not-leak");
+      expect(text).not.toContain("electron-flag-must-not-leak");
+    } finally {
+      if (previousSecret === undefined) delete process.env["LOCALBRIDGE_SYNTHETIC_SECRET"];
+      else process.env["LOCALBRIDGE_SYNTHETIC_SECRET"] = previousSecret;
+      if (previousElectron === undefined) delete process.env["ELECTRON_SYNTHETIC_FLAG"];
+      else process.env["ELECTRON_SYNTHETIC_FLAG"] = previousElectron;
+    }
+  });
+
+  it("TERM-010: desactiva la persistencia de historial de PowerShell", async () => {
+    const { project, supervisor } = await fixture();
+    const session = await supervisor.start(project.id, "history-start");
+    await supervisor.write(project.id, session.sessionId, "Write-Output ((Get-PSReadLineOption).HistorySaveStyle)\r\n", "history-write");
+    const output = await waitForOutput(supervisor, project.id, session.sessionId, "SaveNothing");
+    expect(output.entries.map((entry) => entry.text).join("")).toContain("SaveNothing");
+  });
+});

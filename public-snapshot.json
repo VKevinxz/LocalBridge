@@ -1,0 +1,68 @@
+{
+  "schemaVersion": 1,
+  "rootFiles": [
+    ".gitattributes",
+    ".gitignore",
+    ".oxlintrc.json",
+    "CHANGELOG.md",
+    "CODE_OF_CONDUCT.md",
+    "CONTRIBUTING.md",
+    "COPYRIGHT.md",
+    "package.json",
+    "pnpm-lock.yaml",
+    "pnpm-workspace.yaml",
+    "public-snapshot.json",
+    "README.md",
+    "SECURITY.md",
+    "SUPPORT.md",
+    "tsconfig.base.json",
+    "tsconfig.json",
+    "vitest.config.ts"
+  ],
+  "sourceDirectories": [
+    ".github",
+    "apps",
+    "native",
+    "packages",
+    "scripts",
+    "tests"
+  ],
+  "publicDocs": [
+    "docs/ARCHITECTURE.md",
+    "docs/DESIGN_PRINCIPLES.md",
+    "docs/DOWNLOADS.md",
+    "docs/GETTING_STARTED.md",
+    "docs/GITHUB_PUBLISHING.md",
+    "docs/MAINTAINER_RELEASES.md",
+    "docs/OPERATIONS.md",
+    "docs/PRIVACY_AND_TRUST.md",
+    "docs/SECURITY_MODEL.md",
+    "docs/TOOL_CATALOG.md",
+    "docs/TROUBLESHOOTING.md",
+    "docs/USER_GUIDE.md",
+    "docs/WINDOWS_INSTALLATION.md",
+    "docs/assets/screenshots/activity.png",
+    "docs/assets/screenshots/dashboard.png",
+    "docs/assets/screenshots/projects.png",
+    "docs/releases/v1.1.0.md"
+  ],
+  "excludedDirectoryNames": [
+    ".git",
+    "data",
+    "dist",
+    "node_modules",
+    "out",
+    "release",
+    "vendor"
+  ],
+  "excludedExtensions": [
+    ".db",
+    ".exe",
+    ".key",
+    ".log",
+    ".p12",
+    ".pem",
+    ".pfx",
+    ".zip"
+  ]
+}

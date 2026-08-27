@@ -1,0 +1,55 @@
+{
+  "name": "localbridge-mcp",
+  "version": "1.1.0",
+  "private": true,
+  "license": "UNLICENSED",
+  "author": "VKevinXZ",
+  "description": "Gateway MCP local seguro para proyectos autorizados",
+  "homepage": "https://github.com/VKevinxz/LocalBridge#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/VKevinxz/LocalBridge.git"
+  },
+  "bugs": {
+    "url": "https://github.com/VKevinxz/LocalBridge/issues"
+  },
+  "type": "module",
+  "packageManager": "pnpm@9.12.0",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "tsx apps/server/src/index.ts",
+    "typecheck": "tsc --noEmit -p tsconfig.json && pnpm --filter @localbridge/desktop typecheck",
+    "lint": "oxlint",
+    "test": "vitest run",
+    "test:unit": "vitest run tests/unit",
+    "test:protocol": "vitest run tests/protocol",
+    "test:integration": "vitest run tests/integration",
+    "test:sec": "vitest run tests/security",
+    "build:native:test": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-windows-process-host.ps1",
+    "verify:setup": "tsx scripts/verify-setup-supervisor.ts",
+    "inspector": "npx -y @modelcontextprotocol/inspector@latest npx tsx apps/server/src/index.ts"
+  },
+  "devDependencies": {
+    "@localbridge/audit": "workspace:^",
+    "@localbridge/desktop-core": "workspace:^",
+    "@localbridge/development": "workspace:^",
+    "@localbridge/filesystem": "workspace:^",
+    "@localbridge/git": "workspace:^",
+    "@localbridge/mcp-server": "workspace:^",
+    "@localbridge/permissions": "workspace:^",
+    "@localbridge/shared": "workspace:^",
+    "@localbridge/validation": "workspace:^",
+    "@localbridge/workspace": "workspace:^",
+    "@modelcontextprotocol/client": "^2.0.0",
+    "@modelcontextprotocol/server": "^2.0.0",
+    "@types/node": "^22.9.0",
+    "happy-dom": "^20.11.6",
+    "oxlint": "^1.79.0",
+    "tsx": "^4.19.2",
+    "typescript": "^7.0.2",
+    "vitest": "^4.1.11",
+    "zod": "^4.4.3"
+  }
+}

@@ -1,0 +1,37 @@
+appId: com.localbridge.desktop
+productName: LocalBridge MCP
+copyright: Copyright © 2026 VKevinXZ. All rights reserved.
+directories:
+  output: release
+  buildResources: build
+files:
+  - out/**/*
+  - "!out/server/**/*"
+  - package.json
+extraResources:
+  - from: vendor/tunnel-client
+    to: vendor/tunnel-client
+  - from: vendor/node
+    to: vendor/node
+  - from: vendor/process-host
+    to: vendor/process-host
+  - from: out/server
+    to: server
+electronFuses:
+  runAsNode: false
+  enableCookieEncryption: true
+  enableNodeOptionsEnvironmentVariable: false
+  enableNodeCliInspectArguments: false
+  enableEmbeddedAsarIntegrityValidation: true
+  onlyLoadAppFromAsar: true
+  loadBrowserProcessSpecificV8Snapshot: false
+  grantFileProtocolExtraPrivileges: true
+win:
+  icon: build/icon.svg
+  target:
+    - target: nsis
+      arch:
+        - x64
+nsis:
+  oneClick: false
+  allowToChangeInstallationDirectory: true

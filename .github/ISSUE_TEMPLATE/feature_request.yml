@@ -1,0 +1,39 @@
+name: Propuesta de mejora
+description: Sugiere una mejora concreta para LocalBridge MCP.
+title: "[Feature]: "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Describe el problema antes de proponer una solución. No incluyas proyectos,
+        claves, rutas personales ni configuraciones privadas.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problema
+      description: ¿Qué flujo es difícil o imposible actualmente?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Resultado esperado
+      description: Explica cómo debería comportarse LocalBridge para el usuario.
+    validations:
+      required: true
+  - type: textarea
+    id: security
+    attributes:
+      label: Impacto en permisos y seguridad
+      description: Indica si afectaría archivos, Git, procesos, terminal, navegador o red.
+    validations:
+      required: true
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Privacidad
+      options:
+        - label: Confirmo que no incluí datos personales, claves ni contenido privado.
+          required: true

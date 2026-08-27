@@ -1,0 +1,49 @@
+name: Reporte de problema
+description: Informa un fallo reproducible sin publicar claves ni datos privados.
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        No adjuntes claves, tokens, rutas personales ni contenido privado. Para
+        vulnerabilidades usa el canal privado descrito en SECURITY.md.
+  - type: input
+    id: version
+    attributes:
+      label: Versión
+      description: Visible en la app o en el nombre del instalador.
+      placeholder: v1.1.0
+    validations:
+      required: true
+  - type: dropdown
+    id: windows
+    attributes:
+      label: Windows
+      options:
+        - Windows 11 x64
+        - Windows 10 x64
+        - Otro entorno
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Pasos para reproducir
+      description: Incluye el resultado esperado y el observado.
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostic
+    attributes:
+      label: Diagnóstico redactado
+      description: Usa “Copiar diagnóstico” en Actividad y revisa el texto antes de pegarlo.
+      render: text
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Privacidad
+      options:
+        - label: Confirmo que eliminé claves, rutas personales y contenido privado.
+          required: true

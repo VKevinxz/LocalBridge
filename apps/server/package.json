@@ -1,0 +1,13 @@
+{
+  "name": "@localbridge/server",
+  "version": "1.1.0",
+  "private": true,
+  "license": "UNLICENSED",
+  "type": "module",
+  "main": "./src/index.ts",
+  "dependencies": {
+    "@localbridge/mcp-server": "workspace:*",
+    "@localbridge/shared": "workspace:*",
+    "@modelcontextprotocol/server": "^2.0.0"
+  }
+}

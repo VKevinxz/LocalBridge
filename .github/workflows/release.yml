@@ -1,0 +1,186 @@
+name: Signed Windows release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Build signed release
+    runs-on: windows-latest
+    timeout-minutes: 50
+    environment: release
+
+    steps:
+      - name: Checkout exact tag
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+
+      - name: Validate tag, versions and notes
+        shell: pwsh
+        run: |
+          $tag = $env:GITHUB_REF_NAME
+          if ($tag -notmatch '^v\d+\.\d+\.\d+$') {
+            throw "Release tags must use vMAJOR.MINOR.PATCH."
+          }
+          git merge-base --is-ancestor HEAD origin/main
+          if ($LASTEXITCODE -ne 0) {
+            throw "Release tags must point to a commit contained in main."
+          }
+          $expected = $tag.Substring(1)
+          $manifests = @(
+            'package.json',
+            'apps/desktop/package.json',
+            'apps/server/package.json'
+          )
+          foreach ($manifest in $manifests) {
+            $actual = (Get-Content -LiteralPath $manifest -Raw | ConvertFrom-Json).version
+            if ($actual -ne $expected) {
+              throw "$manifest has version $actual; expected $expected."
+            }
+          }
+          $notes = "docs/releases/$tag.md"
+          if (-not (Test-Path -LiteralPath $notes -PathType Leaf)) {
+            throw "Missing release notes: $notes"
+          }
+          ./scripts/check-publication-readiness.ps1
+
+      - name: Require signing credentials
+        shell: pwsh
+        env:
+          WIN_CSC_LINK: ${{ secrets.WIN_CSC_LINK }}
+          WIN_CSC_KEY_PASSWORD: ${{ secrets.WIN_CSC_KEY_PASSWORD }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:WIN_CSC_LINK)) {
+            throw "WIN_CSC_LINK is required."
+          }
+          if ([string]::IsNullOrWhiteSpace($env:WIN_CSC_KEY_PASSWORD)) {
+            throw "WIN_CSC_KEY_PASSWORD is required."
+          }
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@008330803749db0355799c700092d9a85fd074e9 # v6.0.9
+        with:
+          version: 9.12.0
+
+      - name: Install Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: 22.18.0
+          package-manager-cache: false
+
+      - name: Install locked dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build verified Windows process host
+        run: pnpm build:native:test
+
+      - name: Verify source
+        shell: pwsh
+        run: |
+          ./scripts/check-github-workflows.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          pnpm lint
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          pnpm typecheck
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          pnpm test
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          pnpm test:sec
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          pnpm audit --audit-level moderate
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          ./scripts/audit-public-history.ps1
+
+      - name: Build and sign Windows installer
+        env:
+          WIN_CSC_LINK: ${{ secrets.WIN_CSC_LINK }}
+          WIN_CSC_KEY_PASSWORD: ${{ secrets.WIN_CSC_KEY_PASSWORD }}
+        run: pnpm --filter @localbridge/desktop package:win:signed
+
+      - name: Smoke packaged desktop window
+        shell: pwsh
+        run: |
+          ./scripts/smoke-packaged-desktop.ps1 `
+            -ExecutablePath 'apps/desktop/release/win-unpacked/LocalBridge MCP.exe'
+
+      - name: Verify Authenticode signature and timestamp
+        id: signature
+        shell: pwsh
+        run: |
+          $installers = @(Get-ChildItem -LiteralPath apps/desktop/release -Filter '*Setup*.exe' -File)
+          if ($installers.Count -ne 1) {
+            throw "Expected exactly one installer; found $($installers.Count)."
+          }
+          $signature = Get-AuthenticodeSignature -LiteralPath $installers[0].FullName
+          if ($signature.Status -ne 'Valid') {
+            throw "Installer signature is not valid: $($signature.Status)."
+          }
+          if ($null -eq $signature.TimeStamperCertificate) {
+            throw "Installer signature has no trusted timestamp."
+          }
+          "installer=$($installers[0].FullName)" >> $env:GITHUB_OUTPUT
+
+      - name: Download pinned Syft
+        id: syft
+        uses: anchore/sbom-action/download-syft@fbfd9c6c189226748411491745178e0c2017392d # v0.20.10
+        with:
+          syft-version: v1.51.0
+
+      - name: Generate SPDX SBOM
+        shell: pwsh
+        run: |
+          $version = $env:GITHUB_REF_NAME.Substring(1)
+          & '${{ steps.syft.outputs.cmd }}' scan `
+            'dir:apps/desktop/release/win-unpacked' `
+            --source-name 'localbridge-desktop-windows' `
+            --source-version $version `
+            --output "spdx-json=apps/desktop/release/localbridge-$env:GITHUB_REF_NAME.spdx.json"
+
+      - name: Generate release checksums
+        shell: pwsh
+        run: |
+          $version = $env:GITHUB_REF_NAME.Substring(1)
+          ./scripts/generate-release-checksums.ps1 `
+            -ReleaseDirectory apps/desktop/release -Version $version
+
+      - name: Attest installer and SBOM
+        uses: actions/attest@c32b4b8b198b65d0bd9d63490e847ff7b53989d4 # v4.0.0
+        with:
+          subject-path: ${{ steps.signature.outputs.installer }}
+          sbom-path: apps/desktop/release/localbridge-${{ github.ref_name }}.spdx.json
+
+      - name: Publish GitHub release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = $env:GITHUB_REF_NAME
+          $version = $tag.Substring(1)
+          $releaseDir = (Resolve-Path -LiteralPath apps/desktop/release).Path
+          $assetNames = @(
+            "LocalBridge MCP Setup $version.exe",
+            "LocalBridge MCP Setup $version.exe.blockmap",
+            "localbridge-$tag.spdx.json",
+            'SHA256SUMS.txt'
+          )
+          $assets = foreach ($name in $assetNames) {
+            $asset = Join-Path $releaseDir $name
+            if (-not (Test-Path -LiteralPath $asset -PathType Leaf)) {
+              throw "Missing release asset: $name"
+            }
+            $asset
+          }
+          gh release create $tag @assets --verify-tag `
+            --title $tag --notes-file "docs/releases/$tag.md"
