@@ -59,13 +59,17 @@ describe('SEC-032 — publicación fail-closed', () => {
 
   it('el prerelease sin firma está aislado, rotulado y conserva evidencias', async () => {
     const workflow = await source('.github/workflows/preview-release.yml');
-    const notes = await source('docs/releases/preview-v1.1.0.2.md');
+    const notes = await source('docs/releases/preview-v1.1.0.3.md');
     const stableWorkflow = await source('.github/workflows/release.yml');
 
     expect(workflow).toContain('preview-v*.*.*.*');
     expect(workflow).toContain("'^preview-v(?<version>\\d+\\.\\d+\\.\\d+)\\.(?<sequence>[1-9]\\d*)$'");
     expect(workflow).toContain('git merge-base --is-ancestor HEAD origin/main');
-    expect(workflow).toContain('pnpm --filter @localbridge/desktop package:win');
+    expect(workflow).toContain('pnpm --filter @localbridge/desktop vendor:prepare');
+    expect(workflow).toContain('pnpm --filter @localbridge/desktop build');
+    expect(workflow).toContain(
+      'pnpm --filter @localbridge/desktop exec electron-builder --win --publish never',
+    );
     expect(workflow).not.toContain('package:win:signed');
     expect(workflow).not.toContain('WIN_CSC_LINK');
     expect(workflow).not.toContain('WIN_CSC_KEY_PASSWORD');

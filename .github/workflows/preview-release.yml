@@ -95,7 +95,13 @@ jobs:
           ./scripts/audit-public-history.ps1
 
       - name: Build unsigned Windows installer
-        run: pnpm --filter @localbridge/desktop package:win
+        shell: pwsh
+        run: |
+          pnpm --filter @localbridge/desktop vendor:prepare
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          pnpm --filter @localbridge/desktop build
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          pnpm --filter @localbridge/desktop exec electron-builder --win --publish never
 
       - name: Smoke packaged desktop window
         shell: pwsh
