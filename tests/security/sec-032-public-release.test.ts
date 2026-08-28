@@ -61,6 +61,7 @@ describe('SEC-032 — publicación fail-closed', () => {
     const workflow = await source('.github/workflows/preview-release.yml');
     const notes = await source('docs/releases/preview-v1.1.0.3.md');
     const stableWorkflow = await source('.github/workflows/release.yml');
+    const checksums = await source('scripts/generate-release-checksums.ps1');
 
     expect(workflow).toContain('preview-v*.*.*.*');
     expect(workflow).toContain("'^preview-v(?<version>\\d+\\.\\d+\\.\\d+)\\.(?<sequence>[1-9]\\d*)$'");
@@ -76,6 +77,7 @@ describe('SEC-032 — publicación fail-closed', () => {
     expect(workflow).toContain("$signature.Status -ne 'NotSigned'");
     expect(workflow).toContain('smoke-packaged-desktop.ps1');
     expect(workflow).toContain('generate-release-checksums.ps1');
+    expect(checksums).toContain("$artifact.Name.Replace(' ', '.')");
     expect(workflow).toContain('anchore/sbom-action/download-syft@');
     expect(workflow).toContain('actions/attest@');
     expect(workflow).toContain('gh release create $tag');
