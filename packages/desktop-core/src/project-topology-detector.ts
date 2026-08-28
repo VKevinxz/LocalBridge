@@ -9,20 +9,43 @@ import {
   type ProcessProfile,
 } from "@localbridge/workspace";
 
+/**
+ * Directorios que nunca se recorren. Además de artefactos de build, incluye
+ * ubicaciones habituales de datos y cachés (ADR-0040): antes agotaban el
+ * presupuesto del recorrido y dejaban sin explorar el código real. La omisión
+ * es por nombre de directorio, igual que ya ocurría con `build` o `dist`, así
+ * que un manifest dentro de una de estas carpetas deja de detectarse.
+ */
 const IGNORED_DIRECTORIES = new Set([
   ".git",
+  ".gradle",
+  ".mypy_cache",
   ".next",
   ".nuxt",
   ".output",
+  ".pnpm-store",
+  ".pytest_cache",
+  ".tox",
   ".turbo",
+  ".venv",
   ".vite",
+  ".yarn",
+  "__pycache__",
   "build",
   "coverage",
+  "data",
   "dist",
+  "logs",
   "node_modules",
   "out",
+  "pgdata",
+  "storage",
   "target",
+  "temp",
+  "tmp",
+  "var",
   "vendor",
+  "venv",
 ]);
 const MANIFEST_NAMES = new Set(["package.json", "composer.json", "Makefile", "makefile", "GNUmakefile"]);
 const UNSUPPORTED_MANIFEST_NAMES = new Set(["Cargo.toml", "pyproject.toml", "go.mod", "Gemfile"]);
@@ -35,6 +58,11 @@ const SPECIAL_MAKE_TARGETS = new Set([".PHONY", ".DEFAULT", ".SUFFIXES", ".PRECI
 export interface TopologyDetectorLimits {
   readonly maxDepth: number;
   readonly maxEntries: number;
+  /**
+   * Cota por directorio. Impide que una sola carpeta enorme consuma el
+   * presupuesto global y deje sus hermanas sin explorar (ADR-0040).
+   */
+  readonly maxEntriesPerDirectory: number;
   readonly maxManifests: number;
   readonly maxManifestBytes: number;
 }
@@ -100,9 +128,10 @@ interface DiscoveredFile {
   readonly sha256: string;
 }
 
-const DEFAULT_LIMITS: TopologyDetectorLimits = {
+export const DEFAULT_TOPOLOGY_LIMITS: TopologyDetectorLimits = {
   maxDepth: 6,
   maxEntries: 2_000,
+  maxEntriesPerDirectory: 400,
   maxManifests: 64,
   maxManifestBytes: 1_048_576,
 };
@@ -183,14 +212,22 @@ async function walkWorkspace(
       warnings.push("DIRECTORY_UNREADABLE");
       continue;
     }
+    let directoryEntries = 0;
     for (const entry of entries.toSorted((left, right) => left.name.localeCompare(right.name))) {
+      const relativePath = normalizeRelative(path.join(current.relativePath === "." ? "" : current.relativePath, entry.name));
+      // El presupuesto se cobra después de la denylist (ADR-0040): denegar una
+      // ruta debe liberar presupuesto, no solo evitar descender por ella.
+      if (isPathDenied(relativePath, workspace.denyPatterns)) continue;
       scannedEntries += 1;
+      directoryEntries += 1;
       if (scannedEntries > limits.maxEntries) {
         truncated = true;
         break;
       }
-      const relativePath = normalizeRelative(path.join(current.relativePath === "." ? "" : current.relativePath, entry.name));
-      if (isPathDenied(relativePath, workspace.denyPatterns)) continue;
+      if (directoryEntries > limits.maxEntriesPerDirectory) {
+        truncated = true;
+        break;
+      }
       if (entry.isSymbolicLink()) {
         // No seguimos enlaces aunque apunten dentro: la topología debe depender de
         // raíces físicas revisables y no cambiar si el link se retargetea después.
@@ -313,7 +350,7 @@ export async function detectProjectTopology(
   workspace: AuthorizedWorkspace,
   overrides: Partial<TopologyDetectorLimits> = {},
 ): Promise<ProjectTopology> {
-  const limits = { ...DEFAULT_LIMITS, ...overrides };
+  const limits = { ...DEFAULT_TOPOLOGY_LIMITS, ...overrides };
   const walked = await walkWorkspace(workspace, limits);
   const warnings = [...walked.warnings];
   if (walked.files.some((file) => UNSUPPORTED_MANIFEST_NAMES.has(file.name))) warnings.push("UNSUPPORTED_ECOSYSTEM");

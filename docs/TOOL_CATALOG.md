@@ -832,6 +832,7 @@ Errores: `APPLICATION_PROFILE_NOT_FOUND`, `APPLICATION_REVIEW_REQUIRED`,
 | `browser.navigate` | R3 | `sessionId`, `path`, `operationId?` | estado y ruta relativa |
 | `browser.snapshot` | R2 | `sessionId`, límites | árbol de accesibilidad y refs opacas |
 | `browser.screenshot` | R2 | `sessionId` | imagen PNG + dimensiones |
+| `browser.viewport` | R2 | `sessionId`, `width` 320-3840, `height` 320-2160, `mobile?`, `operationId?` | viewport aplicado |
 | `browser.events` | R2 | `sessionId`, cursor/límite | consola y estado de red sin cuerpos/cabeceras |
 | `browser.stop` | R3 | `sessionId`, `operationId?` | estado final |
 
@@ -844,6 +845,13 @@ si el listener deja de pertenecer al proceso. Popups, descargas, permisos, proto
 orígenes externos se bloquean. Para HMR, `ws:` puede reutilizar exclusivamente la misma
 IP y puerto de un origen `http:` aprobado cuando Electron marca el recurso como
 WebSocket; `wss`, credenciales y cualquier autoridad distinta se deniegan.
+
+`browser.viewport` emula el tamaño de la vista para comprobar diseño responsive. No
+redimensiona la ventana del usuario, no navega, no cambia el origen permitido y no altera el
+agente de usuario ni la escala del dispositivo. Acepta únicamente dimensiones enteras dentro
+del rango indicado y una bandera táctil. Invalida el snapshot vigente, porque tras el
+recálculo del diseño las referencias de elementos dejan de ser válidas; el tamaño se
+restablece cuando el usuario toma el control local.
 
 Una aplicación multiservicio contiene entre 1 y 8 aliases configurados localmente. En el
 flujo `v0.5.0`, MCP aporta únicamente `applicationId` + `runId`; Electron recupera las refs
@@ -921,13 +929,19 @@ descubrir las tools vigentes.
 
 | Tool | Riesgo | Entrada | Resultado acotado |
 |---|---:|---|---|
-| `project.list` | R1 | `{}` | IDs opacos, nombre, estado y cantidades |
+| `project.list` | R1 | `{}` | IDs opacos, nombre, estado, cobertura del escaneo y cantidades |
 | `project.status` | R1 | `projectId` | topología/estado, cantidades y recuperación sugerida |
 | `project.setup.refresh` | R2 | `projectId` | nuevo análisis local y estado, sin ejecutar |
 
 Las salidas nunca contienen roots, rutas absolutas, comandos, argumentos, entorno,
 manifiestos, lockfiles, paquetes, dependencias, URLs, puertos ni huellas de toolchain.
-Los campos desconocidos se rechazan. `refresh` puede invalidar una propuesta anterior,
+Los campos desconocidos se rechazan.
+
+`state` y `scanCoverage` describen la ficha local. `scanCoverage: "partial"` significa que
+la estructura reportada está incompleta porque el recorrido local agotó su presupuesto;
+**no** bloquea ninguna capacidad ni revela el tamaño del árbol. Solo `state` distinto de
+`ready` limita la terminal, y únicamente por condiciones que un humano debe resolver:
+varias raíces sin resolver, carpeta ausente o definiciones en conflicto. `refresh` puede invalidar una propuesta anterior,
 pero no crea archivos, instala dependencias, concede permisos ni inicia procesos.
 
 No existen `project.create`, `project.approve`, `project.execute` ni equivalentes. Crear,
@@ -972,6 +986,12 @@ MCP, `Guiado` deniega, sandbox fail-closed en `Agente en proyecto`, advertencia 
 en `Control total`, Job Object, buffers acotados, sanitización ANSI/OSC, redacción de
 secretos propios y cierre del árbol. No se aceptan rutas absolutas, roots, PIDs,
 ejecutables, variables de entorno completas ni un trust mode en parámetros.
+
+Concurrencia: hasta **8 sesiones por proyecto y 16 en total**; superarlo responde
+`RATE_LIMITED`. El techo es fijo y ninguna tool puede elevarlo. Una sesión terminada conserva
+su salida final durante 30 minutos o hasta que haya 24 sesiones cerradas retenidas; después,
+`terminal.read` responde `TERMINAL_NOT_FOUND`. Cerrar cada terminal al acabar sigue siendo
+responsabilidad del cliente.
 
 ### 14.1 `browser.start` desde un proyecto multiservicio
 

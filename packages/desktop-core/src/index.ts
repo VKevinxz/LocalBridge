@@ -1,5 +1,11 @@
 export { detectProjectCommands, type DetectedCommand } from "./project-command-detector.js";
 export {
+  identityTokens,
+  isSensitiveInput,
+  type SensitiveInputCandidate,
+} from "./sensitive-input.js";
+export {
+  DEFAULT_TOPOLOGY_LIMITS,
   detectProjectTopology,
   type ProjectTopology,
   type TopologyCommand,
@@ -154,14 +160,17 @@ export {
   buildEmptyProjectCatalogRecord,
   loadProjectCatalog,
   loadOrCreateDeviceBinding,
+  loadProjectScanStore,
   loadProjectTrustStore,
   migrateDevelopmentProjectsToCatalog,
   removeProjectCatalogRecord,
+  removeProjectScanRecord,
   replaceProjectCatalog,
   replaceProjectTrust,
   revokeProjectTrust,
   setProjectTrust,
   upsertProjectCatalogRecord,
+  upsertProjectScanRecord,
 } from "./project-catalog-store.js";
 
 export {

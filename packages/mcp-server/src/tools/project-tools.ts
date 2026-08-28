@@ -15,6 +15,13 @@ const projectSchema = z.object({
   workspaceIds: z.array(z.string().max(160)).min(1).max(16),
   applicationId: z.string().regex(/^app_[a-f0-9]{16,32}$/).optional(),
   setupStatus: z.enum(["draft", "review-required", "ready", "interrupted"]),
+  /**
+   * Estado del proyecto y cobertura del último escaneo local (ADR-0040). Sin
+   * recuentos ni rutas: permiten explicar una estructura parcial o una revisión
+   * pendiente, no reconstruir el árbol del proyecto.
+   */
+  state: z.enum(["ready", "review", "unavailable", "conflict"]).default("ready"),
+  scanCoverage: z.enum(["complete", "partial", "unknown"]).default("unknown"),
 }).strict();
 const planSummarySchema = z.object({
   planSha256: z.string().regex(/^[a-f0-9]{64}$/),
@@ -64,7 +71,7 @@ export function registerProjectListTool(server: McpServer, ctx: ToolContext): vo
   const outputSchema = z.object({ projects: z.array(projectSchema).max(500) }).strict();
   server.registerTool("project.list", {
     title: "List assisted local projects",
-    description: "Lists user-created project groupings and readiness. It returns opaque references only and never returns roots, commands, manifests, dependencies, logs, environment values or permissions.",
+    description: "Lists user-created project groupings, their readiness and the coverage of the last local structure scan. A partial coverage means the reported structure is incomplete, not that the project is unavailable. It returns opaque references only and never returns roots, commands, manifests, dependencies, logs, environment values or permissions.",
     inputSchema: z.object({}).strict(),
     outputSchema,
     annotations: { readOnlyHint: true, idempotentHint: true, destructiveHint: false, openWorldHint: false },

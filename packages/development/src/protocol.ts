@@ -76,6 +76,14 @@ export const brokerMethodSchemas = {
   'browser.navigate': sessionIdParams.extend({ path: z.string().min(1).max(2048), operationId: operationIdSchema }).strict(),
   'browser.snapshot': sessionIdParams.extend({ maxDepth: z.number().int().min(1).max(20).default(12), maxElements: z.number().int().min(1).max(1000).default(500) }).strict(),
   'browser.screenshot': sessionIdParams,
+  // Emulación de viewport para probar diseño responsive (ADR-0042). Dimensiones
+  // acotadas; no acepta escala, agente de usuario, URL ni selectores.
+  'browser.viewport': sessionIdParams.extend({
+    width: z.number().int().min(320).max(3840),
+    height: z.number().int().min(320).max(2160),
+    mobile: z.boolean().default(false),
+    operationId: operationIdSchema,
+  }).strict(),
   'browser.events': sessionIdParams.extend({ cursor: cursorSchema, maxBytes: z.number().int().min(1).max(65_536).default(65_536) }).strict(),
   'browser.click': sessionIdParams.extend({ snapshotId: opaqueIdSchema, elementRef: opaqueIdSchema, operationId: operationIdSchema }).strict(),
   'browser.fill': sessionIdParams.extend({ snapshotId: opaqueIdSchema, elementRef: opaqueIdSchema, text: z.string().max(8192), operationId: operationIdSchema }).strict(),

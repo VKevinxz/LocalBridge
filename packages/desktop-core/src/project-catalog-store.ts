@@ -8,11 +8,15 @@ import { isEnoent } from "@localbridge/shared";
 import {
   projectCatalogRecordSchema,
   projectCatalogStoreSchema,
+  projectScanRecordSchema,
+  projectScanStoreSchema,
   projectTrustRecordSchema,
   projectTrustStoreSchema,
   type DevelopmentProject,
   type ProjectCatalogRecord,
   type ProjectCatalogStore,
+  type ProjectScanRecord,
+  type ProjectScanStore,
   type ProjectTrustMode,
   type ProjectTrustRecord,
   type ProjectTrustStore,
@@ -36,6 +40,10 @@ function emptyCatalog(): ProjectCatalogStore {
 
 function emptyTrust(): ProjectTrustStore {
   return { schemaVersion: 1, decisions: [] };
+}
+
+function emptyScans(): ProjectScanStore {
+  return { schemaVersion: 1, scans: [] };
 }
 
 async function readJson<T>(filePath: string, schema: { parse(value: unknown): T }, fallback: T, message: string): Promise<T> {
@@ -89,6 +97,31 @@ export async function removeProjectCatalogRecord(filePath: string, projectId: st
   const projects = current.projects.filter((project) => project.id !== projectId);
   if (projects.length === current.projects.length) throw new ProjectCatalogStoreError("Proyecto no encontrado.", "PROJECT_NOT_FOUND");
   await replaceProjectCatalog(filePath, projects);
+}
+
+/**
+ * Cobertura del último recorrido de topología (ADR-0040). Archivo aparte del
+ * catálogo para que un downgrade siga leyendo `project-catalog.json`; una
+ * versión anterior simplemente ignora este archivo.
+ */
+export async function loadProjectScanStore(filePath: string): Promise<ProjectScanStore> {
+  return readJson(filePath, projectScanStoreSchema, emptyScans(), "El registro de cobertura de escaneo no es válido.");
+}
+
+export async function upsertProjectScanRecord(filePath: string, record: ProjectScanRecord): Promise<ProjectScanRecord> {
+  const validated = projectScanRecordSchema.parse(record);
+  const current = await loadProjectScanStore(filePath);
+  const index = current.scans.findIndex((candidate) => candidate.projectId === validated.projectId);
+  const scans = index === -1 ? [...current.scans, validated] : current.scans.with(index, validated);
+  await writeJson(filePath, projectScanStoreSchema.parse({ schemaVersion: 1, scans }));
+  return validated;
+}
+
+export async function removeProjectScanRecord(filePath: string, projectId: string): Promise<void> {
+  const current = await loadProjectScanStore(filePath);
+  const scans = current.scans.filter((scan) => scan.projectId !== projectId);
+  if (scans.length === current.scans.length) return;
+  await writeJson(filePath, projectScanStoreSchema.parse({ schemaVersion: 1, scans }));
 }
 
 export async function loadProjectTrustStore(filePath: string): Promise<ProjectTrustStore> {

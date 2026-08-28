@@ -9,6 +9,7 @@ import {
   type ResolvedTerminalListener,
 } from '@localbridge/development';
 import type { AuthorizedWorkspace, BrowserProfile, LocalApplication } from '@localbridge/workspace';
+import { isSensitiveInput } from '@localbridge/desktop-core';
 
 import { isAllowedBrowserRequest } from './browser-network-policy.js';
 
@@ -103,6 +104,8 @@ interface ManagedBrowserSession {
   controlEpoch: number;
   activeAgentOperations: number;
   blockedFileChooserCount: number;
+  /** Viewport realmente renderizado. Cambia con `browser.viewport` (ADR-0042). */
+  currentViewport: { width: number; height: number; mobile: boolean };
   viewerCapturePromise?: Promise<BrowserViewerFrame>;
   restoreLiveViewerAfterHuman?: boolean;
   previousViewerWorkArea?: LiveViewerWorkArea;
@@ -763,6 +766,7 @@ export class BrowserController {
       controlEpoch: 0,
       activeAgentOperations: 0,
       blockedFileChooserCount: 0,
+      currentViewport: { width: profile.viewport.width, height: profile.viewport.height, mobile: false },
       agentIdleWaiters: [],
       agentShellUrl,
       trustedShellUrl: agentShellUrl,
@@ -1188,8 +1192,66 @@ export class BrowserController {
         captureBeyondViewport: false,
       }) as { data?: string };
       if (captured.data === undefined) fail('FEATURE_UNAVAILABLE', 'No se pudo capturar la vista local.');
-      return { mimeType: 'image/png' as const, dataBase64: captured.data, width: entry.profile.viewport.width, height: entry.profile.viewport.height };
+      return {
+        mimeType: 'image/png' as const,
+        dataBase64: captured.data,
+        width: entry.currentViewport.width,
+        height: entry.currentViewport.height,
+      };
     });
+  }
+
+  /**
+   * Emula un viewport para probar diseño responsive (ADR-0042).
+   *
+   * Usa `Emulation.setDeviceMetricsOverride` en lugar de redimensionar la
+   * ventana: así el tamaño no queda limitado por la pantalla física, no altera
+   * lo que ve el usuario en el visor en vivo y las capturas ya salen al tamaño
+   * emulado, porque pasan por el mismo canal CDP.
+   *
+   * No concede ninguna capacidad nueva: no cambia el origen permitido, no
+   * navega y no interactúa con la página. Sí invalida el snapshot vigente,
+   * porque tras el reflow las referencias de elementos dejan de ser válidas.
+   */
+  async setViewport(workspaceId: string, sessionId: string, width: number, height: number, mobile: boolean, operationId?: string) {
+    const entry = await this.requireSession(workspaceId, sessionId);
+    return this.withAgentOperation(entry, async () => {
+      if (!Number.isInteger(width) || !Number.isInteger(height) || width < 320 || width > 3840 || height < 320 || height > 2160) {
+        fail('INVALID_INPUT', 'Las dimensiones del viewport están fuera del rango permitido.');
+      }
+      await entry.content.webContents.debugger.sendCommand('Emulation.setDeviceMetricsOverride', {
+        width,
+        height,
+        deviceScaleFactor: 1,
+        mobile,
+      });
+      if (mobile) {
+        await entry.content.webContents.debugger.sendCommand('Emulation.setTouchEmulationEnabled', { enabled: true, maxTouchPoints: 5 })
+          .catch(() => undefined);
+      } else {
+        await entry.content.webContents.debugger.sendCommand('Emulation.setTouchEmulationEnabled', { enabled: false })
+          .catch(() => undefined);
+      }
+      entry.currentViewport = { width, height, mobile };
+      this.invalidateSnapshot(entry);
+      await waitForInteractionToSettle();
+      // La evidencia queda en la auditoría, no en el flujo de eventos de la
+      // página: `browser.events` describe consola y red del sitio, no acciones
+      // del agente.
+      void operationId;
+      return { sessionId, width, height, mobile, state: entry.state };
+    });
+  }
+
+  /** Devuelve la sesión al viewport declarado por su perfil. */
+  private async clearViewportEmulation(entry: ManagedBrowserSession): Promise<void> {
+    if (entry.currentViewport.width === entry.profile.viewport.width
+      && entry.currentViewport.height === entry.profile.viewport.height
+      && !entry.currentViewport.mobile) return;
+    await entry.content.webContents.debugger.sendCommand('Emulation.clearDeviceMetricsOverride').catch(() => undefined);
+    await entry.content.webContents.debugger.sendCommand('Emulation.setTouchEmulationEnabled', { enabled: false }).catch(() => undefined);
+    entry.currentViewport = { width: entry.profile.viewport.width, height: entry.profile.viewport.height, mobile: false };
+    this.invalidateSnapshot(entry);
   }
 
   async events(workspaceId: string, sessionId: string, cursor: number, maxBytes: number) {
@@ -1293,13 +1355,21 @@ export class BrowserController {
     for (let index = 0; index + 1 < attributes.length; index += 2) {
       attributeMap.set((attributes[index] ?? '').toLowerCase(), attributes[index + 1] ?? '');
     }
-    const inputType = (attributeMap.get('type') ?? 'text').toLowerCase();
-    const autocomplete = (attributeMap.get('autocomplete') ?? '').toLowerCase();
-    const identity = `${attributeMap.get('name') ?? ''} ${attributeMap.get('id') ?? ''} ${attributeMap.get('aria-label') ?? ''}`.toLowerCase();
-    const sensitive = ['password', 'file', 'hidden'].includes(inputType) ||
-      /password|one-time-code|cc-|webauthn/.test(autocomplete) ||
-      /pass(word|wd)?|secret|token|api.?key|credit|card|cvc|cvv|otp/.test(identity);
-    if (sensitive) fail('SENSITIVE_INPUT_BLOCKED', 'El campo se clasifica como sensible.');
+    // La clasificación vive en desktop-core para poder probarla campo a campo
+    // (ADR-0041): compara tokens, no subcadenas.
+    const identity = [
+      attributeMap.get('name'),
+      attributeMap.get('id'),
+      attributeMap.get('aria-label'),
+      attributeMap.get('placeholder'),
+    ].filter((value) => value !== undefined).join(' ');
+    if (isSensitiveInput({
+      inputType: attributeMap.get('type'),
+      autocomplete: attributeMap.get('autocomplete'),
+      identity,
+    })) {
+      fail('SENSITIVE_INPUT_BLOCKED', 'El campo se clasifica como sensible.');
+    }
 
     await entry.content.webContents.debugger.sendCommand('DOM.focus', { nodeId });
     await entry.content.webContents.debugger.sendCommand('Input.dispatchKeyEvent', { type: 'rawKeyDown', key: 'a', code: 'KeyA', modifiers: 2 });
@@ -1449,6 +1519,8 @@ export class BrowserController {
       await this.stopEntry(entry);
       throw error;
     }
+    // El usuario debe ver la ventana real, no un viewport emulado por el agente.
+    await this.clearViewportEmulation(entry);
     if (entry.state !== 'running' || entry.window.isDestroyed() || entry.content.webContents.isDestroyed() ||
         entry.controlState !== 'waiting_for_human' || entry.humanRequestId === undefined) {
       fail('HUMAN_CONTROL_REQUEST_NOT_FOUND', 'La solicitud dejó de estar disponible.');
@@ -1694,8 +1766,8 @@ export class BrowserController {
         state: 'ready' as const,
         sessionId,
         dataUrl: `data:image/png;base64,${captured.data}`,
-        width: entry.profile.viewport.width,
-        height: entry.profile.viewport.height,
+        width: entry.currentViewport.width,
+        height: entry.currentViewport.height,
         path: safePathFromUrl(entry.content.webContents.getURL()),
         capturedAt: new Date().toISOString(),
       };

@@ -33,8 +33,8 @@ describe.skipIf(process.platform !== 'win32')('checksums de release', () => {
 
     const lines = (await readFile(path.join(root, 'SHA256SUMS.txt'), 'utf8')).trim().split('\n');
     expect(lines).toHaveLength(3);
-    expect(lines[0]).toMatch(/^[a-f0-9]{64}  LocalBridge MCP Setup 0\.2\.0\.exe\r?$/);
-    expect(lines[1]).toMatch(/^[a-f0-9]{64}  LocalBridge MCP Setup 0\.2\.0\.exe\.blockmap\r?$/);
+    expect(lines[0]).toMatch(/^[a-f0-9]{64}  LocalBridge\.MCP\.Setup\.0\.2\.0\.exe\r?$/);
+    expect(lines[1]).toMatch(/^[a-f0-9]{64}  LocalBridge\.MCP\.Setup\.0\.2\.0\.exe\.blockmap\r?$/);
     expect(lines[2]).toMatch(/^[a-f0-9]{64}  localbridge-v0\.2\.0\.spdx\.json\r?$/);
     expect(lines.join('\n')).not.toContain('private.log');
     expect(lines.join('\n')).not.toContain('builder-debug.yml');
