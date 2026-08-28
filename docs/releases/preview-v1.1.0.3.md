@@ -14,7 +14,7 @@ Windows**.
 ## Antes de instalar
 
 1. Descarga exclusivamente desde esta página de GitHub Releases.
-2. Verifica `LocalBridge MCP Setup 1.1.0.exe` contra `SHA256SUMS.txt`.
+2. Verifica `LocalBridge.MCP.Setup.1.1.0.exe` contra `SHA256SUMS.txt`.
 3. Mantén Microsoft Defender, SmartScreen y Smart App Control activos.
 4. Prueba primero en Windows Sandbox, una VM o un equipo no crítico sin credenciales ni
    proyectos sensibles.
