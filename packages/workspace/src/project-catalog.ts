@@ -98,6 +98,38 @@ export const projectCatalogStoreSchema = z.object({
 });
 export type ProjectCatalogStore = z.infer<typeof projectCatalogStoreSchema>;
 
+/**
+ * Cobertura del recorrido de topología (ADR-0040). Describe cuánto se alcanzó a
+ * inspeccionar, nunca si el proyecto puede operar: vive fuera de
+ * `projectCatalogRecordSchema` porque ese esquema es `.strict()` y un campo
+ * nuevo dejaría sin arrancar a una versión anterior que leyera el catálogo.
+ */
+export const projectScanCoverageSchema = z.enum(["complete", "partial"]);
+export type ProjectScanCoverage = z.infer<typeof projectScanCoverageSchema>;
+
+export const projectScanRecordSchema = z.object({
+  projectId: projectIdSchema,
+  coverage: projectScanCoverageSchema,
+  scannedEntries: z.number().int().min(0).max(10_000_000),
+  entryLimit: z.number().int().min(1).max(10_000_000),
+  observedAt: z.iso.datetime(),
+}).strict();
+export type ProjectScanRecord = z.infer<typeof projectScanRecordSchema>;
+
+export const projectScanStoreSchema = z.object({
+  schemaVersion: z.literal(1),
+  scans: z.array(projectScanRecordSchema).max(500),
+}).strict().superRefine((store, context) => {
+  const ids = new Set<string>();
+  store.scans.forEach((scan, index) => {
+    if (ids.has(scan.projectId)) {
+      context.addIssue({ code: "custom", path: ["scans", index, "projectId"], message: "cobertura duplicada" });
+    }
+    ids.add(scan.projectId);
+  });
+});
+export type ProjectScanStore = z.infer<typeof projectScanStoreSchema>;
+
 export const projectTrustRecordSchema = z.object({
   projectId: projectIdSchema,
   mode: projectTrustModeSchema,

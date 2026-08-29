@@ -63,6 +63,37 @@ describe("tools cerradas de proyectos asistidos", () => {
     expect(JSON.stringify([listed.parsed, current.parsed, refreshed.parsed])).not.toMatch(/rootPath|manifestPath|command|environment|token|dependencyName/i);
   });
 
+  it("informa estado y cobertura del escaneo sin exponer recuentos ni rutas", async () => {
+    const configPath = path.join(os.tmpdir(), `localbridge-project-coverage-${randomUUID()}`, "workspaces.json");
+    await writeRegistryFile(configPath, [buildWorkspace({ id: "ws_project", rootPath: os.tmpdir() })]);
+    broker = await startDevelopmentBroker({ handler: async () => ({
+      projects: [{ ...project, setupStatus: "ready" as const, state: "ready" as const, scanCoverage: "partial" as const }],
+    }) });
+    harness = await createHarness({ pinProtocol: TARGET_PROTOCOL_REVISION, workspaceConfigPath: configPath, developmentBrokerEndpoint: broker.endpoint, developmentBrokerToken: broker.token });
+
+    const listed = await callToolJson(harness.client, "project.list", {});
+
+    expect(listed.isError).toBe(false);
+    // Cobertura parcial informa una estructura incompleta; nunca bloquea ni
+    // filtra el tamaño del árbol (ADR-0040).
+    expect((listed.parsed["projects"] as Array<Record<string, unknown>>)[0]).toMatchObject({
+      state: "ready",
+      scanCoverage: "partial",
+    });
+    expect(JSON.stringify(listed.parsed)).not.toMatch(/scannedEntries|entryLimit|rootPath/i);
+  });
+
+  it("una lista sin estado ni cobertura sigue siendo válida y falla cerrado", async () => {
+    const calls = await setup();
+    const listed = await callToolJson(harness!.client, "project.list", {});
+
+    expect(calls[0]?.method).toBe("project.list");
+    expect((listed.parsed["projects"] as Array<Record<string, unknown>>)[0]).toMatchObject({
+      state: "ready",
+      scanCoverage: "unknown",
+    });
+  });
+
   it("rechaza campos para crear, aprobar, ejecutar o inyectar comandos", async () => {
     await setup();
     for (const payload of [

@@ -118,6 +118,10 @@ import {
   interruptProjectSetupSessions,
   removeDevelopmentProject,
   removeProjectCatalogRecord,
+  removeProjectScanRecord,
+  loadProjectScanStore,
+  upsertProjectScanRecord,
+  DEFAULT_TOPOLOGY_LIMITS,
   replaceProjectCatalog,
   revokeProjectTrust,
   resolveSetupToolchains,
@@ -157,9 +161,11 @@ import {
 } from "@localbridge/development";
 import {
   projectCatalogRecordSchema,
+  projectScanRecordSchema,
   projectTrustModeSchema,
   type DevelopmentProject,
   type ProjectCatalogRecord,
+  type ProjectScanRecord,
   type ProjectSetupSession,
   type ProcessProfile,
   type SetupPlan,
@@ -251,6 +257,11 @@ function projectTrustPath(): string {
   return join(app.getPath("userData"), "project-trust.json");
 }
 
+/** Cobertura del último escaneo, fuera del catálogo para no romper downgrade (ADR-0040). */
+function projectScanPath(): string {
+  return join(app.getPath("userData"), "project-scan.json");
+}
+
 function deviceBindingPath(): string {
   return join(app.getPath("userData"), "device-binding.json");
 }
@@ -259,11 +270,16 @@ function hashText(value: string): string {
   return createHash("sha256").update(value, "utf8").digest("hex");
 }
 
+interface CatalogRecordBuild {
+  readonly record: ProjectCatalogRecord;
+  readonly scan: ProjectScanRecord;
+}
+
 async function catalogRecordForWorkspace(
   project: DevelopmentProject,
   workspace: AuthorizedWorkspace,
   previous?: ProjectCatalogRecord,
-): Promise<ProjectCatalogRecord> {
+): Promise<CatalogRecordBuild> {
   const topology = await detectProjectTopology(workspace);
   const serviceRoots = [...new Set(topology.commands.filter((command) => command.role === "server").map((command) => command.processProfile.cwd))];
   const scopes = [...new Set([".", ...topology.gitRoots, ...topology.manifests.map((manifest) => manifest.cwd), ...serviceRoots])];
@@ -295,12 +311,15 @@ async function catalogRecordForWorkspace(
           : topology.gitRoots.length > 0
             ? "single-repo"
             : "files";
-  return projectCatalogRecordSchema.parse({
+  // `truncated` mide cuánto se alcanzó a inspeccionar, no si el proyecto puede
+  // operar (ADR-0040). Se conserva como cobertura; el estado solo lo degradan
+  // condiciones que un humano debe resolver.
+  const record = projectCatalogRecordSchema.parse({
     id: project.id,
     displayName: project.name,
     description: project.description,
     selectedRoot: workspace.rootPath,
-    state: topology.truncated ? "review" : "ready",
+    state: "ready",
     topology: inferredTopology,
     nodes: [...deduplicated.values()].map((node) => ({
       id: `node_${hashText(`${project.id}:${node.kind}:${node.relativePath}`).slice(0, 24)}`,
@@ -327,6 +346,30 @@ async function catalogRecordForWorkspace(
     createdAt: previous?.createdAt ?? project.createdAt,
     updatedAt: now,
   });
+  return {
+    record,
+    scan: projectScanRecordSchema.parse({
+      projectId: project.id,
+      coverage: topology.truncated ? "partial" : "complete",
+      scannedEntries: topology.scannedEntries,
+      entryLimit: DEFAULT_TOPOLOGY_LIMITS.maxEntries,
+      observedAt: now,
+    }),
+  };
+}
+
+/**
+ * Persiste ficha y cobertura como una sola operación y deja evidencia cuando el
+ * estado cambia (ADR-0040): un rescan actualiza estructura y nunca degrada una
+ * decisión de confianza en silencio.
+ */
+async function persistCatalogRecord(build: CatalogRecordBuild, previous?: ProjectCatalogRecord): Promise<ProjectCatalogRecord> {
+  const stored = await upsertProjectCatalogRecord(projectCatalogPath(), build.record);
+  await upsertProjectScanRecord(projectScanPath(), build.scan).catch(() => undefined);
+  if (previous !== undefined && previous.state !== stored.state) {
+    recordProjectAudit(`project.state.${stored.state}`, stored.id, undefined);
+  }
+  return stored;
 }
 
 function onboardingOwner(event: IpcMainInvokeEvent): string {
@@ -551,6 +594,7 @@ async function finalizeOnboarding(ownerId: string, input: unknown): Promise<Onbo
   let selectedWorkspaceIds: readonly string[];
   let consumedSelectionId: string | undefined;
   let workspaceForNewProject: AuthorizedWorkspace | undefined;
+  let catalogBuild: CatalogRecordBuild | undefined;
 
   if (parsed.kind === "existing") {
     if (draft.existingProjectId !== parsed.projectId) throw new Error("El proyecto seleccionado cambió. Vuelve a revisarlo.");
@@ -601,7 +645,8 @@ async function finalizeOnboarding(ownerId: string, input: unknown): Promise<Onbo
       workspaceIds: [workspace.id],
       setupStatus: "ready",
     });
-    record = await catalogRecordForWorkspace(project, workspace);
+    catalogBuild = await catalogRecordForWorkspace(project, workspace);
+    record = catalogBuild.record;
     selectedWorkspaceIds = [workspace.id];
     consumedSelectionId = parsed.folderSelectionId;
     workspaceForNewProject = workspace;
@@ -617,11 +662,11 @@ async function finalizeOnboarding(ownerId: string, input: unknown): Promise<Onbo
         await upsertWorkspace(registryPath, { ...workspace, enabled: true, permissions });
       }
     } else {
-      if (workspaceForNewProject === undefined) throw new Error("La selección local ya no está disponible.");
+      if (workspaceForNewProject === undefined || catalogBuild === undefined) throw new Error("La selección local ya no está disponible.");
       await upsertWorkspace(registryPath, workspaceForNewProject);
       const registry = await loadRegistryDocument(registryPath);
       await upsertDevelopmentProject(projectStorePath(), registry, project);
-      await upsertProjectCatalogRecord(projectCatalogPath(), record);
+      await persistCatalogRecord(catalogBuild);
     }
     const decision = await setProjectTrust(projectTrustPath(), {
       projectId: project.id,
@@ -675,13 +720,31 @@ async function ensureV1Catalog(): Promise<void> {
   if (missing.length > 0) await replaceProjectCatalog(projectCatalogPath(), [...catalog.projects, ...missing]);
 }
 
+/**
+ * Reevalúa al arrancar los proyectos que quedaron en `review` (ADR-0040). Una
+ * instalación degradada por un escaneo incompleto no puede recuperarse por
+ * actividad, porque la actividad es justo lo que está bloqueado. Solo toca
+ * fichas de una única carpeta: las de varias raíces siguen exigiendo revisión.
+ */
+async function healReviewedProjects(): Promise<void> {
+  const catalog = await loadProjectCatalog(projectCatalogPath()).catch(() => undefined);
+  for (const project of catalog?.projects.filter((candidate) => candidate.state === "review") ?? []) {
+    // Secuencial a propósito: cada reconciliación recorre el disco y escribe el
+    // catálogo; en paralelo competirían por la misma escritura atómica.
+    await rescanV1ProjectFromActivity(project.id).catch(() => undefined);
+  }
+}
+
 async function rescanV1ProjectFromActivity(projectId: string): Promise<void> {
   const [registry, catalog] = await Promise.all([
     loadRegistryDocument(registryPath),
     loadProjectCatalog(projectCatalogPath()),
   ]);
   const current = catalog.projects.find((candidate) => candidate.id === projectId);
-  if (current === undefined || current.state !== "ready") return;
+  // `review` sí se reevalúa (ADR-0040): si la causa desapareció, el proyecto debe
+  // poder recuperarse solo. `unavailable` y `conflict` describen condiciones que un
+  // rescan de estructura no resuelve por sí mismo.
+  if (current === undefined || (current.state !== "ready" && current.state !== "review")) return;
   const workspaceRefs = current.compatibilityRefs.filter((reference) => reference.kind === "workspace");
   if (workspaceRefs.length !== 1) return;
   const workspace = registry.workspaces.find((candidate) => candidate.id === workspaceRefs[0]?.id);
@@ -689,8 +752,8 @@ async function rescanV1ProjectFromActivity(projectId: string): Promise<void> {
   const legacy = (await listDevelopmentProjects(projectStorePath(), registry)).find((candidate) => candidate.id === projectId);
   if (legacy === undefined) return;
   const updated = await catalogRecordForWorkspace(legacy, workspace, current);
-  if (updated.scanFingerprint === current.scanFingerprint) return;
-  await upsertProjectCatalogRecord(projectCatalogPath(), updated);
+  if (updated.record.scanFingerprint === current.scanFingerprint && updated.record.state === current.state) return;
+  await persistCatalogRecord(updated, current);
   sendToRenderer("projects:changed");
 }
 
@@ -793,6 +856,7 @@ function desktopBundledRuntimePaths() {
 async function startDevelopmentRuntime(): Promise<void> {
   await migrateRegistryFile(registryPath);
   await ensureV1Catalog();
+  await healReviewedProjects();
   await interruptProjectSetupSessions(projectSetupStorePath());
   const resourcesRoot = app.isPackaged ? process.resourcesPath : app.getAppPath();
   const runtimePaths = desktopBundledRuntimePaths();
@@ -908,6 +972,14 @@ async function listProjectsForBroker() {
   const registry = await loadRegistryDocument(registryPath);
   const enabled = new Set(registry.workspaces.filter((workspace) => workspace.enabled).map((workspace) => workspace.id));
   const projects = await listDevelopmentProjects(projectStorePath(), registry);
+  // El estado del catálogo y la cobertura del escaneo se informan al agente
+  // (ADR-0040) para que pueda explicar una estructura parcial o una revisión
+  // pendiente en vez de encontrarse una denegación sin causa visible. No se
+  // exponen recuentos, rutas ni nombres de carpeta.
+  const [catalog, scans] = await Promise.all([
+    loadProjectCatalog(projectCatalogPath()).catch(() => ({ schemaVersion: 1 as const, projects: [] })),
+    loadProjectScanStore(projectScanPath()).catch(() => ({ schemaVersion: 1 as const, scans: [] })),
+  ]);
   return {
     projects: projects.filter((project) => project.workspaceIds.every((workspaceId) => enabled.has(workspaceId))).map((project) => ({
       projectId: project.id,
@@ -916,6 +988,8 @@ async function listProjectsForBroker() {
       workspaceIds: project.workspaceIds,
       ...(project.applicationId === undefined ? {} : { applicationId: project.applicationId }),
       setupStatus: project.setupStatus,
+      state: catalog.projects.find((record) => record.id === project.id)?.state ?? "unavailable",
+      scanCoverage: scans.scans.find((scan) => scan.projectId === project.id)?.coverage ?? "unknown",
     })),
   };
 }
@@ -1462,8 +1536,8 @@ function registerIpcHandlers(): void {
     const project = buildNewDevelopmentProject({ name, description, workspaceIds: [workspace.id], setupStatus: "ready" });
     try {
       await upsertDevelopmentProject(projectStorePath(), registry, project);
-      const record = await catalogRecordForWorkspace(project, workspace);
-      await upsertProjectCatalogRecord(projectCatalogPath(), record);
+      const build = await catalogRecordForWorkspace(project, workspace);
+      const record = await persistCatalogRecord(build);
       const decision = await setProjectTrust(projectTrustPath(), { projectId: project.id, mode: trustMode, deviceBinding });
       recordProjectAudit("project.create", project.id, workspace.id);
       sendToRenderer("projects:changed");
@@ -1471,6 +1545,7 @@ function registerIpcHandlers(): void {
     } catch (error) {
       await removeDevelopmentProject(projectStorePath(), project.id).catch(() => undefined);
       await removeProjectCatalogRecord(projectCatalogPath(), project.id).catch(() => undefined);
+      await removeProjectScanRecord(projectScanPath(), project.id).catch(() => undefined);
       await replaceRegistry(registryPath, previousRegistry).catch(() => undefined);
       throw error;
     }
@@ -1563,8 +1638,7 @@ function registerIpcHandlers(): void {
     const workspaceRef = workspaceRefs[0];
     const workspace = registry.workspaces.find((candidate) => candidate.id === workspaceRef?.id);
     if (workspace === undefined) throw new Error("La carpeta vinculada ya no está disponible.");
-    const updated = await catalogRecordForWorkspace(legacy, workspace, current);
-    await upsertProjectCatalogRecord(projectCatalogPath(), updated);
+    const updated = await persistCatalogRecord(await catalogRecordForWorkspace(legacy, workspace, current), current);
     sendToRenderer("projects:changed");
     return updated;
   });
@@ -1674,6 +1748,7 @@ function registerIpcHandlers(): void {
     await terminalSupervisor?.stopProject(projectId);
     await removeDevelopmentProject(projectStorePath(), projectId);
     await removeProjectCatalogRecord(projectCatalogPath(), projectId).catch(() => undefined);
+    await removeProjectScanRecord(projectScanPath(), projectId).catch(() => undefined);
     await revokeProjectTrust(projectTrustPath(), projectId).catch(() => undefined);
     recordProjectAudit("project.remove", projectId, undefined);
   });

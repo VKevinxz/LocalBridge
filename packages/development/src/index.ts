@@ -55,7 +55,11 @@ export {
   type SetupSupervisorOptions,
 } from './setup-supervisor.js';
 export {
+  FINISHED_RETENTION_MS,
+  MAX_RETAINED_FINISHED,
   TerminalSupervisor,
+  expiredTerminalSessions,
+  type RetainedTerminalSession,
   type ResolvedTerminalListener,
   type TerminalListenerInput,
   type TerminalListenerSummary,

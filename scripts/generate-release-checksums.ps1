@@ -45,7 +45,8 @@ $lines = foreach ($artifact in $artifacts) {
   } finally {
     $stream.Dispose()
   }
-  "$hash  $($artifact.Name)"
+  $publishedName = $artifact.Name.Replace(' ', '.')
+  "$hash  $publishedName"
 }
 
 $outputPath = Join-Path $resolvedDirectory 'SHA256SUMS.txt'

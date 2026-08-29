@@ -16,6 +16,7 @@ import {
   registerBrowserSnapshotTool,
   registerBrowserStartTool,
   registerBrowserStopTool,
+  registerBrowserViewportTool,
 } from './tools/browser-read-tools.js';
 import {
   registerBrowserClickTool,
@@ -70,8 +71,9 @@ function serverInstructions(config: ServerConfig): string {
     'LocalBridge MCP exposes structured operations over folders the user authorized, plus terminal sessions only for projects whose local trust level explicitly enables them.',
     'Paths are always relative to a workspace and are addressed by workspaceId; absolute paths and arbitrary roots are rejected.',
     'Call workspace.list first to discover which workspaces exist and what each one permits.',
-    'Call project.list to discover assisted project groupings. project.setup.refresh may only refresh a frozen local proposal; it never approves or executes setup. Tell the user to review setup in LocalBridge when project.setup.status reports awaiting-local-review.',
+    'Call project.list to discover assisted project groupings. Each project reports state and scanCoverage: a partial coverage only means the reported structure is incomplete and never blocks work. project.setup.refresh may only refresh a frozen local proposal; it never approves or executes setup. Tell the user to review setup in LocalBridge when project.setup.status reports awaiting-local-review.',
     'Prefer application.list for configured environments. Call application.start once, poll application.status until ready, then call browser.start with its applicationId, runId and primaryWorkspaceId; never reconstruct services, trust stdout URLs, or supply hosts and ports. Use process tools only for diagnostics or standalone profiles.',
+    'To verify a responsive layout, call browser.viewport with the width and height you want to test, then take a fresh snapshot or screenshot: the previous snapshot is invalidated because the layout changed.',
     'After the work is complete, call browser.stop and application.stop for the same runId. LocalBridge rolls back partial starts and only stops processes it owns.',
     'If a local step requires the user, and browserHumanControl is granted, call browser.human.request once with an informational fixed reason, tell the user to take and later return control in LocalBridge, then poll browser.human.status. Never request, infer or handle credentials, file paths or file contents, and never use other browser tools while human control is pending or active.',
     approvalInstruction,
@@ -163,6 +165,7 @@ export function createMcpServer({ config, logger, workspaceConfigPath }: CreateM
     registerBrowserSnapshotTool,
     registerBrowserStartTool,
     registerBrowserStopTool,
+    registerBrowserViewportTool,
     registerFileCreateTool,
     registerFileDeleteTool,
     registerFileMetadataTool,

@@ -479,6 +479,23 @@ function adoptProjectHtml(): string {
   return `<form id="adopt-project-form" class="surface-card"><div class="card-heading"><div><h3>Agrupar configuración existente</h3><p>Solo crea una referencia de organización; no cambia permisos, perfiles ni aplicaciones.</p></div><button type="button" id="cancel-adopt-project">Cancelar</button></div><label>Nombre<input name="name" maxlength="80" required /></label><fieldset><legend>Carpetas autorizadas</legend>${workspaces.map((workspace) => `<label class="checkbox-row"><input type="checkbox" name="workspaceId" value="${workspace.id}"/>${escapeHtml(workspace.name)}</label>`).join('')}</fieldset><label>Aplicación opcional<select name="applicationId"><option value="">Sin aplicación</option>${applications.map((application) => `<option value="${application.id}">${escapeHtml(application.name)}</option>`).join('')}</select></label><button type="submit" class="primary">Crear agrupación</button><p id="adopt-error" class="error-text"></p></form>`;
 }
 
+/**
+ * Motivo real del estado de una ficha v1 (ADR-0040). Un escaneo incompleto ya no
+ * degrada el estado, así que `review` solo aparece por ambigüedad de raíces.
+ */
+function v1ProjectStateNote(state: string): string {
+  if (state === 'review') {
+    return '<p class="risk-note">Este proyecto tiene varias raíces sin resolver. Vuelve a abrirlo desde la carpeta que las contiene para analizarlo como una unidad.</p>';
+  }
+  if (state === 'unavailable') {
+    return '<p class="risk-note">La carpeta vinculada ya no está disponible. Revísala antes de volver a usar el proyecto.</p>';
+  }
+  if (state === 'conflict') {
+    return '<p class="risk-note risk-high">Hay definiciones incompatibles para este proyecto. Repáralas antes de habilitar terminal.</p>';
+  }
+  return '';
+}
+
 function assistedProjectsSectionHtml(): string {
   const error = assistedProjectsError === undefined ? '' : `<p class="feedback feedback-error">${escapeHtml(assistedProjectsError)}</p>`;
   const draft = v1ProjectDraft;
@@ -488,7 +505,7 @@ function assistedProjectsSectionHtml(): string {
     const mode = decision?.status === 'active' ? decision.mode : 'guided';
     const busy = v1BusyProjectId === project.id;
     const label = mode === 'full-host' ? 'Control total' : mode === 'project-agent' ? 'Agente en proyecto' : 'Guiado';
-    const review = project.state !== 'ready' ? '<p class="risk-note">Este proyecto heredado contiene varias raíces o una detección parcial. Ábrelo nuevamente desde una carpeta padre antes de habilitar terminal.</p>' : '';
+    const review = v1ProjectStateNote(project.state);
     return `<article class="workspace-card"><div class="card-heading"><div><h3>${escapeHtml(project.displayName)}</h3><p>${escapeHtml(project.description || project.selectedRoot)}</p></div><span class="state-pill ${mode === 'full-host' ? 'state-danger' : ''}">${label}</span></div><p><strong>Estructura:</strong> ${escapeHtml(project.topology)} · ${project.nodes.length} nodo(s)</p>${review}${mode === 'full-host' ? '<p class="risk-note risk-high">La terminal puede operar fuera de esta carpeta con la autoridad de tu cuenta.</p>' : '<p class="dependency-note">La terminal general está desactivada. Los permisos existentes siguen iguales.</p>'}<div class="actions"><button type="button" data-v1-rescan="${project.id}" ${busy ? 'disabled aria-busy="true"' : ''}>Revisar estructura</button>${mode === 'full-host' ? `<button type="button" data-v1-guided="${project.id}" ${busy ? 'disabled' : ''}>Volver a Guiado</button><button type="button" class="danger" data-v1-revoke="${project.id}" ${busy ? 'disabled' : ''}>Revocar</button>` : `<button type="button" class="primary" data-v1-full="${project.id}" ${busy || project.state !== 'ready' ? 'disabled' : ''}>Habilitar control total</button>`}<button type="button" data-assisted-remove="${project.id}" ${busy ? 'disabled' : ''}>Eliminar ficha</button></div></article>`;
   }).join('');
   const v1ProjectIds = new Set(v1Projects.projects.map((project) => project.id));
@@ -914,6 +931,10 @@ const AUDIT_ACTION_LABELS: Record<string, string> = {
   'project.refresh': 'Actualizó el análisis del proyecto',
   'project.remove': 'Eliminó una agrupación',
   'project.topology.scan': 'Detectó la topología del proyecto',
+  'project.state.ready': 'El proyecto quedó listo para operar',
+  'project.state.review': 'El proyecto pasó a revisión local',
+  'project.state.unavailable': 'El proyecto quedó no disponible',
+  'project.state.conflict': 'El proyecto quedó en conflicto',
   'project.setup.plan': 'Preparó una propuesta local',
   'project.setup.execute': 'Ejecutó una preparación aprobada',
   'project.setup.cancel': 'Canceló una preparación',

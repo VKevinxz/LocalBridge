@@ -14,8 +14,44 @@ import {
   technicalTerminalOrigin,
 } from "./terminal-origin.js";
 
-const MAX_ACTIVE_GLOBAL = 12;
-const MAX_ACTIVE_PER_PROJECT = 4;
+const MAX_ACTIVE_GLOBAL = 16;
+const MAX_ACTIVE_PER_PROJECT = 8;
+
+/**
+ * Una sesión terminada se conserva para que el agente pueda leer su salida
+ * final, pero no para siempre: cada entrada retiene hasta `MAX_OUTPUT_BYTES`
+ * (ADR-0043). Se podan por antigüedad y por número.
+ */
+export const FINISHED_RETENTION_MS = 30 * 60_000;
+export const MAX_RETAINED_FINISHED = 24;
+
+export interface RetainedTerminalSession {
+  readonly sessionId: string;
+  readonly state: TerminalState;
+  /** Instante en que dejó de ejecutarse; ausente mientras sigue viva. */
+  readonly finishedAtMs?: number | undefined;
+}
+
+/**
+ * Sesiones terminadas que ya pueden liberarse: las que superaron la ventana de
+ * retención y, si aún quedan demasiadas, las más antiguas. Nunca devuelve una
+ * sesión en ejecución.
+ */
+export function expiredTerminalSessions(
+  sessions: readonly RetainedTerminalSession[],
+  nowMs: number,
+  ttlMs: number = FINISHED_RETENTION_MS,
+  maxRetained: number = MAX_RETAINED_FINISHED,
+): string[] {
+  const finished = sessions
+    .filter((session) => session.state !== "running" && session.finishedAtMs !== undefined)
+    .map((session) => ({ sessionId: session.sessionId, finishedAtMs: session.finishedAtMs! }))
+    .toSorted((left, right) => left.finishedAtMs - right.finishedAtMs);
+  const expired = new Set(finished.filter((session) => nowMs - session.finishedAtMs >= ttlMs).map((session) => session.sessionId));
+  const remaining = finished.filter((session) => !expired.has(session.sessionId));
+  for (const session of remaining.slice(0, Math.max(0, remaining.length - maxRetained))) expired.add(session.sessionId);
+  return [...expired];
+}
 const MAX_OUTPUT_BYTES = 1024 * 1024;
 const MAX_WRITE_BYTES = 64 * 1024;
 const MAX_CONTROL_BUFFER_BYTES = 16 * 1024;
@@ -91,6 +127,8 @@ interface MutableTerminal {
   resolveReady(): void;
   ready: boolean;
   timer: NodeJS.Timeout;
+  /** Instante en que dejó de ejecutarse; habilita la poda por retención. */
+  finishedAtMs?: number;
   state: TerminalState;
   outputBytes: number;
   nextCursor: number;
@@ -186,6 +224,21 @@ export class TerminalSupervisor {
     this.now = options.now ?? Date.now;
   }
 
+  /**
+   * Autoridad para operar sobre una sesión que ya fue autorizada al crearse
+   * (ADR-0040). No exige `state === "ready"`: leer o cerrar una sesión viva no
+   * amplía autoridad, y negarlo solo deja procesos que el cliente no puede
+   * recoger. Iniciar o escribir sí pasan por {@linkcode authority}.
+   */
+  private async sessionAuthority(projectId: string): Promise<{
+    project: ProjectCatalogRecord;
+    trust: ProjectTrustRecord & { mode: "project-agent" | "full-host" };
+  }> {
+    const project = await this.options.loadProject(projectId);
+    if (project === undefined) brokerError("PROJECT_NOT_FOUND", "El proyecto no existe.");
+    return this.trusted(project);
+  }
+
   private async authority(projectId: string): Promise<{
     project: ProjectCatalogRecord;
     trust: ProjectTrustRecord & { mode: "project-agent" | "full-host" };
@@ -193,6 +246,14 @@ export class TerminalSupervisor {
     const project = await this.options.loadProject(projectId);
     if (project === undefined) brokerError("PROJECT_NOT_FOUND", "El proyecto no existe.");
     if (project.state !== "ready") brokerError("PROJECT_REVIEW_REQUIRED", "El proyecto requiere revisión local.");
+    return this.trusted(project);
+  }
+
+  private async trusted(project: ProjectCatalogRecord): Promise<{
+    project: ProjectCatalogRecord;
+    trust: ProjectTrustRecord & { mode: "project-agent" | "full-host" };
+  }> {
+    const projectId = project.id;
     const trust = await this.options.loadTrust(projectId);
     if (trust === undefined || trust.status !== "active") brokerError("TERMINAL_NOT_AUTHORIZED", "La terminal no está autorizada localmente.");
     if (trust.deviceBinding !== this.options.deviceBinding) brokerError("TERMINAL_NOT_AUTHORIZED", "La confianza pertenece a otro equipo.");
@@ -201,6 +262,21 @@ export class TerminalSupervisor {
       brokerError("SANDBOX_UNAVAILABLE", "El aislamiento de proyecto no está disponible; la sesión fue denegada.");
     }
     return { project, trust: trust as ProjectTrustRecord & { mode: "project-agent" | "full-host" } };
+  }
+
+  /**
+   * Libera sesiones terminadas fuera de la ventana de retención (ADR-0043). Sin
+   * esto, cada terminal cerrada conservaba su búfer de salida hasta cerrar la
+   * aplicación, y subir el límite de terminales habría multiplicado esa
+   * retención.
+   */
+  private pruneFinished(): void {
+    const expired = expiredTerminalSessions([...this.entries.values()], this.now());
+    for (const sessionId of expired) {
+      this.entries.delete(sessionId);
+      for (const [key, value] of this.operations) if (value === sessionId) this.operations.delete(key);
+      for (const [key, value] of this.writeOperations) if (value.sessionId === sessionId) this.writeOperations.delete(key);
+    }
   }
 
   private entry(projectId: string, sessionId: string): MutableTerminal {
@@ -292,6 +368,7 @@ export class TerminalSupervisor {
     if (previous !== undefined) return summary(this.entry(projectId, previous));
 
     const { project, trust } = await this.authority(projectId);
+    this.pruneFinished();
     const active = [...this.entries.values()].filter((candidate) => candidate.state === "running");
     if (active.length >= MAX_ACTIVE_GLOBAL || active.filter((candidate) => candidate.projectId === projectId).length >= MAX_ACTIVE_PER_PROJECT) {
       brokerError("RATE_LIMITED", "Se alcanzó el límite de terminales activas.");
@@ -362,6 +439,7 @@ export class TerminalSupervisor {
     control.on("close", () => entry.listeners.clear());
     child.once("error", () => {
       if (entry.state === "running") entry.state = "exited";
+      entry.finishedAtMs ??= this.now();
       entry.exitCode = -1;
       entry.listeners.clear();
       clearTimeout(entry.timer);
@@ -369,6 +447,7 @@ export class TerminalSupervisor {
     });
     child.once("close", (code) => {
       if (entry.state === "running") entry.state = "exited";
+      entry.finishedAtMs ??= this.now();
       entry.exitCode = code ?? -1;
       entry.listeners.clear();
       clearTimeout(entry.timer);
@@ -412,7 +491,7 @@ export class TerminalSupervisor {
   }
 
   async read(projectId: string, sessionId: string, cursor: number, maxBytes: number) {
-    await this.authority(projectId);
+    await this.sessionAuthority(projectId);
     const entry = this.entry(projectId, sessionId);
     const firstCursor = entry.output[0]?.cursor ?? entry.nextCursor;
     let used = 0;
@@ -434,7 +513,7 @@ export class TerminalSupervisor {
   }
 
   async status(projectId: string, sessionId: string): Promise<{ session: TerminalSummary; listeners: readonly TerminalListenerSummary[] }> {
-    await this.authority(projectId);
+    await this.sessionAuthority(projectId);
     const entry = this.entry(projectId, sessionId);
     const cutoff = this.now() - LISTENER_STALE_MS;
     return { session: summary(entry), listeners: [...entry.listeners.values()].filter((listener) => listener.observedAtMs >= cutoff).map(listenerSummary) };
@@ -479,7 +558,7 @@ export class TerminalSupervisor {
   }
 
   async stop(projectId: string, sessionId: string): Promise<TerminalSummary> {
-    await this.authority(projectId);
+    await this.sessionAuthority(projectId);
     await this.terminate(sessionId, "stopped");
     return summary(this.entry(projectId, sessionId));
   }
@@ -502,6 +581,7 @@ export class TerminalSupervisor {
     const entry = this.entries.get(sessionId);
     if (entry === undefined || entry.state !== "running") return;
     entry.state = state;
+    entry.finishedAtMs ??= this.now();
     entry.listeners.clear();
     entry.child.kill();
     await entry.closePromise;

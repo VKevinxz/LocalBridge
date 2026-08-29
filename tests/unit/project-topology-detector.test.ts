@@ -126,4 +126,48 @@ describe("project topology detector", () => {
     expect(result.truncated).toBe(true);
     expect(result.scannedEntries).toBeGreaterThanOrEqual(4);
   });
+
+  it("una ruta denegada libera presupuesto de escaneo (ADR-0040)", async () => {
+    const rootPath = await root();
+    await mkdir(path.join(rootPath, "datos"), { recursive: true });
+    for (let index = 0; index < 30; index += 1) {
+      await writeFile(path.join(rootPath, "datos", `bloque-${index}.bin`), "x");
+    }
+    await writeFile(path.join(rootPath, "package.json"), JSON.stringify({ scripts: { dev: "vite" } }));
+
+    const sinDenegar = await detectProjectTopology(buildWorkspace({ rootPath }));
+    const denegado = await detectProjectTopology(buildWorkspace({ rootPath, denyPatterns: ["datos/"] }));
+
+    expect(denegado.scannedEntries).toBeLessThan(sinDenegar.scannedEntries);
+    expect(denegado.manifests.map((manifest) => manifest.path)).toEqual(["package.json"]);
+  });
+
+  it("una carpeta enorme no deja sin explorar a sus hermanas", async () => {
+    const rootPath = await root();
+    await mkdir(path.join(rootPath, "aaa-datos"), { recursive: true });
+    for (let index = 0; index < 40; index += 1) {
+      await writeFile(path.join(rootPath, "aaa-datos", `bloque-${index}.bin`), "x");
+    }
+    await mkdir(path.join(rootPath, "zzz-api"), { recursive: true });
+    await writeFile(path.join(rootPath, "zzz-api", "package.json"), JSON.stringify({ scripts: { dev: "node server.js" } }));
+
+    const result = await detectProjectTopology(buildWorkspace({ rootPath }), { maxEntriesPerDirectory: 5 });
+
+    expect(result.truncated).toBe(true);
+    expect(result.manifests.map((manifest) => manifest.path)).toContain("zzz-api/package.json");
+  });
+
+  it("omite directorios de datos y cachés habituales", async () => {
+    const rootPath = await root();
+    for (const ignored of [".venv", "storage", "pgdata", "__pycache__"]) {
+      await mkdir(path.join(rootPath, ignored), { recursive: true });
+      await writeFile(path.join(rootPath, ignored, "package.json"), JSON.stringify({ scripts: { dev: "vite" } }));
+    }
+    await writeFile(path.join(rootPath, "package.json"), JSON.stringify({ scripts: { dev: "vite" } }));
+
+    const result = await detectProjectTopology(buildWorkspace({ rootPath }));
+
+    expect(result.manifests.map((manifest) => manifest.path)).toEqual(["package.json"]);
+    expect(result.truncated).toBe(false);
+  });
 });

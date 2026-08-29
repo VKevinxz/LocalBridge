@@ -3,10 +3,10 @@
 Aplicación de escritorio para conectar ChatGPT con proyectos locales de Windows de forma
 explícita, auditable y revocable.
 
-**Versión actual:** `v1.1.0` · **Plataforma:** Windows x64 · **Estado:** preview ·
+**Versión actual:** `v1.2.1` · **Plataforma:** Windows x64 · **Estado:** preview ·
 **Licencia:** `UNLICENSED`
 
-[Descargar la preview](https://github.com/VKevinxz/LocalBridge/releases/tag/preview-v1.1.0.3) ·
+[Descargar la preview](https://github.com/VKevinxz/LocalBridge/releases/tag/preview-v1.2.1.1) ·
 [Repositorio oficial](https://github.com/VKevinxz/LocalBridge) ·
 [Instalación](docs/GETTING_STARTED.md) ·
 [Avisos de Windows](docs/WINDOWS_INSTALLATION.md) ·

@@ -234,6 +234,41 @@ export function registerBrowserSnapshotTool(server: McpServer, ctx: ToolContext)
   });
 }
 
+export function registerBrowserViewportTool(server: McpServer, ctx: ToolContext): void {
+  const outputSchema = z.object({
+    sessionId: sessionIdSchema,
+    width: z.number().int(),
+    height: z.number().int(),
+    mobile: z.boolean(),
+    state: z.string().max(32),
+  }).strict();
+  server.registerTool('browser.viewport', {
+    title: 'Resize the isolated local page for responsive testing',
+    description: 'Emulates a viewport size in an isolated LocalBridge browser session so responsive layouts and breakpoints can be verified, and optionally emulates a touch device. Width must be 320-3840 and height 320-2160. It does not resize the user window, navigate, change the allowed origin or grant any capability, and it invalidates the current snapshot because the layout changes. Take a new snapshot or screenshot afterwards. Requires browserRead.',
+    inputSchema: z.object({
+      workspaceId: workspaceIdSchema,
+      sessionId: sessionIdSchema,
+      width: z.number().int().min(320).max(3840),
+      height: z.number().int().min(320).max(2160),
+      mobile: z.boolean().default(false),
+      operationId: operationIdSchema,
+    }).strict(),
+    outputSchema,
+    annotations: { readOnlyHint: false, idempotentHint: true, destructiveHint: false, openWorldHint: false },
+  }, async ({ workspaceId, sessionId, width, height, mobile, operationId }) => {
+    const auditBase = audit(ctx, 'browser.viewport', 'R2', workspaceId, sessionId, operationId);
+    try {
+      await requireRead(ctx, workspaceId);
+      const result = outputSchema.parse(await client(ctx).call('browser.viewport', {
+        workspaceId, sessionId, width, height, mobile, ...(operationId === undefined ? {} : { operationId }),
+      }));
+      return toolSuccess(result, { context: auditBase, logger: ctx.logger });
+    } catch (error) {
+      return toolError(mapBrokerError(error), ctx.logger, { tool: 'browser.viewport', workspaceId, sessionId }, auditBase);
+    }
+  });
+}
+
 export function registerBrowserScreenshotTool(server: McpServer, ctx: ToolContext): void {
   const outputSchema = z.object({ mimeType: z.literal('image/png'), width: z.number().int(), height: z.number().int() });
   const brokerSchema = outputSchema.extend({ dataBase64: z.string() });

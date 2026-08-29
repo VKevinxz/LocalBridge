@@ -4,6 +4,56 @@ Los cambios relevantes de LocalBridge MCP se documentan aquí. El proyecto sigue
 [Semantic Versioning](https://semver.org/lang/es/) y publica artefactos mediante GitHub
 Releases.
 
+## [1.2.1] — 2026-08-28
+
+### Mejorado
+
+- el límite de terminales concurrentes pasa de 4 a 8 por proyecto y de 12 a 16 en total.
+
+### Corregido
+
+- una terminal cerrada dejaba de liberarse nunca y retenía su salida completa hasta cerrar la
+  aplicación; ahora se conserva 30 minutos o hasta 24 sesiones cerradas.
+
+## [1.2.0] — 2026-08-28
+
+### Añadido
+
+- `browser.viewport`: emula un tamaño de vista para comprobar diseño responsive y puntos de
+  ruptura, con emulación táctil opcional;
+- las capturas informan el tamaño realmente renderizado.
+
+### Seguridad
+
+- el tamaño se emula sin redimensionar ventanas del usuario y se restablece cuando la persona
+  toma el control local;
+- la tool acepta solo dimensiones enteras acotadas y una bandera táctil: ni URL, ni puerto, ni
+  selector, ni agente de usuario, ni escala de dispositivo.
+
+## [1.1.2] — 2026-08-28
+
+### Corregido
+
+- la detección de campos de credenciales del navegador compara palabras completas y deja de
+  bloquear campos inocentes como `secretaria` o `wizard`;
+- se reconocen términos en español (`contraseña`, `clave de acceso`, `tarjeta`, `código de
+  seguridad`) que antes no se detectaban;
+- se distingue «palabra clave» de una clave real y se tiene en cuenta el texto de ayuda del
+  campo.
+
+## [1.1.1] — 2026-08-28
+
+### Corregido
+
+- un escaneo de estructura incompleto ya no degrada el estado de un proyecto ni revoca
+  capacidades concedidas: la cobertura pasa a ser un metadato informado, no un estado;
+- `project.list` informa estado y cobertura para que el cliente pueda explicar una
+  estructura parcial;
+- leer, consultar y cerrar una terminal existente dejan de bloquearse cuando el proyecto
+  requiere revisión; iniciar y escribir conservan la revisión;
+- un proyecto que quedó en revisión vuelve a evaluarse solo, incluso al arrancar;
+- el presupuesto del escaneo respeta la denylist y omite directorios de datos y cachés.
+
 ## [1.1.0] — 2026-08-27
 
 ### Añadido
@@ -53,6 +103,10 @@ Releases.
 - baseline funcional de filesystem, Git de lectura, validaciones, auditoría y Secure MCP
   Tunnel.
 
+[1.2.1]: https://github.com/VKevinxz/LocalBridge/releases/tag/v1.2.1
+[1.2.0]: https://github.com/VKevinxz/LocalBridge/releases/tag/v1.2.0
+[1.1.2]: https://github.com/VKevinxz/LocalBridge/releases/tag/v1.1.2
+[1.1.1]: https://github.com/VKevinxz/LocalBridge/releases/tag/v1.1.1
 [1.1.0]: https://github.com/VKevinxz/LocalBridge/releases/tag/v1.1.0
 [1.0.0]: https://github.com/VKevinxz/LocalBridge/releases/tag/v1.0.0
 [0.9.0]: https://github.com/VKevinxz/LocalBridge/releases/tag/v0.9.0

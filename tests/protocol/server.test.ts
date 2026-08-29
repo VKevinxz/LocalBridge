@@ -53,6 +53,7 @@ describe('protocolo MCP 2026-07-28', () => {
       'browser.snapshot',
       'browser.start',
       'browser.stop',
+      'browser.viewport',
       'file.create',
       'file.delete',
       'file.metadata',

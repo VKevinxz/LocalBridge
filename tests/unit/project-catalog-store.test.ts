@@ -9,10 +9,13 @@ import {
   buildNewDevelopmentProject,
   loadProjectCatalog,
   loadOrCreateDeviceBinding,
+  loadProjectScanStore,
   loadProjectTrustStore,
   migrateDevelopmentProjectsToCatalog,
   removeProjectCatalogRecord,
+  removeProjectScanRecord,
   revokeProjectTrust,
+  upsertProjectScanRecord,
   setProjectTrust,
   upsertProjectCatalogRecord,
 } from "@localbridge/desktop-core";
@@ -24,7 +27,11 @@ afterEach(async () => Promise.all(roots.splice(0).map((root) => rm(root, { recur
 async function fixture() {
   const root = await mkdtemp(path.join(os.tmpdir(), "localbridge-project-catalog-"));
   roots.push(root);
-  return { catalog: path.join(root, "project-catalog.json"), trust: path.join(root, "project-trust.json") };
+  return {
+    catalog: path.join(root, "project-catalog.json"),
+    trust: path.join(root, "project-trust.json"),
+    scan: path.join(root, "project-scan.json"),
+  };
 }
 
 describe("project catalog v1", () => {
@@ -90,5 +97,52 @@ describe("project catalog v1", () => {
     await upsertProjectCatalogRecord(files.catalog, project);
     await removeProjectCatalogRecord(files.catalog, project.id);
     expect(await loadProjectCatalog(files.catalog)).toEqual({ schemaVersion: 1, projects: [] });
+  });
+
+  it("SCAN-000: varias raíces sin resolver siguen exigiendo revisión local", async () => {
+    const workspaces = [
+      buildWorkspace({ id: "ws_uno", rootPath: "D:\\Proyectos\\Uno" }),
+      buildWorkspace({ id: "ws_dos", rootPath: "D:\\Proyectos\\Dos" }),
+    ];
+    const project = buildNewDevelopmentProject({ name: "Multi", workspaceIds: ["ws_uno", "ws_dos"] });
+    const [migrated] = migrateDevelopmentProjectsToCatalog([project], { schemaVersion: 4, workspaces, applications: [] });
+    expect(migrated?.state).toBe("review");
+  });
+
+  it("SCAN-001: la cobertura vive fuera del catálogo y no altera su contenido", async () => {
+    const files = await fixture();
+    const project = buildEmptyProjectCatalogRecord({ displayName: "Cobertura", selectedRoot: "D:\\Cobertura" });
+    await upsertProjectCatalogRecord(files.catalog, project);
+    const catalogBefore = await readFile(files.catalog, "utf8");
+
+    await upsertProjectScanRecord(files.scan, {
+      projectId: project.id,
+      coverage: "partial",
+      scannedEntries: 2_000,
+      entryLimit: 2_000,
+      observedAt: new Date().toISOString(),
+    });
+
+    expect(await readFile(files.catalog, "utf8")).toBe(catalogBefore);
+    expect((await loadProjectScanStore(files.scan)).scans[0]).toMatchObject({ projectId: project.id, coverage: "partial" });
+  });
+
+  it("SCAN-002: cada proyecto conserva una sola cobertura, la más reciente", async () => {
+    const files = await fixture();
+    const projectId = `project_${"a".repeat(24)}`;
+    const base = { projectId, scannedEntries: 10, entryLimit: 2_000, observedAt: "2026-08-28T00:00:00.000Z" };
+    await upsertProjectScanRecord(files.scan, { ...base, coverage: "partial" });
+    await upsertProjectScanRecord(files.scan, { ...base, coverage: "complete", observedAt: "2026-08-28T01:00:00.000Z" });
+
+    const store = await loadProjectScanStore(files.scan);
+    expect(store.scans).toHaveLength(1);
+    expect(store.scans[0]).toMatchObject({ coverage: "complete", observedAt: "2026-08-28T01:00:00.000Z" });
+  });
+
+  it("SCAN-003: eliminar la cobertura es idempotente y no crea el archivo", async () => {
+    const files = await fixture();
+    await removeProjectScanRecord(files.scan, `project_${"b".repeat(24)}`);
+    await expect(readFile(files.scan)).rejects.toMatchObject({ code: "ENOENT" });
+    expect(await loadProjectScanStore(files.scan)).toEqual({ schemaVersion: 1, scans: [] });
   });
 });

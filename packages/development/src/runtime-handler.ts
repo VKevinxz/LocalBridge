@@ -28,6 +28,7 @@ export interface DevelopmentRuntimeHandlerOptions {
     navigate(workspaceId: string, sessionId: string, path: string): Promise<unknown>;
     snapshot(workspaceId: string, sessionId: string, maxDepth: number, maxElements: number): Promise<unknown>;
     screenshot(workspaceId: string, sessionId: string): Promise<unknown>;
+    setViewport(workspaceId: string, sessionId: string, width: number, height: number, mobile: boolean, operationId?: string): Promise<unknown>;
     events(workspaceId: string, sessionId: string, cursor: number, maxBytes: number): Promise<unknown>;
     click(workspaceId: string, sessionId: string, snapshotId: string, elementRef: string, operationId?: string): Promise<unknown>;
     fill(workspaceId: string, sessionId: string, snapshotId: string, elementRef: string, text: string, operationId?: string): Promise<unknown>;
@@ -152,6 +153,16 @@ export function createDevelopmentRuntimeHandler(options: DevelopmentRuntimeHandl
       case 'browser.screenshot':
         if (options.browser === undefined) break;
         return options.browser.screenshot(workspaceId, String(input['sessionId']));
+      case 'browser.viewport':
+        if (options.browser === undefined) break;
+        return options.browser.setViewport(
+          workspaceId,
+          String(input['sessionId']),
+          Number(input['width']),
+          Number(input['height']),
+          input['mobile'] === true,
+          input['operationId'] as string | undefined,
+        );
       case 'browser.events':
         if (options.browser === undefined) break;
         return options.browser.events(workspaceId, String(input['sessionId']), Number(input['cursor']), Number(input['maxBytes']));
