@@ -25,6 +25,7 @@ import {
 import { createHarness } from '../helpers/harness.js';
 
 const run = promisify(execFile);
+const REAL_GIT_HOOK_TIMEOUT_MS = 30_000;
 
 /**
  * Prueba de extremo a extremo de ADR-0016: cliente y servidor reales,
@@ -57,11 +58,11 @@ beforeEach(async () => {
       permissions: { read: true, write: true, overwrite: false, gitRead: true, validations: false, gitWrite: true },
     }),
   ]);
-}, 30_000);
+}, REAL_GIT_HOOK_TIMEOUT_MS);
 
 afterEach(async () => {
   await workspace.cleanup();
-}, 30_000);
+}, REAL_GIT_HOOK_TIMEOUT_MS);
 
 function acceptHandler(seen: ElicitRequest[]): (request: ElicitRequest) => ElicitResult {
   return (request) => {
@@ -291,7 +292,7 @@ describe('git.push — round-trip MRTR real, contra un remoto real', () => {
     await initBareGitRepo(remoteRoot);
     await addGitRemote(workspace.root, 'origin', remoteRoot);
     await run('git', ['push', '-u', 'origin', 'main'], { cwd: workspace.root });
-  });
+  }, REAL_GIT_HOOK_TIMEOUT_MS);
 
   it('aprobar publica el commit en el remoto real, y el humano ve qué commits se publicarían', async () => {
     const seen: ElicitRequest[] = [];
