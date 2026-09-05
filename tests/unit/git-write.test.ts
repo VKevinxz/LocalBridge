@@ -17,17 +17,18 @@ import {
 } from '../helpers/fixtures.js';
 
 let workspace: TempWorkspace;
+const REAL_GIT_HOOK_TIMEOUT_MS = 30_000;
 
 beforeEach(async () => {
   workspace = await createTempWorkspaceDir();
   await populateSampleProject(workspace.root);
   await initGitRepo(workspace.root);
   await gitCommitAll(workspace.root, 'commit inicial');
-});
+}, REAL_GIT_HOOK_TIMEOUT_MS);
 
 afterEach(async () => {
   await workspace.cleanup();
-});
+}, REAL_GIT_HOOK_TIMEOUT_MS);
 
 function gitWorkspace() {
   return buildWorkspace({
@@ -204,7 +205,7 @@ describe('pushCommits', () => {
     const { promisify } = await import('node:util');
     const run = promisify(execFile);
     await run('git', ['push', '-u', 'origin', 'main'], { cwd: workspace.root });
-  });
+  }, REAL_GIT_HOOK_TIMEOUT_MS);
 
   it('empuja un commit real a un remoto real', async () => {
     await writeFile(path.join(workspace.root, 'nuevo.txt'), 'contenido\n');

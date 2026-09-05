@@ -52,7 +52,8 @@
     "docs/releases/preview-v1.1.0.1.md",
     "docs/releases/preview-v1.1.0.2.md",
     "docs/releases/preview-v1.1.0.3.md",
-    "docs/releases/preview-v1.2.1.1.md"
+    "docs/releases/preview-v1.2.1.1.md",
+    "docs/releases/preview-v1.2.1.2.md"
   ],
   "excludedDirectoryNames": [
     ".git",

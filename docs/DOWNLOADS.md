@@ -2,10 +2,10 @@
 
 ## Preview disponible
 
-- [Preview v1.2.1.1 sin firma](https://github.com/VKevinxz/LocalBridge/releases/tag/preview-v1.2.1.1)
+- [Preview v1.2.1.2 sin firma](https://github.com/VKevinxz/LocalBridge/releases/tag/preview-v1.2.1.2)
 - [Repositorio oficial](https://github.com/VKevinxz/LocalBridge)
-- [Instalador Windows x64 v1.2.1 — sin firma](https://github.com/VKevinxz/LocalBridge/releases/download/preview-v1.2.1.1/LocalBridge.MCP.Setup.1.2.1.exe)
-- [Checksums de la preview](https://github.com/VKevinxz/LocalBridge/releases/download/preview-v1.2.1.1/SHA256SUMS.txt)
+- [Instalador Windows x64 v1.2.1 — sin firma](https://github.com/VKevinxz/LocalBridge/releases/download/preview-v1.2.1.2/LocalBridge.MCP.Setup.1.2.1.exe)
+- [Checksums de la preview](https://github.com/VKevinxz/LocalBridge/releases/download/preview-v1.2.1.2/SHA256SUMS.txt)
 
 No descargues instaladores desde issues, adjuntos, mirrors o repositorios de terceros.
 

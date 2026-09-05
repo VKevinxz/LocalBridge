@@ -15,6 +15,14 @@ Releases.
 - una terminal cerrada dejaba de liberarse nunca y retenía su salida completa hasta cerrar la
   aplicación; ahora se conserva 30 minutos o hasta 24 sesiones cerradas.
 
+### Seguridad y distribución
+
+- se fijan versiones corregidas de dependencias transitivas del empaquetador para evitar
+  vulnerabilidades conocidas en el pipeline de distribución;
+- las preparaciones, limpiezas y pruebas de integración que operan repositorios Git reales
+  disponen de un margen explícito de 30 segundos en Windows, sin ampliar el timeout global
+  ni relajar aserciones de seguridad.
+
 ## [1.2.0] — 2026-08-28
 
 ### Añadido
