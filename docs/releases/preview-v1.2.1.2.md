@@ -23,9 +23,9 @@ una firma digital de Windows**.
 
 ## Correcciones del pipeline
 
-- los hooks de pruebas que preparan y eliminan repositorios Git reales tienen un margen
-  explícito de 30 segundos en Windows; las aserciones conservan el timeout global de 10
-  segundos;
+- los hooks y casos de integración que preparan, usan y eliminan repositorios Git reales
+  tienen un margen explícito de 30 segundos en Windows; el timeout global y las aserciones
+  de seguridad se conservan sin cambios;
 - `fast-uri` y `@xmldom/xmldom`, dependencias transitivas del empaquetador, quedan fijadas
   a versiones corregidas y la auditoría no reporta vulnerabilidades conocidas.
 

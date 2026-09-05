@@ -26,6 +26,7 @@ import { createHarness } from '../helpers/harness.js';
 
 const run = promisify(execFile);
 const REAL_GIT_HOOK_TIMEOUT_MS = 30_000;
+const REAL_GIT_TEST_TIMEOUT_MS = 30_000;
 
 /**
  * Prueba de extremo a extremo de ADR-0016: cliente y servidor reales,
@@ -323,7 +324,7 @@ describe('git.push — round-trip MRTR real, contra un remoto real', () => {
     } finally {
       await harness.close();
     }
-  });
+  }, REAL_GIT_TEST_TIMEOUT_MS);
 
   it('aprobar el commit NO aprueba automáticamente el push (son aprobaciones separadas)', async () => {
     const seen: ElicitRequest[] = [];
@@ -364,7 +365,7 @@ describe('git.push — round-trip MRTR real, contra un remoto real', () => {
     } finally {
       await harness.close();
     }
-  });
+  }, REAL_GIT_TEST_TIMEOUT_MS);
 });
 
 describe('Git write — aprobación nativa delegada al host', () => {
@@ -412,5 +413,5 @@ describe('Git write — aprobación nativa delegada al host', () => {
       await harness.close();
       await remoteWorkspace.cleanup();
     }
-  });
+  }, REAL_GIT_TEST_TIMEOUT_MS);
 });

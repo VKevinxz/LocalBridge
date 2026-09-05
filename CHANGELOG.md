@@ -19,8 +19,9 @@ Releases.
 
 - se fijan versiones corregidas de dependencias transitivas del empaquetador para evitar
   vulnerabilidades conocidas en el pipeline de distribución;
-- las preparaciones y limpiezas de repositorios Git reales disponen de un timeout de hook
-  explícito en Windows, sin ampliar el timeout de las aserciones de seguridad.
+- las preparaciones, limpiezas y pruebas de integración que operan repositorios Git reales
+  disponen de un margen explícito de 30 segundos en Windows, sin ampliar el timeout global
+  ni relajar aserciones de seguridad.
 
 ## [1.2.0] — 2026-08-28
 
