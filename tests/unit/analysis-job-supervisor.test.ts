@@ -36,6 +36,12 @@ function request(operationId = 'operation-1') {
   };
 }
 
+function completionSignal(): { promise: Promise<void>; resolve: () => void } {
+  let resolve!: () => void;
+  const promise = new Promise<void>((done) => { resolve = done; });
+  return { promise, resolve };
+}
+
 describe('AnalysisJobSupervisor', () => {
   it('deduplica la misma intención y rechaza el mismo operationId con payload distinto', async () => {
     const execute = vi.fn<AnalysisJobExecutor>(async () => ({
@@ -118,28 +124,56 @@ describe('AnalysisJobSupervisor', () => {
   it('acota la concurrencia global aunque varios workspaces permitan dos jobs', async () => {
     let active = 0;
     let maximumActive = 0;
+    let batchStarted = completionSignal();
+    const allCompleted = completionSignal();
+    const releases: Array<() => void> = [];
+    let jobs: Array<ReturnType<AnalysisJobSupervisor['start']>> = [];
     const supervisor = new AnalysisJobSupervisor({
       journalPath: await journalPath(),
       execute: async () => {
         active += 1;
         maximumActive = Math.max(maximumActive, active);
-        await new Promise((resolve) => setTimeout(resolve, 20));
+        await new Promise<void>((resolve) => {
+          releases.push(resolve);
+          if (active >= 2) batchStarted.resolve();
+        });
         active -= 1;
         return { summary: {}, coverage: { status: 'supported', bytesRead: 1, uniqueBytesRead: 1 }, items: [] };
       },
       concurrencyForWorkspace: async () => 2,
       maxGlobalRunningJobs: 2,
+      onChange: () => {
+        if (jobs.length === 8 && jobs.every((job) => supervisor.status(job.workspaceId, job.jobId, 0, 1).job.state === 'completed')) {
+          allCompleted.resolve();
+        }
+      },
     });
-    const jobs = Array.from({ length: 8 }, (_value, index) => supervisor.start({
-      ...request(`global-${index}`),
-      workspaceId: `ws_${index % 4}`,
-    }));
-    await eventually(
-      () => jobs.map((job) => supervisor.status(job.workspaceId, job.jobId, 0, 1).job.state),
-      (states) => states.every((state) => state === 'completed'),
-    );
-    expect(maximumActive).toBe(2);
-    await supervisor.close();
+    try {
+      jobs = Array.from({ length: 8 }, (_value, index) => supervisor.start({
+        ...request(`global-${index}`),
+        workspaceId: `ws_${index % 4}`,
+      }));
+      for (let batch = 0; batch < 4; batch += 1) {
+        await batchStarted.promise;
+        // Deja que el scheduler intente admitir más trabajo mientras los dos
+        // ejecutores permanecen retenidos: un exceso de concurrencia es visible.
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        const states = jobs.map((job) => supervisor.status(job.workspaceId, job.jobId, 0, 1).job.state);
+        expect(states.filter((state) => state === 'running')).toHaveLength(2);
+        expect(states.filter((state) => state === 'queued')).toHaveLength(6 - batch * 2);
+        expect(active).toBe(2);
+        expect(maximumActive).toBe(2);
+        batchStarted = completionSignal();
+        releases.splice(0).forEach((release) => release());
+      }
+      await allCompleted.promise;
+      expect(jobs.every((job) => supervisor.status(job.workspaceId, job.jobId, 0, 1).job.state === 'completed')).toBe(true);
+      expect(active).toBe(0);
+      expect(maximumActive).toBe(2);
+    } finally {
+      releases.splice(0).forEach((release) => release());
+      await supervisor.close();
+    }
   });
 
   it('reconcilia como interrupted un estado no terminal guardado antes de reiniciar', async () => {
