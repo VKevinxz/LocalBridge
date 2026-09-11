@@ -42,27 +42,72 @@ CREATE TABLE IF NOT EXISTS pending_approvals (
 CREATE INDEX IF NOT EXISTS idx_pending_approvals_expiry ON pending_approvals (expires_at);
 `;
 
+const DATABASE_BUSY_TIMEOUT_MS = 5_000;
+const DATABASE_OPEN_ATTEMPTS = 4;
+const DATABASE_BUSY_RETRY_BASE_MS = 25;
+
+function isDatabaseBusy(error: unknown): boolean {
+  return error instanceof Error && /database(?: table)? is locked/iu.test(error.message);
+}
+
+function waitBeforeRetry(attempt: number): void {
+  const delayMs = DATABASE_BUSY_RETRY_BASE_MS * 2 ** attempt;
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, delayMs);
+}
+
+function initializeSchema(db: DatabaseSync): void {
+  // Una transacción IMMEDIATE serializa el arranque en frío de procesos MCP
+  // distintos. Sin ella, varios CREATE/ALTER idempotentes pueden intercalarse
+  // y uno de los procesos recibir SQLITE_BUSY antes de insertar su evento.
+  db.exec("BEGIN IMMEDIATE;");
+  try {
+    db.exec(SCHEMA);
+    const pendingColumns = db.prepare("PRAGMA table_info(pending_approvals)").all() as Array<Record<string, unknown>>;
+    if (!pendingColumns.some((column) => String(column["name"]) === "status")) {
+      db.exec("ALTER TABLE pending_approvals ADD COLUMN status TEXT NOT NULL DEFAULT 'pending';");
+    }
+    db.exec("COMMIT;");
+  } catch (error) {
+    try {
+      db.exec("ROLLBACK;");
+    } catch {
+      // Si SQLite abortó la transacción, no hay nada que revertir.
+    }
+    throw error;
+  }
+}
+
 function openDatabase(dbPath: string): DatabaseSync {
   // `DatabaseSync` no crea el directorio padre por su cuenta, a diferencia del
   // registro de workspaces (que usa `fs.mkdir` explícito por el mismo motivo).
   mkdirSync(path.dirname(dbPath), { recursive: true });
 
-  const db = new DatabaseSync(dbPath);
-  // Sin esto, `DatabaseSync` falla al instante con "database is locked"
-  // (SQLITE_BUSY) en vez de esperar — verificado con escrituras concurrentes
-  // desde procesos de servidor distintos (dos clientes MCP a la vez, cada uno
-  // con su propio proceso stdio). Con busy_timeout, un escritor espera a que
-  // el otro termine en vez de perder el evento.
-  db.exec("PRAGMA busy_timeout = 5000;");
-  // WAL: las inserciones concurrentes desde llamadas de lectura simultáneas no
-  // se bloquean entre sí a nivel de archivo completo.
-  db.exec("PRAGMA journal_mode = WAL;");
-  db.exec(SCHEMA);
-  const pendingColumns = db.prepare("PRAGMA table_info(pending_approvals)").all() as Array<Record<string, unknown>>;
-  if (!pendingColumns.some((column) => String(column["name"]) === "status")) {
-    db.exec("ALTER TABLE pending_approvals ADD COLUMN status TEXT NOT NULL DEFAULT 'pending';");
+  for (let attempt = 0; attempt < DATABASE_OPEN_ATTEMPTS; attempt += 1) {
+    const db = new DatabaseSync(dbPath);
+    try {
+      // `busy_timeout` cubre las esperas ordinarias. El reintento exterior
+      // también cubre operaciones de inicialización (en particular el cambio
+      // a WAL) que pueden devolver SQLITE_BUSY sin consumir toda esa espera.
+      db.exec(`PRAGMA busy_timeout = ${DATABASE_BUSY_TIMEOUT_MS};`);
+      // WAL: las inserciones concurrentes desde llamadas de lectura simultáneas
+      // no se bloquean entre sí a nivel de archivo completo.
+      db.exec("PRAGMA journal_mode = WAL;");
+      initializeSchema(db);
+      return db;
+    } catch (error) {
+      try {
+        db.close();
+      } catch {
+        // Conserva el error original de apertura/inicialización.
+      }
+      if (!isDatabaseBusy(error) || attempt === DATABASE_OPEN_ATTEMPTS - 1) {
+        throw error;
+      }
+      waitBeforeRetry(attempt);
+    }
   }
-  return db;
+
+  throw new Error("audit database could not be opened");
 }
 
 /**
