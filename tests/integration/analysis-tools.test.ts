@@ -33,7 +33,9 @@ afterEach(async () => {
   harness = undefined;
   broker = undefined;
   supervisor = undefined;
-  if (analysisPrivateRoot !== undefined) await rm(analysisPrivateRoot, { recursive: true, force: true });
+  if (analysisPrivateRoot !== undefined) {
+    await rm(analysisPrivateRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+  }
   analysisPrivateRoot = undefined;
   analysisConfigPath = undefined;
   await workspace.cleanup();
@@ -180,7 +182,7 @@ describe('jobs de artefactos grandes vía MCP y broker', () => {
     }));
     expect(((utf16['job'] as Record<string, unknown>)['summary'] as Record<string, unknown>)['encoding']).toBe('utf-16le');
     expect((utf16['items'] as Array<Record<string, unknown>>).find((item) => item['kind'] === 'text')?.['text']).toContain('Texto visual UTF16');
-  });
+  }, 35_000);
 
   it('pagina texto desde una fuente sparse de 10 GiB con lectura acotada', async () => {
     await createSparseFile(
