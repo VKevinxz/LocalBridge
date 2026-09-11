@@ -4,8 +4,8 @@
 
 | Versión | Estado |
 |---|---|
-| `1.1.x` | Preview actual; recibe correcciones |
-| `1.0.x` | Compatibilidad y correcciones críticas según viabilidad |
+| `1.7.x` | Preview actual; recibe correcciones |
+| `1.0.x`–`1.6.x` | Compatibilidad y correcciones críticas según viabilidad |
 | `< 1.0` | Sin soporte regular |
 
 ## Reportar una vulnerabilidad
@@ -37,6 +37,6 @@ corrección o mitigación razonable.
 - migraciones que amplíen autoridad;
 - artefactos de release sin integridad o procedencia.
 
-El diseño general se resume en [docs/SECURITY_MODEL.md](docs/SECURITY_MODEL.md). El contrato
-técnico completo, incluidas las cuotas web y el staging por chunks de v1.6.1, está en
-[docs/SECURITY.md](docs/SECURITY.md).
+El diseño general y las fronteras de confianza se resumen en
+[docs/SECURITY_MODEL.md](docs/SECURITY_MODEL.md). Las herramientas y sus contratos públicos
+se describen en [docs/TOOL_CATALOG.md](docs/TOOL_CATALOG.md).
