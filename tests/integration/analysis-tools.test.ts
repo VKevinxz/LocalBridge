@@ -85,8 +85,9 @@ async function start(name: string, args: Record<string, unknown>): Promise<Recor
   return result.structuredContent as Record<string, unknown>;
 }
 
-async function completed(job: Record<string, unknown>): Promise<Record<string, unknown>> {
-  const deadline = Date.now() + 5_000;
+async function completed(job: Record<string, unknown>, timeoutMs = 5_000): Promise<Record<string, unknown>> {
+  const deadline = Date.now() + timeoutMs;
+  let lastState = 'unknown';
   while (Date.now() < deadline) {
     const result = await harness!.client.callTool({
       name: 'analysis.status',
@@ -95,13 +96,14 @@ async function completed(job: Record<string, unknown>): Promise<Record<string, u
     expect(result.isError, JSON.stringify(result.content)).not.toBe(true);
     const status = result.structuredContent as Record<string, unknown>;
     const current = status['job'] as Record<string, unknown>;
+    lastState = String(current['state']);
     if (current['state'] === 'completed') return status;
     if (['failed', 'cancelled', 'source_changed', 'interrupted'].includes(String(current['state']))) {
       throw new Error(`unexpected terminal state: ${JSON.stringify(current)}`);
     }
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
-  throw new Error('timeout waiting for analysis job');
+  throw new Error(`timeout waiting for analysis job after ${timeoutMs}ms; state=${lastState}`);
 }
 
 async function eventually<T>(read: () => T, predicate: (value: T) => boolean): Promise<T> {
@@ -217,17 +219,17 @@ describe('jobs de artefactos grandes vía MCP y broker', () => {
     const text = await completed(await start('document.process', {
       workspaceId: 'ws_analysis', path: 'sample.pdf', operationId: 'pdf_read_1',
       request: { mode: 'read', maxChars: 20_000 },
-    }));
+    }), 20_000); // El worker de lectura tiene un timeout propio de 15 s.
     expect((text['items'] as Array<Record<string, unknown>>).find((item) => item['kind'] === 'text')?.['text']).toContain('Hello PDF');
 
     const rendered = await completed(await start('document.process', {
       workspaceId: 'ws_analysis', path: 'sample.pdf', operationId: 'pdf_render_1',
       request: { mode: 'render', pages: [2], detail: 'standard' },
-    }));
+    }), 35_000); // El worker de render tiene un timeout propio de 30 s.
     expect((rendered['items'] as Array<Record<string, unknown>>)).toEqual(expect.arrayContaining([
       expect.objectContaining({ kind: 'image', mimeType: expect.stringMatching(/^image\//), encodedBytes: expect.any(Number) }),
     ]));
-  }, 20_000);
+  }, 65_000);
 
   it('inicia una descarga observada sin aceptar URL libre y permite redescubrir el job', async () => {
     const calls: unknown[] = [];
