@@ -1,12 +1,12 @@
 /** `file.metadata` (TOOL_CATALOG.md §5). */
 
-import { createHash } from "node:crypto";
-import { readFile, stat } from "node:fs/promises";
+import { stat } from "node:fs/promises";
 
 import { LocalBridgeError } from "@localbridge/shared";
 import type { AuthorizedWorkspace } from "@localbridge/workspace";
 
 import { resolveAllowedPath } from "./guard.js";
+import { hashResolvedFile } from './hash-file.js';
 
 export interface FileMetadataResult {
   path: string;
@@ -42,22 +42,14 @@ export async function getFileMetadata(workspace: AuthorizedWorkspace, relativePa
     return { path: safe.relativePath, exists: true };
   }
 
-  // Mismo techo que file.read (SEC-011): metadata también hashea el archivo
-  // completo, así que no puede convertirse en una vía indirecta para forzar la
-  // lectura de un archivo que file.read rechazaría por tamaño.
-  if (stats.size > workspace.limits.maxFileBytes) {
-    throw new LocalBridgeError("FILE_TOO_LARGE");
-  }
-
-  const buffer = await readFile(safe.realPath);
-  const sha256 = createHash("sha256").update(buffer).digest("hex");
+  const hashed = await hashResolvedFile(safe.realPath);
 
   return {
     path: safe.relativePath,
     exists: true,
     type: "file",
-    size: buffer.byteLength,
-    sha256,
-    modifiedAt: stats.mtime.toISOString(),
+    size: hashed.size,
+    sha256: hashed.sha256,
+    modifiedAt: hashed.modifiedAt,
   };
 }

@@ -4,7 +4,7 @@ import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { isLocalBridgeError } from '@localbridge/shared';
-import { createWorkspaceFile, writeGuardedWorkspaceFile, deleteWorkspaceFile, moveWorkspaceFile } from '@localbridge/filesystem';
+import { createWorkspaceFile, writeGuardedWorkspaceFile, patchGuardedWorkspaceFile, deleteWorkspaceFile, moveWorkspaceFile } from '@localbridge/filesystem';
 
 import {
   buildWorkspace,
@@ -214,6 +214,116 @@ describe('writeGuardedWorkspaceFile — file.write_guarded', () => {
   });
 });
 
+describe('patchGuardedWorkspaceFile — file.patch_guarded', () => {
+  it('aplica ediciones ordenadas por contexto sin transmitir el archivo completo', async () => {
+    const ws = buildWorkspace({ rootPath: workspace.root });
+    const original = await readFile(path.join(workspace.root, 'src', 'index.ts'), 'utf8');
+    const hash = createHash('sha256').update(original).digest('hex');
+
+    const result = await patchGuardedWorkspaceFile(ws, 'src/index.ts', hash, [
+      { oldText: 'hello', newText: 'greeting' },
+      { oldText: 'world', newText: 'LocalBridge' },
+    ]);
+
+    expect(result).toMatchObject({ previousSha256: hash, appliedEdits: 2, replacements: 2 });
+    expect(await readFile(path.join(workspace.root, 'src', 'index.ts'), 'utf8'))
+      .toBe('export const greeting = "LocalBridge";\n');
+  });
+
+  it('falla sin escribir cuando el contexto es ambiguo', async () => {
+    const target = path.join(workspace.root, 'src', 'index.ts');
+    await writeFile(target, 'same same\n');
+    const original = await readFile(target, 'utf8');
+    const hash = createHash('sha256').update(original).digest('hex');
+
+    await expectCode(
+      patchGuardedWorkspaceFile(buildWorkspace({ rootPath: workspace.root }), 'src/index.ts', hash, [
+        { oldText: 'same', newText: 'changed' },
+      ]),
+      'INVALID_INPUT',
+    );
+    expect(await readFile(target, 'utf8')).toBe(original);
+  });
+
+  it('identifica de forma segura el índice de la edición inválida', async () => {
+    const target = path.join(workspace.root, 'src', 'index.ts');
+    const original = await readFile(target, 'utf8');
+    const hash = createHash('sha256').update(original).digest('hex');
+
+    await expect(patchGuardedWorkspaceFile(buildWorkspace({ rootPath: workspace.root }), 'src/index.ts', hash, [
+      { oldText: 'hello', newText: 'greeting' },
+      { oldText: 'contexto inexistente', newText: 'x' },
+    ])).rejects.toMatchObject({
+      code: 'INVALID_INPUT',
+      details: { reason: 'patch context occurrence mismatch', editIndex: 1 },
+    });
+    expect(await readFile(target, 'utf8')).toBe(original);
+  });
+
+  it('falla sin escribir cuando el archivo cambió desde la lectura', async () => {
+    const target = path.join(workspace.root, 'src', 'index.ts');
+    const stale = createHash('sha256').update(await readFile(target)).digest('hex');
+    await writeFile(target, 'cambio externo\n');
+
+    await expectCode(
+      patchGuardedWorkspaceFile(buildWorkspace({ rootPath: workspace.root }), 'src/index.ts', stale, [
+        { oldText: 'hello', newText: 'bye' },
+      ]),
+      'HASH_MISMATCH',
+    );
+    expect(await readFile(target, 'utf8')).toBe('cambio externo\n');
+  });
+
+  it('rechaza una expansión mayor que maxFileBytes antes de construirla', async () => {
+    const target = path.join(workspace.root, 'src', 'index.ts');
+    const original = 'a'.repeat(512);
+    await writeFile(target, original);
+    const hash = createHash('sha256').update(original).digest('hex');
+    const ws = buildWorkspace({
+      rootPath: workspace.root,
+      limits: { maxFileBytes: 1024, maxTreeEntries: 300, maxTreeDepth: 3 },
+    });
+
+    await expectCode(
+      patchGuardedWorkspaceFile(ws, 'src/index.ts', hash, [
+        { oldText: 'a', newText: 'x'.repeat(1024), expectedOccurrences: 512 },
+      ]),
+      'FILE_TOO_LARGE',
+    );
+    expect(await readFile(target, 'utf8')).toBe(original);
+  });
+
+  it('rechaza UTF-8 inválido sin normalizar ni alterar bytes', async () => {
+    const target = path.join(workspace.root, 'src', 'index.ts');
+    const original = Buffer.from([0x61, 0x80, 0x62]);
+    await writeFile(target, original);
+    const hash = createHash('sha256').update(original).digest('hex');
+
+    await expectCode(
+      patchGuardedWorkspaceFile(buildWorkspace({ rootPath: workspace.root }), 'src/index.ts', hash, [
+        { oldText: 'a', newText: 'z' },
+      ]),
+      'INVALID_INPUT',
+    );
+    expect(await readFile(target)).toEqual(original);
+  });
+
+  it('preserva el BOM UTF-8 situado fuera del contexto editado', async () => {
+    const target = path.join(workspace.root, 'src', 'index.ts');
+    const original = Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from('alpha beta\n')]);
+    await writeFile(target, original);
+    const hash = createHash('sha256').update(original).digest('hex');
+
+    await patchGuardedWorkspaceFile(buildWorkspace({ rootPath: workspace.root }), 'src/index.ts', hash, [
+      { oldText: 'beta', newText: 'gamma' },
+    ]);
+
+    expect(await readFile(target)).toEqual(
+      Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from('alpha gamma\n')]),
+    );
+  });
+});
+
 describe('deleteWorkspaceFile — file.delete', () => {
   it('con el hash correcto, borra el archivo', async () => {
     const ws = buildWorkspace({ rootPath: workspace.root, permissions: { read: true, write: false, overwrite: true, gitRead: false, validations: false, gitWrite: false } });
@@ -224,6 +334,19 @@ describe('deleteWorkspaceFile — file.delete', () => {
 
     expect(result).toEqual({ path: 'src/index.ts', deleted: true });
     await expect(readFile(path.join(workspace.root, 'src', 'index.ts'))).rejects.toThrow();
+  });
+
+  it('borra por hash streaming un asset mayor que la cuota de texto', async () => {
+    const bytes = Buffer.alloc(2 * 1024 * 1024, 0x34);
+    await writeFile(path.join(workspace.root, 'large-delete.bin'), bytes);
+    const ws = buildWorkspace({
+      rootPath: workspace.root,
+      limits: { maxFileBytes: 1024, maxTreeEntries: 300, maxTreeDepth: 3 },
+    });
+    const hash = createHash('sha256').update(bytes).digest('hex');
+
+    await expect(deleteWorkspaceFile(ws, 'large-delete.bin', hash)).resolves.toEqual({ path: 'large-delete.bin', deleted: true });
+    await expect(readFile(path.join(workspace.root, 'large-delete.bin'))).rejects.toThrow();
   });
 
   it('[SEC-008] hash incorrecto -> HASH_MISMATCH, el archivo no se borra', async () => {
@@ -296,6 +419,24 @@ describe('moveWorkspaceFile — file.move', () => {
     await expect(readFile(path.join(workspace.root, 'src', 'index.ts'))).rejects.toThrow();
     const atDest = await readFile(path.join(workspace.root, 'src', 'renombrado.ts'), 'utf8');
     expect(atDest).toBe(original);
+  });
+
+  it('mueve por hash streaming un asset mayor que la cuota de texto', async () => {
+    const bytes = Buffer.alloc(2 * 1024 * 1024, 0x78);
+    await writeFile(path.join(workspace.root, 'large-source.bin'), bytes);
+    const ws = buildWorkspace({
+      rootPath: workspace.root,
+      limits: { maxFileBytes: 1024, maxTreeEntries: 300, maxTreeDepth: 3 },
+    });
+    const hash = createHash('sha256').update(bytes).digest('hex');
+
+    await expect(moveWorkspaceFile(ws, 'large-source.bin', 'assets/large-destination.bin', hash)).resolves.toMatchObject({
+      sourcePath: 'large-source.bin',
+      destPath: 'assets/large-destination.bin',
+      size: bytes.byteLength,
+      sha256: hash,
+    });
+    expect(await readFile(path.join(workspace.root, 'assets', 'large-destination.bin'))).toEqual(bytes);
   });
 
   it('crea los directorios intermedios del destino que falten', async () => {

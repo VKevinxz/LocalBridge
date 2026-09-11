@@ -46,7 +46,47 @@ const DEFAULT_LIMITS = {
   maxFileBytes: 1_048_576,
   maxTreeEntries: 300,
   maxTreeDepth: 3,
+  largeArtifacts: {
+    mode: "standard",
+    reserve: {
+      minimumFreeBytes: 1024 * 1024 * 1024,
+      minimumFreePercent: 10,
+    },
+    maxConcurrentJobs: 1,
+  },
 } as const;
+
+export const largeArtifactPolicySchema = z.discriminatedUnion("mode", [
+  z.object({
+    mode: z.literal("standard"),
+    reserve: z.object({
+      minimumFreeBytes: z.number().int().min(64 * 1024 * 1024).max(Number.MAX_SAFE_INTEGER),
+      minimumFreePercent: z.number().min(1).max(50),
+    }).strict(),
+    maxConcurrentJobs: z.union([z.literal(1), z.literal(2)]),
+  }).strict(),
+  z.object({
+    mode: z.literal("custom"),
+    customSourceBytes: z.number().int().min(1024 * 1024).max(Number.MAX_SAFE_INTEGER),
+    reserve: z.object({
+      minimumFreeBytes: z.number().int().min(64 * 1024 * 1024).max(Number.MAX_SAFE_INTEGER),
+      minimumFreePercent: z.number().min(1).max(50),
+    }).strict(),
+    maxConcurrentJobs: z.union([z.literal(1), z.literal(2)]),
+  }).strict(),
+  z.object({
+    mode: z.literal("adaptive"),
+    reserve: z.object({
+      minimumFreeBytes: z.number().int().min(64 * 1024 * 1024).max(Number.MAX_SAFE_INTEGER),
+      minimumFreePercent: z.number().min(1).max(50),
+    }).strict(),
+    maxConcurrentJobs: z.union([z.literal(1), z.literal(2)]),
+  }).strict(),
+]);
+
+export function defaultLargeArtifactPolicy() {
+  return largeArtifactPolicySchema.parse(DEFAULT_LIMITS.largeArtifacts);
+}
 
 const PROFILE_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/;
 const SHA256_PATTERN = /^[a-f0-9]{64}$/;
@@ -138,7 +178,7 @@ export const browserProfileSchema = z
     viewport: z.object({
       width: z.number().int().min(640).max(2560),
       height: z.number().int().min(480).max(1600),
-    }).strict().default({ width: 1280, height: 800 }),
+    }).strict().default({ width: 1920, height: 1080 }),
     linkedProcessProfile: z.string().regex(PROFILE_NAME_PATTERN).optional(),
   })
   .strict()
@@ -168,7 +208,7 @@ export const browserApplicationProfileSchema = z
     viewport: z.object({
       width: z.number().int().min(640).max(2560),
       height: z.number().int().min(480).max(1600),
-    }).strict().default({ width: 1280, height: 800 }),
+    }).strict().default({ width: 1920, height: 1080 }),
   })
   .strict()
   .superRefine((application, context) => {
@@ -226,7 +266,7 @@ export const localApplicationSchema = z.object({
   viewport: z.object({
     width: z.number().int().min(640).max(2560),
     height: z.number().int().min(480).max(1600),
-  }).strict().default({ width: 1280, height: 800 }),
+  }).strict().default({ width: 1920, height: 1080 }),
   reviewState: z.enum(["reviewed", "needs-review", "conflict"]),
   createdAt: z.iso.datetime(),
   updatedAt: z.iso.datetime(),
@@ -266,6 +306,7 @@ const workspaceFields = {
       maxFileBytes: z.number().int().positive(),
       maxTreeEntries: z.number().int().positive(),
       maxTreeDepth: z.number().int().positive(),
+      largeArtifacts: largeArtifactPolicySchema.default(() => defaultLargeArtifactPolicy()),
     })
     .default(DEFAULT_LIMITS),
   denyPatterns: z.array(z.string()).default(() => [...DEFAULT_DENY_PATTERNS]),
@@ -409,6 +450,15 @@ function validateApplicationReferences(
 }
 
 export const registryFileSchema = z.object({
+  schemaVersion: z.literal(5),
+  workspaces: z.array(workspaceSchema).default([]),
+  applications: z.array(localApplicationSchema).default([]),
+}).strict().superRefine((registry, context) => {
+  const byId = validateWorkspaceIds(registry.workspaces, context);
+  validateApplicationReferences(registry.applications, byId, context);
+});
+
+const legacyV4RegistryFileSchema = z.object({
   schemaVersion: z.literal(4),
   workspaces: z.array(workspaceSchema).default([]),
   applications: z.array(localApplicationSchema).default([]),
@@ -454,7 +504,7 @@ export const legacyRegistryFileSchema = z.object({
   });
 });
 
-const legacyV4RegistryFileSchema = z.object({
+const legacyUnversionedV4RegistryFileSchema = z.object({
   workspaces: z.array(legacyV4WorkspaceSchema).default([]),
 }).strict().superRefine((registry, context) => {
   const byId = validateWorkspaceIds(registry.workspaces, context);
@@ -524,28 +574,37 @@ function migrateV3Workspace(workspace: z.infer<typeof legacyV3WorkspaceSchema>):
   });
 }
 
-/** Lee v4 o migra en memoria v3/v0.4.x sin ampliar permisos ni fusionar conflictos distintos. */
+/** Lee v5 o migra en memoria v4/v3/v0.4.x sin ampliar permisos ni consumo. */
 export function parseWorkspaceRegistry(input: unknown): WorkspaceRegistry {
   const current = registryFileSchema.safeParse(input);
   if (current.success) return current.data;
 
+  const v4 = legacyV4RegistryFileSchema.safeParse(input);
+  if (v4.success) {
+    return registryFileSchema.parse({
+      schemaVersion: 5,
+      workspaces: v4.data.workspaces,
+      applications: v4.data.applications,
+    });
+  }
+
   const v3 = legacyV3RegistryFileSchema.safeParse(input);
   if (v3.success) {
     return registryFileSchema.parse({
-      schemaVersion: 4,
+      schemaVersion: 5,
       workspaces: v3.data.workspaces.map(migrateV3Workspace),
       applications: v3.data.applications,
     });
   }
 
   const legacyV3 = legacyRegistryFileSchema.safeParse(input);
-  let legacy: z.infer<typeof legacyRegistryFileSchema> | z.infer<typeof legacyV4RegistryFileSchema>;
+  let legacy: z.infer<typeof legacyRegistryFileSchema> | z.infer<typeof legacyUnversionedV4RegistryFileSchema>;
   let legacyUsesV3Permissions: boolean;
   if (legacyV3.success) {
     legacy = legacyV3.data;
     legacyUsesV3Permissions = true;
   } else {
-    const legacyV4 = legacyV4RegistryFileSchema.safeParse(input);
+    const legacyV4 = legacyUnversionedV4RegistryFileSchema.safeParse(input);
     if (!legacyV4.success) throw legacyV3.error;
     legacy = legacyV4.data;
     legacyUsesV3Permissions = false;
@@ -578,7 +637,7 @@ export function parseWorkspaceRegistry(input: unknown): WorkspaceRegistry {
 
   const workspaces = legacy.workspaces.map(({ browserApplications: _legacy, ...workspace }) =>
     legacyUsesV3Permissions ? migrateV3Workspace(workspace as z.infer<typeof legacyV3WorkspaceSchema>) : workspaceSchema.parse(workspace));
-  return registryFileSchema.parse({ schemaVersion: 4, workspaces, applications });
+  return registryFileSchema.parse({ schemaVersion: 5, workspaces, applications });
 }
 
 /**
@@ -602,10 +661,10 @@ export async function loadWorkspaceRegistryDocument(
     raw = await readFile(configPath, "utf8");
   } catch (error) {
     if (isEnoent(error)) {
-      return { schemaVersion: 4, workspaces: [], applications: [] };
+      return { schemaVersion: 5, workspaces: [], applications: [] };
     }
     logger.error("workspace registry unreadable", { code: nodeErrorCode(error) });
-    return { schemaVersion: 4, workspaces: [], applications: [] };
+    return { schemaVersion: 5, workspaces: [], applications: [] };
   }
 
   let parsed: unknown;
@@ -613,7 +672,7 @@ export async function loadWorkspaceRegistryDocument(
     parsed = JSON.parse(raw);
   } catch {
     logger.error("workspace registry is not valid JSON");
-    return { schemaVersion: 4, workspaces: [], applications: [] };
+    return { schemaVersion: 5, workspaces: [], applications: [] };
   }
 
   try {
@@ -622,7 +681,7 @@ export async function loadWorkspaceRegistryDocument(
     logger.error("workspace registry failed schema validation", {
       issueCount: error instanceof z.ZodError ? error.issues.length : 1,
     });
-    return { schemaVersion: 4, workspaces: [], applications: [] };
+    return { schemaVersion: 5, workspaces: [], applications: [] };
   }
 }
 

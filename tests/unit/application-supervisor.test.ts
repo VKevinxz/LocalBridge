@@ -26,7 +26,7 @@ function application(id = 'app_aaaaaaaaaaaaaaaaaaaaaaaa'): LocalApplication {
 function registry(applications = [application()]): WorkspaceRegistry {
   const permissions = { read: true, write: false, overwrite: false, gitRead: false, validations: false, gitWrite: false, processes: true, browserRead: true };
   return {
-    schemaVersion: 4,
+    schemaVersion: 5,
     workspaces: [
       buildWorkspace({ id: 'ws_api', rootPath: 'C:\\api', permissions, processProfiles: { dev: profile } }),
       buildWorkspace({ id: 'ws_front', rootPath: 'C:\\front', permissions, processProfiles: { dev: profile } }),
@@ -47,7 +47,7 @@ function countedRegistry(serviceCount: number): WorkspaceRegistry {
     allowManagedWildcard: false,
   }));
   return {
-    schemaVersion: 4,
+    schemaVersion: 5,
     workspaces: services.map((service) => buildWorkspace({ id: service.workspaceId, rootPath: `C:\\service-${service.startupOrder}`, permissions, processProfiles: { dev: profile } })),
     applications: [{
       id: `app_${serviceCount.toString(16).padStart(24, '0')}`,

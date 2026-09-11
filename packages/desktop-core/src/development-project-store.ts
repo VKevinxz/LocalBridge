@@ -143,6 +143,14 @@ export async function removeDevelopmentProject(filePath: string, projectId: stri
   await writeStore(filePath, { schemaVersion: 1, projects });
 }
 
+export async function removeDevelopmentProjectIfPresent(filePath: string, projectId: string): Promise<boolean> {
+  const current = await readStore(filePath);
+  const projects = current.projects.filter((project) => project.id !== projectId);
+  if (projects.length === current.projects.length) return false;
+  await writeStore(filePath, { schemaVersion: 1, projects });
+  return true;
+}
+
 export async function replaceDevelopmentProjects(
   filePath: string,
   projects: readonly DevelopmentProject[],

@@ -4,6 +4,7 @@ export type {
   BrowserProfile,
   BrowserApplicationProfile,
   BrowserApplicationService,
+  LargeArtifactPolicy,
   LegacyApplicationCandidate,
   LocalApplication,
   LocalApplicationService,
@@ -19,6 +20,7 @@ export {
   applicationNameKey,
   browserProfileSchema,
   browserApplicationProfileSchema,
+  defaultLargeArtifactPolicy,
   DEFAULT_DENY_PATTERNS,
   getWorkspace,
   legacyRegistryFileSchema,
@@ -26,6 +28,7 @@ export {
   loadWorkspaceRegistry,
   localApplicationSchema,
   localApplicationServiceSchema,
+  largeArtifactPolicySchema,
   loopbackOriginSchema,
   parseWorkspaceRegistry,
   processProfileSchema,
@@ -35,7 +38,16 @@ export {
 
 export { resolveSafePath, type SafePath } from "./paths.js";
 
+export {
+  fromWorkspaceScopePath,
+  resolveWorkspaceScope,
+  toWorkspaceScopePath,
+  type AuthorizedWorkspaceScope,
+} from "./scope.js";
+
 export { isPathDenied } from "./denylist.js";
+
+export { withWorkspaceAuthorityLock } from "./authority-lock.js";
 
 export { resolveWriteTarget, type ResolveWriteTargetOptions, type WriteTarget } from "./write-paths.js";
 

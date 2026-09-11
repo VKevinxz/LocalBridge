@@ -58,6 +58,9 @@ jobs:
       - name: Security suite
         run: pnpm test:sec
 
+      - name: Real Electron browser suite
+        run: pnpm test:electron
+
       - name: Export and audit public source
         shell: pwsh
         run: |
@@ -71,5 +74,16 @@ jobs:
         shell: pwsh
         run: ./scripts/audit-public-history.ps1
 
-      - name: Desktop build
-        run: pnpm --filter @localbridge/desktop build
+      - name: Build unpacked desktop
+        run: pnpm --filter @localbridge/desktop package:win:dir
+
+      - name: Smoke packaged desktop window
+        shell: pwsh
+        run: |
+          ./scripts/smoke-packaged-desktop.ps1 `
+            -ExecutablePath 'apps/desktop/release/win-unpacked/LocalBridge MCP.exe'
+
+      - name: Packaged MCP server suite
+        env:
+          LOCALBRIDGE_PACKAGED_RESOURCES: ${{ github.workspace }}\apps\desktop\release\win-unpacked\resources
+        run: pnpm exec vitest run tests/integration/packaged-desktop-server.test.ts

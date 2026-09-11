@@ -237,6 +237,7 @@ export function resolvePendingApproval(dbPath: string, approval: PendingApproval
 export function queryPendingApprovals(dbPath: string, now = new Date()): PendingApproval[] {
   const db = openDatabase(dbPath);
   try {
+    db.prepare("DELETE FROM pending_approvals WHERE status = 'pending' AND expires_at <= ?").run(now.toISOString());
     const rows = db
       .prepare("SELECT * FROM pending_approvals WHERE status = 'pending' AND expires_at > ? ORDER BY requested_at DESC LIMIT ?")
       .all(now.toISOString(), MAX_PENDING_APPROVALS) as Array<Record<string, unknown>>;

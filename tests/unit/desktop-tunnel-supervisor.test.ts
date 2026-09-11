@@ -151,6 +151,7 @@ describe('TunnelSupervisor.connect', () => {
     supervisor.connect(CONNECT_OPTIONS);
 
     expect(supervisor.getStatus()).toBe('connecting');
+    expect(supervisor.getEffectiveGitApprovalMode()).toBe('mrtr');
     expect(onStatusChange).toHaveBeenCalledWith('connecting', undefined);
   });
 
@@ -338,5 +339,6 @@ describe('TunnelSupervisor.disconnect', () => {
     expect(() => supervisor.disconnect()).not.toThrow();
     expect(killTreeFn).not.toHaveBeenCalled();
     expect(supervisor.getStatus()).toBe('disconnected');
+    expect(supervisor.getEffectiveGitApprovalMode()).toBeUndefined();
   });
 });

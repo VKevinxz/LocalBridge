@@ -14,6 +14,7 @@ export {
   getCommitSnapshot,
   getPushSnapshot,
   type StageResult,
+  type GitMutationOptions,
   type CommitResult,
   type CommitSnapshot,
   type PushResult,

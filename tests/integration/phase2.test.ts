@@ -43,6 +43,40 @@ describe('1. listar workspace', () => {
     expect(workspaces[0]?.permissions).toBeDefined();
     expect(workspaces[0]?.limits).toBeDefined();
   });
+
+  it('explica la disponibilidad efectiva de perfiles sin conceder capacidades', async () => {
+    const processProfile = {
+      command: ['npm', 'run', 'dev'],
+      cwd: '.',
+      source: { kind: 'package-script' as const, manifestPath: 'package.json' as const, script: 'dev', definitionSha256: 'a'.repeat(64) },
+      maxRuntimeSeconds: 300,
+    };
+    await writeRegistryFile(configPath, [buildWorkspace({
+      id: 'ws_profiles',
+      rootPath: workspace.root,
+      permissions: {
+        read: true, write: false, overwrite: false, gitRead: false, validations: true,
+        gitWrite: false, processes: true, browserRead: true, browserInteract: false,
+        browserHumanControl: false,
+      },
+      validationProfiles: { test: ['pnpm', 'test'] },
+      processProfiles: { dev: processProfile },
+      browserProfiles: { web: { origin: 'http://127.0.0.1:5173', allowedOrigins: ['http://127.0.0.1:5173'], viewport: { width: 1280, height: 800 } } },
+      automationReviewRequired: true,
+    })]);
+    harness = await createHarness({ pinProtocol: TARGET_PROTOCOL_REVISION, workspaceConfigPath: configPath });
+
+    const result = await callToolJson(harness.client, 'workspace.list', {});
+    const listed = (result.parsed['workspaces'] as Array<Record<string, unknown>>)[0] as {
+      profileAvailability: Record<string, Array<Record<string, unknown>>>;
+    };
+
+    expect(listed.profileAvailability).toEqual({
+      validations: [{ name: 'test', available: true }],
+      processes: [{ name: 'dev', available: false, blockedReason: 'automation-review-required' }],
+      browser: [{ name: 'web', available: false, blockedReason: 'automation-review-required' }],
+    });
+  });
 });
 
 describe('2. leer archivo (recorrido completo)', () => {

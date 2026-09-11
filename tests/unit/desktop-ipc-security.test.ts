@@ -6,6 +6,7 @@ import {
   authorizedWorkspaceInputSchema,
   auditQuerySchema,
   liveViewerMoveInputSchema,
+  liveViewerPresentationInputSchema,
   liveViewerTargetInputSchema,
   terminalListenerTargetInputSchema,
   terminalSessionTargetInputSchema,
@@ -16,6 +17,15 @@ import {
   tunnelApiKeyInputSchema,
   portableImportSessionIdSchema,
   portableWorkspaceRefSchema,
+  webHumanSessionInputSchema,
+  webLiveViewerHideInputSchema,
+  webLiveViewerMoveInputSchema,
+  webLiveViewerPresentationInputSchema,
+  webLiveViewerShowInputSchema,
+  webProfileCreateInputSchema,
+  webProfileUpdateInputSchema,
+  webTabsInputSchema,
+  webViewerStateInputSchema,
 } from '@localbridge/desktop-core';
 import { assertTrustedIpcSender } from '../../apps/desktop/src/main/ipc-security.js';
 
@@ -50,10 +60,16 @@ describe('frontera IPC de Electron', () => {
       name: 'Proyecto',
       rootPath: path.resolve('proyecto'),
       permissions: PERMISSIONS,
+      maxFileBytes: 8 * 1024 * 1024,
       validationProfiles: { test: ['pnpm', 'test'] },
     });
 
     expect(parsed.validationProfiles).toEqual({ test: ['pnpm', 'test'] });
+    expect(parsed.maxFileBytes).toBe(8 * 1024 * 1024);
+    expect(() => newWorkspaceInputSchema.parse({
+      name: 'Proyecto', rootPath: path.resolve('proyecto'), permissions: PERMISSIONS,
+      maxFileBytes: 25 * 1024 * 1024 + 1,
+    })).toThrow();
   });
 
   it('rechaza rutas relativas, campos extra y workspaces manipulados', () => {
@@ -116,6 +132,20 @@ describe('frontera IPC de Electron', () => {
     ]) expect(() => liveViewerMoveInputSchema.parse(invalid)).toThrow();
   });
 
+  it('valida modo y desplazamiento del visor sin cambiar el viewport lógico', () => {
+    const sessionId = `session_${'a'.repeat(24)}`;
+    const webSessionId = `websession_${'b'.repeat(24)}`;
+    expect(liveViewerPresentationInputSchema.parse({ sessionId, mode: 'fit' })).toEqual({ sessionId, mode: 'fit', panX: 0, panY: 0 });
+    expect(webLiveViewerPresentationInputSchema.parse({ sessionId: webSessionId, mode: 'actual', panX: 240, panY: 135 }))
+      .toEqual({ sessionId: webSessionId, mode: 'actual', panX: 240, panY: 135 });
+    for (const invalid of [
+      { sessionId, mode: 'stretch', panX: 0, panY: 0 },
+      { sessionId, mode: 'actual', panX: -1, panY: 0 },
+      { sessionId, mode: 'actual', panX: 0.5, panY: 0 },
+      { sessionId, mode: 'actual', panX: 0, panY: 0, width: 1920 },
+    ]) expect(() => liveViewerPresentationInputSchema.parse(invalid)).toThrow();
+  });
+
   it('acepta solo referencias opacas para acciones locales de terminal', () => {
     const projectId = `project_${'a'.repeat(24)}`;
     const terminalSessionId = `terminal_${'b'.repeat(24)}`;
@@ -130,5 +160,48 @@ describe('frontera IPC de Electron', () => {
       { projectId, terminalSessionId: 'terminal_invalid', listenerRef },
       { projectId, terminalSessionId, listenerRef: 'listener_invalid' },
     ]) expect(() => terminalListenerTargetInputSchema.parse(invalid)).toThrow();
+  });
+
+  it('valida perfiles web locales sin aceptar URL, cookies ni rutas', () => {
+    expect(webProfileCreateInputSchema.parse({ kind: 'public-research', name: 'Público' })).toEqual({ kind: 'public-research', name: 'Público' });
+    expect(webProfileCreateInputSchema.parse({ kind: 'site-account', name: 'Portal', destinations: ['example.com'], supportHosts: [] }))
+      .toMatchObject({ kind: 'site-account', destinations: ['example.com'] });
+    for (const invalid of [
+      { kind: 'site-account', name: 'Portal', destinations: ['https://example.com/private'] },
+      { kind: 'public-research', name: 'Público', url: 'https://example.com' },
+      { kind: 'public-research', name: 'Público', cookie: 'secret' },
+    ]) expect(() => webProfileCreateInputSchema.parse(invalid)).toThrow();
+
+    const profile = {
+      id: `webprofile_${'a'.repeat(24)}`, name: 'Público', kind: 'public-research' as const, enabled: false, reviewRequired: false,
+      destinations: [], supportHosts: [], permissions: { read: true, interact: true, download: false, humanControl: false },
+      limits: { maxSessions: 2, maxTabsPerSession: 8, maxExtractedChars: 50_000, maxDownloadBytes: 25 * 1024 * 1024 },
+      createdAt: '2026-09-05T00:00:00.000Z', updatedAt: '2026-09-05T00:00:00.000Z',
+    };
+    expect(webProfileUpdateInputSchema.parse({ expectedSha256: 'b'.repeat(64), profile }).profile.id).toBe(profile.id);
+    expect(() => webProfileUpdateInputSchema.parse({ expectedSha256: 'b'.repeat(64), profile, rootPath: 'C:\\private' })).toThrow();
+    expect(webHumanSessionInputSchema.parse(`websession_${'c'.repeat(24)}`)).toBe(`websession_${'c'.repeat(24)}`);
+    expect(() => webHumanSessionInputSchema.parse(`session_${'c'.repeat(24)}`)).toThrow();
+  });
+
+  it('acepta solo IDs, modo y display para la vista web local', () => {
+    const sessionId = `websession_${'a'.repeat(24)}`;
+    const tabId = `webtab_${'b'.repeat(24)}`;
+    expect(webViewerStateInputSchema.parse({})).toEqual({});
+    expect(webTabsInputSchema.parse({ sessionId })).toEqual({ sessionId });
+    expect(webLiveViewerShowInputSchema.parse({ mode: 'follow', sessionId, displayId: '-42' }))
+      .toEqual({ mode: 'follow', sessionId, displayId: '-42' });
+    expect(webLiveViewerShowInputSchema.parse({ mode: 'pinned', sessionId, tabId })).toEqual({ mode: 'pinned', sessionId, tabId });
+    expect(webLiveViewerHideInputSchema.parse({ sessionId })).toEqual({ sessionId });
+    expect(webLiveViewerMoveInputSchema.parse({ sessionId, displayId: '7' })).toEqual({ sessionId, displayId: '7' });
+    for (const invalid of [
+      { mode: 'pinned', sessionId },
+      { mode: 'follow', sessionId, tabId },
+      { mode: 'pinned', sessionId, tabId, url: 'https://example.com' },
+      { mode: 'pinned', sessionId, tabId, x: 20 },
+      { mode: 'pinned', sessionId: `session_${'a'.repeat(24)}`, tabId },
+      { mode: 'pinned', sessionId, tabId: `tab_${'b'.repeat(24)}` },
+    ]) expect(() => webLiveViewerShowInputSchema.parse(invalid)).toThrow();
+    expect(() => webViewerStateInputSchema.parse({ sessionId })).toThrow();
   });
 });

@@ -78,6 +78,24 @@ export interface TerminalOutputEntry {
   readonly text: string;
 }
 
+function utf8Window(buffer: Buffer, requestedStart: number, maxBytes: number): {
+  start: number;
+  end: number;
+  minimumBytesToProgress?: number;
+} {
+  let start = Math.min(Math.max(0, requestedStart), buffer.length);
+  while (start < buffer.length && (buffer[start]! & 0xc0) === 0x80) start += 1;
+  if (start >= buffer.length) return { start, end: start };
+
+  let end = Math.min(buffer.length, start + maxBytes);
+  while (end > start && end < buffer.length && (buffer[end]! & 0xc0) === 0x80) end -= 1;
+  if (end > start) return { start, end };
+
+  let codePointEnd = start + 1;
+  while (codePointEnd < buffer.length && (buffer[codePointEnd]! & 0xc0) === 0x80) codePointEnd += 1;
+  return { start, end: start, minimumBytesToProgress: codePointEnd - start };
+}
+
 export interface TerminalListenerSummary {
   readonly listenerRef: string;
   readonly origin: string;
@@ -116,6 +134,8 @@ interface MutableTerminal {
   readonly sessionId: string;
   readonly projectId: string;
   readonly trustMode: "project-agent" | "full-host";
+  /** Liga sesión y output a la aprobación y root exactos vigentes al iniciarla. */
+  readonly authorityFingerprint: string;
   readonly child: ChildProcessWithoutNullStreams;
   readonly startedAtMs: number;
   readonly deadlineMs: number;
@@ -200,6 +220,22 @@ function summary(entry: MutableTerminal): TerminalSummary {
   };
 }
 
+function terminalAuthorityFingerprint(
+  project: ProjectCatalogRecord,
+  trust: ProjectTrustRecord & { mode: "project-agent" | "full-host" },
+): string {
+  return createHash("sha256").update(JSON.stringify([
+    project.id,
+    project.selectedRoot,
+    trust.mode,
+    trust.deviceBinding,
+    trust.status,
+    trust.networkPolicy,
+    trust.acceptedRiskVersion,
+    trust.reviewedAt,
+  ]), "utf8").digest("hex");
+}
+
 function listenerSummary(listener: MutableListener): TerminalListenerSummary {
   return {
     listenerRef: listener.listenerRef,
@@ -247,6 +283,16 @@ export class TerminalSupervisor {
     if (project === undefined) brokerError("PROJECT_NOT_FOUND", "El proyecto no existe.");
     if (project.state !== "ready") brokerError("PROJECT_REVIEW_REQUIRED", "El proyecto requiere revisión local.");
     return this.trusted(project);
+  }
+
+  private requireSessionAuthority(
+    entry: MutableTerminal,
+    project: ProjectCatalogRecord,
+    trust: ProjectTrustRecord & { mode: "project-agent" | "full-host" },
+  ): void {
+    if (entry.authorityFingerprint !== terminalAuthorityFingerprint(project, trust)) {
+      brokerError("TERMINAL_NOT_AUTHORIZED", "La autoridad de la sesión cambió.");
+    }
   }
 
   private async trusted(project: ProjectCatalogRecord): Promise<{
@@ -364,10 +410,15 @@ export class TerminalSupervisor {
 
   async start(projectId: string, operationId?: string): Promise<TerminalSummary> {
     const operationKey = operationId === undefined ? undefined : `${projectId}:${operationId}`;
-    const previous = operationKey === undefined ? undefined : this.operations.get(operationKey);
-    if (previous !== undefined) return summary(this.entry(projectId, previous));
-
     const { project, trust } = await this.authority(projectId);
+    const previous = operationKey === undefined ? undefined : this.operations.get(operationKey);
+    if (previous !== undefined) {
+      const entry = this.entry(projectId, previous);
+      if (entry.authorityFingerprint !== terminalAuthorityFingerprint(project, trust)) {
+        brokerError("IDEMPOTENCY_CONFLICT", "La autoridad del operationId cambió.");
+      }
+      return summary(entry);
+    }
     this.pruneFinished();
     const active = [...this.entries.values()].filter((candidate) => candidate.state === "running");
     if (active.length >= MAX_ACTIVE_GLOBAL || active.filter((candidate) => candidate.projectId === projectId).length >= MAX_ACTIVE_PER_PROJECT) {
@@ -413,6 +464,7 @@ export class TerminalSupervisor {
       sessionId,
       projectId,
       trustMode: trust.mode,
+      authorityFingerprint: terminalAuthorityFingerprint(project, trust),
       child,
       startedAtMs,
       deadlineMs,
@@ -470,10 +522,10 @@ export class TerminalSupervisor {
   }
 
   async write(projectId: string, sessionId: string, text: string, operationId?: string): Promise<{ session: TerminalSummary; nextCursor: number }> {
-    const { trust } = await this.authority(projectId);
+    const { project, trust } = await this.authority(projectId);
     const entry = this.entry(projectId, sessionId);
     if (entry.state !== "running") brokerError("TERMINAL_NOT_RUNNING", "La terminal ya no está activa.");
-    if (entry.trustMode !== trust.mode) brokerError("TERMINAL_NOT_AUTHORIZED", "La confianza de la sesión cambió.");
+    this.requireSessionAuthority(entry, project, trust);
     const bytes = Buffer.byteLength(text);
     if (bytes === 0 || bytes > MAX_WRITE_BYTES) brokerError("INVALID_INPUT", "La entrada de terminal no tiene un tamaño válido.");
     const operationKey = operationId === undefined ? undefined : `${projectId}:${sessionId}:${operationId}`;
@@ -491,32 +543,55 @@ export class TerminalSupervisor {
   }
 
   async read(projectId: string, sessionId: string, cursor: number, maxBytes: number) {
-    await this.sessionAuthority(projectId);
+    const { project, trust } = await this.sessionAuthority(projectId);
     const entry = this.entry(projectId, sessionId);
+    this.requireSessionAuthority(entry, project, trust);
     const firstCursor = entry.output[0]?.cursor ?? entry.nextCursor;
+    let nextCursor = Math.max(cursor, firstCursor);
     let used = 0;
     const output: TerminalOutputEntry[] = [];
+    let minimumBytesToProgress: number | undefined;
     for (const item of entry.output) {
-      const end = item.cursor + Buffer.byteLength(item.text);
-      if (end <= cursor) continue;
-      const bytes = Buffer.byteLength(item.text);
-      if (used + bytes > maxBytes && output.length > 0) break;
-      output.push(item);
-      used += bytes;
+      const buffer = Buffer.from(item.text, "utf8");
+      const itemEnd = item.cursor + buffer.length;
+      if (itemEnd <= nextCursor) continue;
+      const window = utf8Window(buffer, nextCursor - item.cursor, maxBytes - used);
+      nextCursor = item.cursor + window.start;
+      if (window.end === window.start) {
+        minimumBytesToProgress = window.minimumBytesToProgress;
+        break;
+      }
+      const text = buffer.subarray(window.start, window.end).toString("utf8");
+      output.push({ cursor: nextCursor, stream: item.stream, text });
+      used += window.end - window.start;
+      nextCursor = item.cursor + window.end;
+      if (window.end < buffer.length || used === maxBytes) break;
     }
     return {
       session: summary(entry),
       entries: output,
-      nextCursor: output.length === 0 ? Math.max(cursor, entry.nextCursor) : output.at(-1)!.cursor + Buffer.byteLength(output.at(-1)!.text),
+      nextCursor: output.length === 0 && minimumBytesToProgress === undefined ? Math.max(cursor, entry.nextCursor) : nextCursor,
       truncatedBeforeCursor: cursor < firstCursor,
+      ...(minimumBytesToProgress === undefined ? {} : { minimumBytesToProgress }),
     };
   }
 
   async status(projectId: string, sessionId: string): Promise<{ session: TerminalSummary; listeners: readonly TerminalListenerSummary[] }> {
-    await this.sessionAuthority(projectId);
+    const { project, trust } = await this.sessionAuthority(projectId);
     const entry = this.entry(projectId, sessionId);
+    this.requireSessionAuthority(entry, project, trust);
     const cutoff = this.now() - LISTENER_STALE_MS;
     return { session: summary(entry), listeners: [...entry.listeners.values()].filter((listener) => listener.observedAtMs >= cutoff).map(listenerSummary) };
+  }
+
+  async list(projectId: string): Promise<readonly TerminalSummary[]> {
+    const { project, trust } = await this.sessionAuthority(projectId);
+    const authorityFingerprint = terminalAuthorityFingerprint(project, trust);
+    this.pruneFinished();
+    return [...this.entries.values()]
+      .filter((entry) => entry.projectId === projectId && entry.authorityFingerprint === authorityFingerprint)
+      .map(summary)
+      .toSorted((left, right) => left.startedAt.localeCompare(right.startedAt));
   }
 
   async resolveListener(projectId: string, sessionId: string, listenerRef: string, workspaceId?: string): Promise<ResolvedTerminalListener> {
@@ -525,6 +600,7 @@ export class TerminalSupervisor {
       brokerError("APPLICATION_SERVICE_MISMATCH", "La carpeta no pertenece al proyecto de esta terminal.");
     }
     const entry = this.entry(projectId, sessionId);
+    this.requireSessionAuthority(entry, project, trust);
     if (entry.state !== "running") brokerError("TERMINAL_NOT_RUNNING", "La terminal ya no está activa.");
     const listener = [...entry.listeners.values()].find((candidate) => candidate.listenerRef === listenerRef);
     if (listener === undefined || listener.observedAtMs < this.now() - LISTENER_STALE_MS) {
@@ -559,8 +635,9 @@ export class TerminalSupervisor {
 
   async stop(projectId: string, sessionId: string): Promise<TerminalSummary> {
     await this.sessionAuthority(projectId);
-    await this.terminate(sessionId, "stopped");
-    return summary(this.entry(projectId, sessionId));
+    const entry = this.entry(projectId, sessionId);
+    await this.terminate(entry.sessionId, "stopped");
+    return summary(entry);
   }
 
   listAll(): readonly TerminalSummary[] {
@@ -571,7 +648,16 @@ export class TerminalSupervisor {
     await Promise.all([...this.entries.values()].filter((entry) => entry.state === "running").map(async (entry) => {
       const project = await this.options.loadProject(entry.projectId).catch(() => undefined);
       const trust = await this.options.loadTrust(entry.projectId).catch(() => undefined);
-      if (project?.state !== "ready" || trust?.status !== "active" || trust.deviceBinding !== this.options.deviceBinding || trust.mode !== entry.trustMode) {
+      const terminalTrust = trust?.mode === "project-agent" || trust?.mode === "full-host" ? trust as ProjectTrustRecord & {
+        mode: "project-agent" | "full-host";
+      } : undefined;
+      if (
+        project?.state !== "ready"
+        || terminalTrust === undefined
+        || terminalTrust.status !== "active"
+        || terminalTrust.deviceBinding !== this.options.deviceBinding
+        || entry.authorityFingerprint !== terminalAuthorityFingerprint(project, terminalTrust)
+      ) {
         await this.terminate(entry.sessionId, "revoked");
       }
     }));

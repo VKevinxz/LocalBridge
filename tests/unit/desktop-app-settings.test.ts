@@ -16,13 +16,14 @@ beforeEach(() => {
 describe('readDesktopSettings', () => {
   it('un fichero ausente devuelve los valores por defecto', async () => {
     expect(await readDesktopSettings(settingsPath)).toEqual(DEFAULT_DESKTOP_SETTINGS);
+    expect(DEFAULT_DESKTOP_SETTINGS.gitApprovalMode).toBe('host');
   });
 
   it('un fichero roto degrada a los valores por defecto en vez de lanzar', async () => {
     await mkdir(path.dirname(settingsPath), { recursive: true });
     await writeFile(settingsPath, 'no es json', 'utf8');
 
-    await expect(readDesktopSettings(settingsPath)).resolves.toEqual(DEFAULT_DESKTOP_SETTINGS);
+    await expect(readDesktopSettings(settingsPath)).resolves.toEqual({ ...DEFAULT_DESKTOP_SETTINGS, gitApprovalMode: 'mrtr' });
   });
 
   it('rellena con valores por defecto los campos que falten', async () => {
@@ -57,6 +58,7 @@ describe('writeDesktopSettings / readDesktopSettings', () => {
       onboardingStep: 2,
       onboardingCompleted: false,
       minimizeToTray: true,
+      largeArtifactPreference: DEFAULT_DESKTOP_SETTINGS.largeArtifactPreference,
       gitApprovalMode: 'host' as const,
       activeConnectionProfileId: 'profile_default0',
       connectionProfiles: [{ id: 'profile_default0', name: 'Personal', tunnelId: 'tunnel_0123456789abcdef0123456789abcdef' }],

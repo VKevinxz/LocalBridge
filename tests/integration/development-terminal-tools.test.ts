@@ -34,6 +34,7 @@ describe('terminal de confianza vía broker privado', () => {
     broker = await startDevelopmentBroker({
       handler: async ({ method }) => {
         methods.push(method);
+        if (method === 'terminal.list') return [summary];
         if (method === 'terminal.read') {
           return { session: { ...summary, nextCursor: 1 }, entries: [{ cursor: 0, stream: 'terminal', text: 'ready\r\n' }], nextCursor: 1, truncatedBeforeCursor: false };
         }
@@ -62,11 +63,12 @@ describe('terminal de confianza vía broker privado', () => {
     });
 
     expect((await callToolJson(harness.client, 'terminal.start', { projectId, operationId: 'start-1' })).parsed).toMatchObject(summary);
+    expect((await callToolJson(harness.client, 'terminal.list', { projectId })).parsed).toEqual({ sessions: [summary] });
     expect((await callToolJson(harness.client, 'terminal.write', { projectId, sessionId, text: 'npm run dev\r', operationId: 'write-1' })).parsed).toMatchObject({ nextCursor: 1 });
     expect((await callToolJson(harness.client, 'terminal.read', { projectId, sessionId, cursor: 0, maxBytes: 1024 })).parsed).toMatchObject({ entries: [{ text: 'ready\r\n' }] });
     expect((await callToolJson(harness.client, 'terminal.status', { projectId, sessionId })).parsed).toMatchObject({ listeners: [{ port: 5173 }] });
     expect((await callToolJson(harness.client, 'terminal.stop', { projectId, sessionId, operationId: 'stop-1' })).parsed).toMatchObject(summary);
-    expect(methods).toEqual(['terminal.start', 'terminal.write', 'terminal.read', 'terminal.status', 'terminal.stop']);
+    expect(methods).toEqual(['terminal.start', 'terminal.list', 'terminal.write', 'terminal.read', 'terminal.status', 'terminal.stop']);
   });
 
   it('preserva un fallo cerrado de confianza sin revelar su detalle interno', async () => {

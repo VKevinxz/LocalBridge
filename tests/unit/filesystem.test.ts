@@ -1,9 +1,16 @@
 import { createHash } from 'node:crypto';
-import { mkdir, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, readdir, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-import { getFileMetadata, readWorkspaceFile, buildWorkspaceTree, searchWorkspace } from '@localbridge/filesystem';
+import {
+  createWorkspaceBinaryFile,
+  createWorkspaceBinaryFileFromChunks,
+  getFileMetadata,
+  readWorkspaceFile,
+  buildWorkspaceTree,
+  searchWorkspace,
+} from '@localbridge/filesystem';
 import { isLocalBridgeError } from '@localbridge/shared';
 
 import { buildWorkspace, createTempWorkspaceDir, populateSampleProject, type TempWorkspace } from '../helpers/fixtures.js';
@@ -17,6 +24,105 @@ beforeEach(async () => {
 
 afterEach(async () => {
   await workspace.cleanup();
+});
+
+describe('createWorkspaceBinaryFile — autoridad de cuota binaria', () => {
+  it('mantiene maxFileBytes por defecto y acepta una cuota web local acotada', async () => {
+    const ws = buildWorkspace({
+      rootPath: workspace.root,
+      limits: { maxFileBytes: 16, maxTreeEntries: 300, maxTreeDepth: 3 },
+    });
+    const bytes = Buffer.alloc(32, 0x61);
+
+    await expect(createWorkspaceBinaryFile(ws, 'downloads/default.bin', bytes))
+      .rejects.toMatchObject({ code: 'FILE_TOO_LARGE' });
+    await expect(createWorkspaceBinaryFile(ws, 'downloads/web.bin', bytes, { maximumBytes: 64 }))
+      .resolves.toMatchObject({ path: 'downloads/web.bin', size: 32, created: true });
+  });
+
+  it('rechaza límites internos por encima de 1 GiB o reservas inválidas', async () => {
+    const ws = buildWorkspace({ rootPath: workspace.root });
+    await expect(createWorkspaceBinaryFile(ws, 'downloads/ceiling.bin', Buffer.from('x'), {
+      maximumBytes: 1024 * 1024 * 1024 + 1,
+    })).rejects.toMatchObject({ code: 'INVALID_INPUT' });
+    await expect(createWorkspaceBinaryFile(ws, 'downloads/reserve.bin', Buffer.from('x'), {
+      reserveFreeBytes: -1,
+    })).rejects.toMatchObject({ code: 'INVALID_INPUT' });
+  });
+
+  it('publica un flujo por staging y elimina parciales si el productor falla', async () => {
+    const ws = buildWorkspace({
+      rootPath: workspace.root,
+      limits: { maxFileBytes: 4, maxTreeEntries: 300, maxTreeDepth: 3 },
+    });
+    const saved = await createWorkspaceBinaryFileFromChunks(ws, 'downloads/stream.bin', async (writer) => {
+      await writer.write(Buffer.from('stream-'));
+      await writer.write(Buffer.from('content'));
+      expect(writer.size).toBe(14);
+    }, { maximumBytes: 32 });
+    expect(saved).toMatchObject({ path: 'downloads/stream.bin', size: 14, created: true });
+    expect(await readFile(path.join(workspace.root, 'downloads', 'stream.bin'), 'utf8')).toBe('stream-content');
+
+    await expect(createWorkspaceBinaryFileFromChunks(ws, 'downloads/fail.bin', async (writer) => {
+      await writer.write(Buffer.from('partial'));
+      throw new Error('validation failed');
+    }, { maximumBytes: 32 })).rejects.toThrow('validation failed');
+    expect((await readdir(path.join(workspace.root, 'downloads'))).some((name) => name.includes('fail.bin'))).toBe(false);
+  });
+
+  it('escribe un stream sintético grande reutilizando chunks acotados', async () => {
+    const ws = buildWorkspace({
+      rootPath: workspace.root,
+      limits: { maxFileBytes: 1024, maxTreeEntries: 300, maxTreeDepth: 3 },
+    });
+    const chunk = Buffer.alloc(64 * 1024, 0xa5);
+    const chunkCount = 512;
+    const expected = createHash('sha256');
+    for (let index = 0; index < chunkCount; index += 1) expected.update(chunk);
+
+    const saved = await createWorkspaceBinaryFileFromChunks(ws, 'downloads/large-stream.bin', async (writer) => {
+      for (let index = 0; index < chunkCount; index += 1) await writer.write(chunk);
+    }, { maximumBytes: 64 * 1024 * 1024 });
+
+    expect(saved).toMatchObject({
+      size: chunk.byteLength * chunkCount,
+      sha256: expected.digest('hex'),
+      created: true,
+    });
+    expect((await getFileMetadata(ws, 'downloads/large-stream.bin')).size).toBe(chunk.byteLength * chunkCount);
+  });
+
+  it('acepta en streaming una política local superior a 1 GiB sin materializar ese tamaño', async () => {
+    const ws = buildWorkspace({ rootPath: workspace.root });
+    await expect(createWorkspaceBinaryFileFromChunks(ws, 'downloads/custom-limit.bin', async (writer) => {
+      await writer.write(Buffer.from('bounded'));
+    }, { maximumBytes: 2 * 1024 * 1024 * 1024 }))
+      .resolves.toMatchObject({ path: 'downloads/custom-limit.bin', size: 7, created: true });
+  });
+
+  it('revalida autoridad durante un stream largo y elimina el staging al revocarse', async () => {
+    const ws = buildWorkspace({ rootPath: workspace.root });
+    let authorized = true;
+    let protectedEffects = 0;
+    const operation = createWorkspaceBinaryFileFromChunks(ws, 'downloads/revoked.bin', async (writer) => {
+      await writer.write(Buffer.from('first'));
+      authorized = false;
+      await writer.write(Buffer.from('second'));
+    }, {
+      adaptive: true,
+      checkAuthority: async () => {
+        if (!authorized) throw Object.assign(new Error('revoked'), { code: 'CAPABILITY_DISABLED' });
+      },
+      withAuthorizedEffect: async (effect) => {
+        protectedEffects += 1;
+        return effect();
+      },
+    });
+
+    await expect(operation).rejects.toMatchObject({ code: 'CAPABILITY_DISABLED' });
+    expect(protectedEffects).toBe(1);
+    expect((await readdir(path.join(workspace.root, 'downloads'))).some((name) => name.includes('revoked.bin'))).toBe(false);
+  });
 });
 
 describe('readWorkspaceFile — file.read', () => {
@@ -38,6 +144,31 @@ describe('readWorkspaceFile — file.read', () => {
     expect(partial.content).toBe('expor');
     expect(partial.truncated).toBe(true);
     expect(partial.sha256).toBe(full.sha256);
+  });
+
+  it('lee un rango de líneas acotado sin cambiar el hash del archivo completo', async () => {
+    await writeFile(path.join(workspace.root, 'src', 'ranged.ts'), 'uno\ndos\ntres\ncuatro\n');
+    const ws = buildWorkspace({ rootPath: workspace.root });
+    const full = await readWorkspaceFile(ws, 'src/ranged.ts', undefined);
+    const ranged = await readWorkspaceFile(ws, 'src/ranged.ts', undefined, { startLine: 2, endLine: 3 });
+
+    expect(ranged.content).toBe('dos\ntres\n');
+    expect(ranged.sha256).toBe(full.sha256);
+    expect(ranged.size).toBe(full.size);
+    expect(ranged.truncated).toBe(false);
+    expect(ranged.lineRange).toEqual({
+      startLine: 2,
+      endLine: 3,
+      totalLines: 4,
+      hasMoreBefore: true,
+      hasMoreAfter: true,
+    });
+  });
+
+  it('rechaza rangos que empiezan después del final del archivo', async () => {
+    const ws = buildWorkspace({ rootPath: workspace.root });
+    await expect(readWorkspaceFile(ws, 'src/index.ts', undefined, { startLine: 99 }))
+      .rejects.toMatchObject({ code: 'INVALID_INPUT' });
   });
 
   it('[SEC-011] un archivo mayor que el límite del workspace se rechaza sin leerlo', async () => {
@@ -79,6 +210,24 @@ describe('getFileMetadata — file.metadata', () => {
     expect(meta.type).toBe('file');
     expect(meta.sha256).toBe(read.sha256);
     expect(meta.size).toBe(read.size);
+  });
+
+  it('hashea por streaming un asset administrado mayor que la cuota de texto', async () => {
+    const bytes = Buffer.alloc(2 * 1024 * 1024, 0x5a);
+    await writeFile(path.join(workspace.root, 'large-asset.bin'), bytes);
+    const ws = buildWorkspace({
+      rootPath: workspace.root,
+      limits: { maxFileBytes: 1024, maxTreeEntries: 300, maxTreeDepth: 3 },
+    });
+
+    const meta = await getFileMetadata(ws, 'large-asset.bin');
+
+    expect(meta).toMatchObject({
+      exists: true,
+      type: 'file',
+      size: bytes.byteLength,
+      sha256: createHash('sha256').update(bytes).digest('hex'),
+    });
   });
 
   it('archivo inexistente: exists=false, sin lanzar', async () => {
@@ -230,6 +379,31 @@ describe('searchWorkspace — workspace.search', () => {
     expect(result.matches.some((m) => m.path === 'grande.txt')).toBe(false);
   });
 
+  it('en adaptive busca por streaming por encima de maxFileBytes y entre chunks', async () => {
+    const prefix = 'x'.repeat(1024 * 1024 - 3);
+    await writeFile(path.join(workspace.root, 'grande-adaptive.txt'), `${prefix}aguja-cruzada\nsegunda\n`);
+    const base = buildWorkspace({ rootPath: workspace.root });
+    const ws = buildWorkspace({
+      rootPath: workspace.root,
+      limits: {
+        ...base.limits,
+        maxFileBytes: 1024,
+        largeArtifacts: { mode: 'adaptive', reserve: { minimumFreeBytes: 0, minimumFreePercent: 0 }, maxConcurrentJobs: 1 },
+      },
+    });
+    const result = await searchWorkspace(ws, 'grande-adaptive.txt', 'aguja-cruzada', true, undefined);
+    expect(result.matches).toEqual([{ path: 'grande-adaptive.txt', line: 1, text: 'x'.repeat(2000) }]);
+    expect(result.filesScanned).toBe(1);
+  });
+
+  it('busca texto UTF-16 con BOM sin clasificar sus NUL como binario', async () => {
+    const body = Buffer.from('primera\r\nAguja UTF16\r\n', 'utf16le');
+    await writeFile(path.join(workspace.root, 'utf16.txt'), Buffer.concat([Buffer.from([0xff, 0xfe]), body]));
+    const ws = buildWorkspace({ rootPath: workspace.root });
+    const result = await searchWorkspace(ws, 'utf16.txt', 'aguja utf16', false, undefined);
+    expect(result.matches).toEqual([{ path: 'utf16.txt', line: 2, text: 'Aguja UTF16\r' }]);
+  });
+
   it('maxResults acota el resultado y marca truncated', async () => {
     await mkdir(path.join(workspace.root, 'many'), { recursive: true });
     for (let i = 0; i < 20; i += 1) {
@@ -265,5 +439,11 @@ describe('searchWorkspace — workspace.search', () => {
     const result = await searchWorkspace(ws, '.', 'esta-cadena-no-existe-en-ningun-lado', false, undefined);
     expect(result.matches).toEqual([]);
     expect(result.truncated).toBe(false);
+  });
+
+  it('TIMEOUT detiene el recorrido dentro de la propia operación', async () => {
+    const ws = buildWorkspace({ rootPath: workspace.root });
+    await expect(searchWorkspace(ws, '.', 'hello', false, undefined, { timeoutMs: 0, now: () => 100 }))
+      .rejects.toMatchObject({ code: 'TIMEOUT' });
   });
 });

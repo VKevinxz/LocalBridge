@@ -1,6 +1,7 @@
 import { execFile } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { createRequire } from 'node:module';
+import { DatabaseSync } from 'node:sqlite';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -316,6 +317,13 @@ describe('aprobaciones MRTR pendientes', () => {
       action: 'git.commit',
     });
     expect(queryPendingApprovals(dbPath, new Date('2026-08-23T20:05:00.000Z'))).toEqual([]);
+    const db = new DatabaseSync(dbPath);
+    try {
+      const row = db.prepare("SELECT COUNT(*) AS count FROM pending_approvals WHERE id = 'expired'").get() as { count: number };
+      expect(row.count).toBe(0);
+    } finally {
+      db.close();
+    }
   });
 
   it('un estado resuelto no puede resucitar por una primera ronda concurrente tardía', () => {

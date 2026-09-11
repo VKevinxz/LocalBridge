@@ -51,10 +51,13 @@ describe("SEC-157..160 — emulación de viewport (ADR-0042)", () => {
     expect(method).not.toMatch(/loadURL|allowedOrigins|executeJavaScript|Runtime\.evaluate|setUserAgent/);
   });
 
-  it("SEC-160: el control humano devuelve la ventana a su tamaño real", async () => {
+  it("SEC-160: el control humano usa tamaño real y devuelve al agente su viewport elegido", async () => {
     const controller = await source("apps/desktop/src/main/browser-controller.ts");
     expect(controller).toContain("await this.clearViewportEmulation(entry);");
     expect(controller).toContain("Emulation.clearDeviceMetricsOverride");
+    expect(controller).toContain("entry.agentViewportBeforeHuman = { ...entry.currentViewport }");
+    expect(controller).toContain("entry.currentViewport = entry.agentViewportBeforeHuman");
+    expect(controller).toContain("await this.installDebugger(entry, entry.content.webContents)");
     // Capturas y visor informan el tamaño realmente renderizado, no el
     // declarado por el perfil; la única referencia al perfil que queda es el
     // reseteo dentro de `clearViewportEmulation`.

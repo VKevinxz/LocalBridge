@@ -1,8 +1,8 @@
-import { chmod, mkdir, readFile, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-import { commitStaged, getCommitSnapshot, getPushSnapshot, pushCommits, stageFiles } from '@localbridge/git';
+import { commitStaged, getCommitSnapshot, getPushSnapshot, pushCommits, runGit, stageFiles } from '@localbridge/git';
 import { isLocalBridgeError } from '@localbridge/shared';
 
 import {
@@ -61,6 +61,19 @@ describe('stageFiles', () => {
     expect(diff.stdout.trim()).toBe('README.md');
   });
 
+  it('stagea un asset administrado mayor que la cuota de texto', async () => {
+    await writeFile(path.join(workspace.root, 'large-asset.bin'), Buffer.alloc(2 * 1024 * 1024, 0x6b));
+    const target = buildWorkspace({
+      rootPath: workspace.root,
+      permissions: { read: true, write: true, overwrite: true, gitRead: true, validations: false, gitWrite: true },
+      limits: { maxFileBytes: 1024, maxTreeEntries: 300, maxTreeDepth: 3 },
+    });
+
+    await expect(stageFiles(target, ['large-asset.bin'])).resolves.toEqual({ staged: ['large-asset.bin'] });
+    const staged = await runGit(['diff', '--cached', '--name-only'], { cwd: workspace.root });
+    expect(staged.stdout.trim()).toBe('large-asset.bin');
+  });
+
   it('rechaza una ruta fuera del workspace', async () => {
     await expect(stageFiles(gitWorkspace(), ['../fuera.txt'])).rejects.toMatchObject({ code: 'PATH_OUTSIDE_WORKSPACE' });
   });
@@ -73,6 +86,32 @@ describe('stageFiles', () => {
 
   it('rechaza un archivo que no existe', async () => {
     await expect(stageFiles(gitWorkspace(), ['no-existe.txt'])).rejects.toMatchObject({ code: 'FILE_NOT_FOUND' });
+  });
+
+  it('permite stagear la eliminación de un archivo tracked', async () => {
+    await writeFile(path.join(workspace.root, 'eliminado.txt'), 'tracked\n');
+    await stageFiles(gitWorkspace(), ['eliminado.txt']);
+    await commit('agrega archivo que luego se elimina');
+    await rm(path.join(workspace.root, 'eliminado.txt'));
+
+    await expect(stageFiles(gitWorkspace(), ['eliminado.txt'])).resolves.toEqual({ staged: ['eliminado.txt'] });
+    const { execFile } = await import('node:child_process');
+    const { promisify } = await import('node:util');
+    const diff = await promisify(execFile)('git', ['diff', '--cached', '--name-status'], { cwd: workspace.root });
+    expect(diff.stdout.trim()).toBe('D\teliminado.txt');
+  });
+
+  it('permite stagear ambos extremos de un rename', async () => {
+    await writeFile(path.join(workspace.root, 'antes.txt'), 'tracked\n');
+    await stageFiles(gitWorkspace(), ['antes.txt']);
+    await commit('agrega archivo que luego se renombra');
+    await rename(path.join(workspace.root, 'antes.txt'), path.join(workspace.root, 'despues.txt'));
+
+    await stageFiles(gitWorkspace(), ['antes.txt', 'despues.txt']);
+    const { execFile } = await import('node:child_process');
+    const { promisify } = await import('node:util');
+    const diff = await promisify(execFile)('git', ['diff', '--cached', '--name-status'], { cwd: workspace.root });
+    expect(diff.stdout.trim()).toMatch(/^R\d+\tantes\.txt\tdespues\.txt$/);
   });
 
   it('rechaza una lista vacía de rutas', async () => {
@@ -91,7 +130,38 @@ describe('stageFiles', () => {
   });
 });
 
+describe('runner Git', () => {
+  it('permite un timeout específico y termina una operación que queda esperando entrada', async () => {
+    await expect(runGit(['cat-file', '--batch'], { cwd: workspace.root, timeoutMs: 25 }))
+      .rejects.toMatchObject({ code: 'TIMEOUT' });
+  });
+});
+
 describe('commitStaged', () => {
+  it('crea el primer commit de un repositorio sin HEAD', async () => {
+    const empty = await createTempWorkspaceDir();
+    try {
+      await initGitRepo(empty.root);
+      await writeFile(path.join(empty.root, 'README.md'), '# primero\n');
+      const target = buildWorkspace({
+        rootPath: empty.root,
+        permissions: { read: true, write: true, overwrite: true, gitRead: true, validations: false, gitWrite: true },
+      });
+      await stageFiles(target, ['README.md']);
+
+      const snapshot = await getCommitSnapshot(target);
+      expect(snapshot.parentHash).toBeUndefined();
+      const result = await commitStaged(target, 'primer commit', snapshot);
+
+      const { execFile } = await import('node:child_process');
+      const { promisify } = await import('node:util');
+      const shown = await promisify(execFile)('git', ['log', '-1', '--format=%H %P %s'], { cwd: empty.root });
+      expect(shown.stdout.trim()).toBe(`${result.commitHash}  primer commit`);
+    } finally {
+      await empty.cleanup();
+    }
+  });
+
   it('rechaza un archivo denegado que otro programa haya dejado staged', async () => {
     const { execFile } = await import('node:child_process');
     const { promisify } = await import('node:util');

@@ -35,6 +35,8 @@ let humanControlAllowed = true;
 let dynamicListenerAllowed = true;
 let projectTerminalListenersAllowed = true;
 let handoffConfirmation: () => Promise<boolean> = async () => true;
+let savedBrowserEvidence = 0;
+let savedMotionBundles = 0;
 const pageSockets = new Set<Socket>();
 const applicationSockets = new Set<Socket>();
 const stage = (name: string): void => { process.stderr.write(`[browser-test] ${name}\n`); };
@@ -46,6 +48,11 @@ const pageServer = http.createServer((request, response) => {
     response.end("self.addEventListener('fetch',()=>{});");
     return;
   }
+  if (request.url?.startsWith('/qa-response') === true) {
+    response.setHeader('content-type', 'application/json; charset=utf-8');
+    response.end('{"ok":true}');
+    return;
+  }
   if (request.url?.startsWith('/redirect-alt') === true) {
     response.statusCode = 302;
     response.setHeader('location', `http://127.0.0.1:${alternatePort}/login`);
@@ -53,14 +60,25 @@ const pageServer = http.createServer((request, response) => {
     return;
   }
   response.setHeader('content-type', 'text/html; charset=utf-8');
-  response.end(`<!doctype html><html><head><title>Local test</title></head><body>
+  response.end(`<!doctype html><html><head><title>Local test</title><style>
+    @keyframes pulse-fixture { from { opacity:.35; transform:translateY(8px) } to { opacity:1; transform:translateY(0) } }
+    #motion-css{animation:pulse-fixture 800ms ease-in-out infinite alternate}.sticky-fixture{position:sticky;top:0;background:#fff}
+    #transition-fixture{opacity:.3;transition:opacity 2s ease}#transition-fixture.active{opacity:1}
+  </style></head><body>
     <h1>${request.url === '/next' ? 'Next page' : 'Development page'}</h1>
+    <div id="motion-css">CSS animation fixture</div><div class="sticky-fixture">Sticky fixture</div>
+    <div id="transition-fixture">Transition fixture</div><canvas id="motion-canvas" width="64" height="32"></canvas>
     <label>Query <input id="query" name="query"></label>
     <label>Password <input id="password" name="password" type="password"></label>
     <label for="fixture">Upload fixture</label><input id="fixture" name="fixture" type="file" multiple>
     <button id="open-fixture">Choose fixture indirectly</button><span id="upload-state">No fixture</span>
     <button id="action">Run action</button>
-    <script>document.querySelector('#action').onclick=()=>{document.querySelector('h1').textContent='Applied: '+document.querySelector('#query').value};document.querySelector('#fixture').addEventListener('change',(event)=>{document.querySelector('#upload-state').textContent=event.target.files.length+' fixture(s) selected'});document.querySelector('#open-fixture').onclick=()=>document.querySelector('#fixture').click();document.querySelector('#password').addEventListener('input',(event)=>{const value=event.target.value;document.title='leak:'+value;document.body.dataset.leak=value;console.log('HOSTILE_PASSWORD_ECHO',value)});console.log('LOCALBRIDGE_BROWSER_READY');fetch('http://127.0.0.1:${blockedPort}/blocked').catch(()=>{});const hmr=new WebSocket('ws://127.0.0.1:${pagePort}/hmr');hmr.addEventListener('open',()=>console.log('LOCALBRIDGE_HMR_SOCKET_OPEN'));new WebSocket('ws://127.0.0.1:${blockedPort}/blocked');</script>
+    <label>Theme <select id="theme"><option value="blue">Blue</option><option value="green">Green</option></select></label>
+    <button id="hover">Hover target</button><button id="async">Run async</button><button id="dialog">Open dialog</button>
+    <button id="disabled" disabled>Disabled action</button>
+    <button id="drag-source">Drag source</button><button id="drag-target">Drag target</button>
+    <output id="qa-state" aria-live="polite">QA idle</output><div style="height:1400px">Scrollable fixture</div>
+    <script>document.addEventListener('mousedown',(event)=>console.log('SYNTHETIC_MOUSE_DOWN',event.clientX,event.clientY,event.target.id),true);document.querySelector('#action').onclick=()=>{document.querySelector('h1').textContent='Applied: '+document.querySelector('#query').value};document.querySelector('#fixture').addEventListener('change',(event)=>{document.querySelector('#upload-state').textContent=event.target.files.length+' fixture(s) selected'});document.querySelector('#open-fixture').onclick=()=>document.querySelector('#fixture').click();document.querySelector('#password').addEventListener('input',(event)=>{const value=event.target.value;document.title='leak:'+value;document.body.dataset.leak=value;console.log('HOSTILE_PASSWORD_ECHO',value)});document.querySelector('#theme').onchange=(event)=>document.querySelector('#qa-state').textContent='Theme: '+event.target.value;document.querySelector('#hover').onmouseenter=()=>document.querySelector('#qa-state').textContent='Hovered';document.querySelector('#async').onclick=()=>setTimeout(async()=>{await fetch('/qa-response');document.querySelector('#qa-state').textContent='Async ready'},250);document.querySelector('#dialog').onclick=()=>confirm('Synthetic dialog');let dragging=false;document.querySelector('#drag-source').onmousedown=()=>{dragging=true};document.querySelector('#drag-target').onmouseup=()=>{if(dragging)document.querySelector('#qa-state').textContent='Dragged';dragging=false};document.querySelector('#transition-fixture').classList.add('active');document.querySelector('#motion-css').animate([{filter:'brightness(.7)'},{filter:'brightness(1)'}],{duration:900,iterations:Infinity,direction:'alternate'});const motionContext=document.querySelector('#motion-canvas').getContext('2d');motionContext.fillStyle='#0cf';motionContext.fillRect(0,0,64,32);setTimeout(()=>document.body.dataset.lazyReady='true',120);console.log('LOCALBRIDGE_BROWSER_READY');fetch('http://127.0.0.1:${blockedPort}/blocked').catch(()=>{});const hmr=new WebSocket('ws://127.0.0.1:${pagePort}/hmr');hmr.addEventListener('open',()=>console.log('LOCALBRIDGE_HMR_SOCKET_OPEN'));new WebSocket('ws://127.0.0.1:${blockedPort}/blocked');</script>
   </body></html>`);
 });
 pageServer.on('upgrade', (request, socket) => {
@@ -301,6 +319,39 @@ const controller = new BrowserController({
     throw new Error('project terminal listener mismatch');
   },
   confirmHumanControlHandoff: async () => handoffConfirmation(),
+  saveScreenshot: async ({ path: destinationPath, bytes }) => {
+    if (destinationPath !== 'evidence/local.png' || !Buffer.from(bytes).subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) {
+      throw new Error('invalid browser evidence fixture');
+    }
+    savedBrowserEvidence += 1;
+    const content = Buffer.from(bytes);
+    return { path: destinationPath, sha256: createHash('sha256').update(content).digest('hex'), size: content.length, created: true };
+  },
+  saveMotionBundle: async ({ path: destinationPath, produce }) => {
+    const files: Array<{ path: string; sha256: string; size: number }> = [];
+    let totalSize = 0;
+    const value = await produce({
+      get totalSize() { return totalSize; },
+      get fileCount() { return files.length; },
+      get maxFileBytes() { return 256 * 1024 * 1024; },
+      get maxTotalBytes() { return 1024 * 1024 * 1024; },
+      ensureCapacity: async (requiredBytes) => {
+        if (totalSize + requiredBytes > 1024 * 1024 * 1024) throw new LocalBridgeError('FILE_TOO_LARGE');
+      },
+      write: async (relativePath, input) => {
+        const bytes = Buffer.from(input);
+        if (bytes.length > 256 * 1024 * 1024 || totalSize + bytes.length > 1024 * 1024 * 1024) {
+          throw new LocalBridgeError('FILE_TOO_LARGE');
+        }
+        const receipt = { path: relativePath, sha256: createHash('sha256').update(bytes).digest('hex'), size: bytes.length };
+        files.push(receipt);
+        totalSize += bytes.length;
+        return receipt;
+      },
+    });
+    savedMotionBundles += 1;
+    return { path: destinationPath, created: true, totalSize, fileCount: files.length, files, value };
+  },
 });
 
 try {
@@ -309,6 +360,16 @@ try {
   stage('session-started');
   const repeated = await controller.start('ws_browser', 'app', 'browser_start_1');
   if (started.sessionId !== repeated.sessionId) throw new Error('browser start was not idempotent');
+  const viewport = await controller.setViewport('ws_browser', started.sessionId, 980, 680, false, 'viewport_replay');
+  const viewportReplay = await controller.setViewport('ws_browser', started.sessionId, 980, 680, false, 'viewport_replay');
+  if (JSON.stringify(viewportReplay) !== JSON.stringify(viewport)) throw new Error('viewport replay changed its result');
+  let viewportConflict = false;
+  try {
+    await controller.setViewport('ws_browser', started.sessionId, 900, 640, false, 'viewport_replay');
+  } catch (error) {
+    viewportConflict = error instanceof Error && 'code' in error && error.code === 'IDEMPOTENCY_CONFLICT';
+  }
+  if (!viewportConflict) throw new Error('viewport operationId accepted a different viewport');
   const snapshot = await controller.snapshot('ws_browser', started.sessionId, 12, 500);
   stage('snapshot');
   if (!snapshot.nodes.some((node) => node['role'] === 'button' && typeof node['elementRef'] === 'string')) {
@@ -343,11 +404,141 @@ try {
   await controller.click('ws_browser', started.sessionId, interactionSnapshot.snapshotId, currentButton, 'click_1');
   await controller.click('ws_browser', started.sessionId, interactionSnapshot.snapshotId, currentButton, 'click_1');
   const appliedSnapshot = await controller.snapshot('ws_browser', started.sessionId, 12, 500);
-  if (!appliedSnapshot.nodes.some((node) => node['name'] === 'Applied: hello')) throw new Error(`controlled interaction did not update DOM: ${JSON.stringify(appliedSnapshot.nodes)}`);
+  if (!appliedSnapshot.nodes.some((node) => node['name'] === 'Applied: hello')) {
+    const clickDiagnostic = await controller.events('ws_browser', started.sessionId, 0, 65_536);
+    throw new Error(`controlled interaction did not update DOM: ${JSON.stringify({ nodes: appliedSnapshot.nodes, events: clickDiagnostic.events })}`);
+  }
+  await controller.assert('ws_browser', started.sessionId, { kind: 'text', value: 'Applied: hello', state: 'present' });
+  const disabled = appliedSnapshot.nodes.find((node) => node['role'] === 'button' && node['name'] === 'Disabled action')?.['elementRef'];
+  const hover = appliedSnapshot.nodes.find((node) => node['role'] === 'button' && node['name'] === 'Hover target')?.['elementRef'];
+  if (typeof disabled !== 'string' || typeof hover !== 'string') throw new Error('QA button references missing');
+  let disabledRejected = false;
+  try {
+    await controller.click('ws_browser', started.sessionId, appliedSnapshot.snapshotId, disabled, 'disabled_click');
+  } catch (error) {
+    disabledRejected = error instanceof Error && 'code' in error && error.code === 'ELEMENT_NOT_INTERACTABLE';
+  }
+  if (!disabledRejected) throw new Error('disabled element accepted a click');
+  await controller.hover('ws_browser', started.sessionId, appliedSnapshot.snapshotId, hover, 'hover_qa');
+  await controller.wait('ws_browser', started.sessionId, { kind: 'text', value: 'Hovered', state: 'present' }, 2_000);
+  stage('hover-qa-passed');
+
+  const selectSnapshot = await controller.snapshot('ws_browser', started.sessionId, 12, 500);
+  const theme = selectSnapshot.nodes.find((node) => node['role'] === 'combobox' && node['name'] === 'Theme')?.['elementRef'];
+  if (typeof theme !== 'string') throw new Error(`select reference missing: ${JSON.stringify(selectSnapshot.nodes)}`);
+  await controller.select('ws_browser', started.sessionId, selectSnapshot.snapshotId, theme, 'green', 'select_qa');
+  await controller.assert('ws_browser', started.sessionId, { kind: 'text', value: 'Theme: green', state: 'present' });
+  stage('select-qa-passed');
+
+  const asyncSnapshot = await controller.snapshot('ws_browser', started.sessionId, 12, 500);
+  const asyncButton = asyncSnapshot.nodes.find((node) => node['role'] === 'button' && node['name'] === 'Run async')?.['elementRef'];
+  if (typeof asyncButton !== 'string') throw new Error('async button reference missing');
+  const beforeAsync = await controller.events('ws_browser', started.sessionId, 0, 65_536);
+  await controller.click('ws_browser', started.sessionId, asyncSnapshot.snapshotId, asyncButton, 'async_qa');
+  await controller.wait('ws_browser', started.sessionId, { kind: 'response', path: '/qa-response', status: 200, afterCursor: beforeAsync.nextCursor }, 2_000);
+  await controller.wait('ws_browser', started.sessionId, { kind: 'text', value: 'Async ready', state: 'present' }, 2_000);
+  await controller.assert('ws_browser', started.sessionId, { kind: 'no-console-errors', afterCursor: beforeAsync.nextCursor });
+  stage('async-qa-passed');
+
+  await controller.scroll('ws_browser', started.sessionId, 'down', 700, 'shared_qa_operation');
+  const scrollContents = webContents.getAllWebContents().find((candidate) => candidate.getURL().startsWith(`http://127.0.0.1:${pagePort}`));
+  if (scrollContents === undefined || await scrollContents.executeJavaScript('scrollY') as number <= 0) throw new Error('wheel scrolling did not move the page');
+  const collisionSnapshot = await controller.snapshot('ws_browser', started.sessionId, 12, 500);
+  const collisionHover = collisionSnapshot.nodes.find((node) => node['role'] === 'button' && node['name'] === 'Hover target')?.['elementRef'];
+  let interactionConflict = false;
+  try {
+    await controller.hover('ws_browser', started.sessionId, collisionSnapshot.snapshotId, String(collisionHover), 'shared_qa_operation');
+  } catch (error) {
+    interactionConflict = error instanceof Error && 'code' in error && error.code === 'IDEMPOTENCY_CONFLICT';
+  }
+  if (!interactionConflict) throw new Error('cross-action operationId collision was accepted');
+  await controller.scroll('ws_browser', started.sessionId, 'up', 700, 'scroll_reset');
+  stage('scroll-qa-passed');
+
+  const dragSnapshot = await controller.snapshot('ws_browser', started.sessionId, 12, 500);
+  const dragSource = dragSnapshot.nodes.find((node) => node['name'] === 'Drag source')?.['elementRef'];
+  const dragTarget = dragSnapshot.nodes.find((node) => node['name'] === 'Drag target')?.['elementRef'];
+  if (typeof dragSource !== 'string' || typeof dragTarget !== 'string') throw new Error('drag references missing');
+  await controller.drag('ws_browser', started.sessionId, dragSnapshot.snapshotId, dragSource, dragTarget, 'drag_qa');
+  await controller.assert('ws_browser', started.sessionId, { kind: 'text', value: 'Dragged', state: 'present' });
+  stage('drag-qa-passed');
+
+  const dialogSnapshot = await controller.snapshot('ws_browser', started.sessionId, 12, 500);
+  const dialogButton = dialogSnapshot.nodes.find((node) => node['name'] === 'Open dialog')?.['elementRef'];
+  if (typeof dialogButton !== 'string') throw new Error('dialog button reference missing');
+  await controller.click('ws_browser', started.sessionId, dialogSnapshot.snapshotId, dialogButton, 'dialog_open');
+  await controller.assert('ws_browser', started.sessionId, { kind: 'dialog', state: 'open' });
+  await controller.dialog('ws_browser', started.sessionId, 'dismiss', 'dialog_dismiss');
+  await controller.assert('ws_browser', started.sessionId, { kind: 'dialog', state: 'closed' });
+  stage('typed-qa-passed');
   const screenshot = await controller.screenshot('ws_browser', started.sessionId);
   stage('screenshot');
   if (Buffer.from(screenshot.dataBase64, 'base64').length < 1000) throw new Error('screenshot is unexpectedly empty');
-  await controller.navigate('ws_browser', started.sessionId, '/next');
+  const savedScreenshot = await controller.saveScreenshot('ws_browser', started.sessionId, 'evidence/local.png', 'save_local_1');
+  const savedScreenshotReplay = await controller.saveScreenshot('ws_browser', started.sessionId, 'evidence/local.png', 'save_local_1');
+  if (savedBrowserEvidence !== 1 || savedScreenshot.mimeType !== 'image/png' || savedScreenshot.width !== 980 || savedScreenshot.height !== 680 ||
+      JSON.stringify(savedScreenshotReplay) !== JSON.stringify(savedScreenshot)) {
+    throw new Error('browser.screenshot.save no guardó una sola captura PNG verificable');
+  }
+  const motionInspection = await controller.inspectMotion('ws_browser', started.sessionId, 100) as {
+    capabilities?: { screencast?: boolean }; viewport?: { width?: number; height?: number };
+    animations?: Array<{ source?: string }>; stickyCandidates?: unknown[];
+  };
+  if (motionInspection.viewport?.width !== 980 || motionInspection.viewport.height !== 680 || !motionInspection.capabilities?.screencast ||
+      !motionInspection.animations?.some((item) => item.source === 'document-getAnimations') || (motionInspection.stickyCandidates?.length ?? 0) === 0) {
+    throw new Error(`la inspección temporal no detectó el viewport o screencast de Electron: ${JSON.stringify(motionInspection)}`);
+  }
+  const motionCapture = await controller.captureMotion(
+    'ws_browser', started.sessionId, 'evidence/local-scroll.lbmotion',
+    { axis: 'y', startY: 0, distancePx: 500, durationMs: 500, sampleCount: 3 }, 0, 'auto', 'motion_local_1',
+  );
+  const motionReplay = await controller.captureMotion(
+    'ws_browser', started.sessionId, 'evidence/local-scroll.lbmotion',
+    { axis: 'y', startY: 0, distancePx: 500, durationMs: 500, sampleCount: 3 }, 0, 'auto', 'motion_local_1',
+  );
+  if (savedMotionBundles !== 1 || motionCapture.frameCount !== 3 || motionCapture.width !== 980 || motionCapture.height !== 680 ||
+      JSON.stringify(motionReplay) !== JSON.stringify(motionCapture)) {
+    throw new Error(`browser.motion.capture no produjo evidencia temporal idempotente: ${JSON.stringify(motionCapture)}`);
+  }
+  const cancelledMotion = controller.captureMotion(
+    'ws_browser', started.sessionId, 'evidence/cancelled-scroll.lbmotion',
+    { axis: 'y', startY: 0, distancePx: 400, durationMs: 2_000, sampleCount: 12 }, 0, 'stepped', 'motion_cancelled_1',
+  );
+  await new Promise((resolve) => setTimeout(resolve, 120));
+  controller.cancelMotionLocally(started.sessionId);
+  let cancellationClosed = false;
+  try { await cancelledMotion; } catch (error) {
+    cancellationClosed = error instanceof Error && 'code' in error && error.code === 'MOTION_EFFECT_UNCERTAIN';
+  }
+  if (!cancellationClosed || savedMotionBundles !== 1) throw new Error('cancelar una captura temporal no cerró ni limpió el staging');
+  await controller.setViewport('ws_browser', started.sessionId, 1920, 1080, false, 'viewport_large_capture');
+  const activeContents = webContents.getAllWebContents().find((candidate) => candidate.getURL().startsWith(`http://127.0.0.1:${pagePort}`));
+  if (activeContents === undefined) throw new Error('browser contents missing for large capture');
+  await activeContents.executeJavaScript(`(() => {
+    document.body.innerHTML = '<canvas id="noise" width="1920" height="1080" style="display:block;width:1920px;height:1080px"></canvas>';
+    const context = document.querySelector('#noise').getContext('2d');
+    const image = context.createImageData(1920, 1080); let state = 0x12345678;
+    for (let index = 0; index < image.data.length; index += 4) {
+      state = (Math.imul(state, 1664525) + 1013904223) >>> 0;
+      image.data[index] = state & 255; image.data[index + 1] = (state >>> 8) & 255; image.data[index + 2] = (state >>> 16) & 255; image.data[index + 3] = 255;
+    }
+    context.putImageData(image, 0, 0);
+  })()`, true);
+  const largeBrowserCapture = await controller.screenshot('ws_browser', started.sessionId);
+  if (largeBrowserCapture.mimeType !== 'image/jpeg' || !largeBrowserCapture.fallbackUsed || largeBrowserCapture.width !== 1920 || largeBrowserCapture.height !== 1080) {
+    throw new Error(`large browser capture did not use bounded JPEG fallback: ${largeBrowserCapture.mimeType} ${largeBrowserCapture.width}x${largeBrowserCapture.height}`);
+  }
+  await controller.setViewport('ws_browser', started.sessionId, 980, 680, false, 'viewport_after_large_capture');
+  const navigated = await controller.navigate('ws_browser', started.sessionId, '/next', 'navigate_replay');
+  const navigationReplay = await controller.navigate('ws_browser', started.sessionId, '/next', 'navigate_replay');
+  if (JSON.stringify(navigationReplay) !== JSON.stringify(navigated)) throw new Error('navigation replay changed its result');
+  let navigationConflict = false;
+  try {
+    await controller.navigate('ws_browser', started.sessionId, '/', 'navigate_replay');
+  } catch (error) {
+    navigationConflict = error instanceof Error && 'code' in error && error.code === 'IDEMPOTENCY_CONFLICT';
+  }
+  if (!navigationConflict) throw new Error('navigation operationId accepted another destination');
   stage('navigated');
   const nextSnapshot = await controller.snapshot('ws_browser', started.sessionId, 12, 500);
   if (!nextSnapshot.nodes.some((node) => node['name'] === 'Next page')) throw new Error('navigation did not update the page');
@@ -377,6 +568,8 @@ try {
   const originalWindowCount = BrowserWindow.getAllWindows().length;
   const visibilityBeforeLive = await liveProjectContents.executeJavaScript('document.visibilityState') as string;
   await liveProjectContents.executeJavaScript("window.__localBridgeLiveTicks=0;window.__localBridgeLiveTimer=setInterval(()=>{window.__localBridgeLiveTicks+=1},20)");
+  await liveProjectContents.executeJavaScript("document.getAnimations({subtree:true}).forEach((animation)=>animation.cancel())");
+  await controller.setViewport('ws_browser', started.sessionId, 1920, 1080, false, 'viewer_full_hd');
   const firstWorkArea = { x: 80, y: 70, width: 1920, height: 1040 };
   const secondWorkArea = { x: 2080, y: 120, width: 2560, height: 1400 };
   await controller.showLiveViewerLocally(started.sessionId, firstWorkArea);
@@ -387,6 +580,27 @@ try {
   const [liveX, liveY] = liveWindow.getPosition();
   if (liveX <= -9_000 || liveY <= -9_000) throw new Error('live view remained off-screen');
   if (controller.getLocalLiveViewerSessionId() !== started.sessionId) throw new Error('live view state was not exposed locally');
+  const fittedBounds = liveWindow.getBounds();
+  const fittedContent = liveProjectContents.getOwnerBrowserWindow() === liveWindow
+    ? (controller as unknown as { entries: Map<string, { content: WebContentsView }> }).entries.get(started.sessionId)?.content.getBounds()
+    : undefined;
+  const viewerScreenshot = await controller.screenshot('ws_browser', started.sessionId);
+  if (fittedBounds.width >= 1920 || fittedBounds.height !== firstWorkArea.height || fittedContent === undefined ||
+      Math.abs(fittedContent.width / fittedContent.height - 16 / 9) > 0.01 ||
+      viewerScreenshot.width !== 1920 || viewerScreenshot.height !== 1080) {
+    throw new Error(`el visor local no encajó 1920x1080 sin alterar la evidencia: ${JSON.stringify({ fittedBounds, fittedContent, screenshot: [viewerScreenshot.width, viewerScreenshot.height] })}`);
+  }
+  const fitHash = createHash('sha256').update(Buffer.from(viewerScreenshot.dataBase64, 'base64')).digest('hex');
+  await controller.setLiveViewerPresentationLocally(started.sessionId, 'actual', 500, 200);
+  const actualSummary = (await controller.list('ws_browser')).find((item) => item.sessionId === started.sessionId)?.viewerPresentation;
+  const actualScreenshot = await controller.screenshot('ws_browser', started.sessionId);
+  const actualHash = createHash('sha256').update(Buffer.from(actualScreenshot.dataBase64, 'base64')).digest('hex');
+  const actualContent = (controller as unknown as { entries: Map<string, { content: WebContentsView }> }).entries.get(started.sessionId)?.content.getBounds();
+  if (actualSummary?.mode !== 'actual' || actualSummary.scale !== 1 || actualSummary.panX <= 0 || actualSummary.panY <= 0 ||
+      actualContent === undefined || actualContent.x >= 0 || actualContent.y >= 0 || fitHash !== actualHash) {
+    throw new Error(`el modo 1:1 alteró el render, no aplicó pan local o cambió la captura: ${JSON.stringify({ actualSummary, actualContent, fitHash, actualHash })}`);
+  }
+  await controller.setLiveViewerPresentationLocally(started.sessionId, 'fit');
   if (BrowserWindow.getAllWindows().length !== originalWindowCount) throw new Error('live view created a duplicate BrowserWindow');
   const liveContents = webContents.getAllWebContents().filter((candidate) => candidate.getURL().startsWith(`http://127.0.0.1:${pagePort}`));
   if (liveContents.length !== 1 || liveContents[0]?.id !== originalContentsId) throw new Error('live view duplicated or replaced the controlled page');
@@ -403,7 +617,15 @@ try {
   await controller.moveLiveViewerLocally(started.sessionId, secondWorkArea);
   const afterMoveBounds = liveWindow.getBounds();
   if (afterMoveBounds.x === beforeMoveBounds.x && afterMoveBounds.y === beforeMoveBounds.y) throw new Error('live view did not move to another display area');
-  if (afterMoveBounds.width !== beforeMoveBounds.width || afterMoveBounds.height !== beforeMoveBounds.height) throw new Error('moving live view changed its viewport');
+  if (afterMoveBounds.x < secondWorkArea.x || afterMoveBounds.y < secondWorkArea.y ||
+      afterMoveBounds.x + afterMoveBounds.width > secondWorkArea.x + secondWorkArea.width ||
+      afterMoveBounds.y + afterMoveBounds.height > secondWorkArea.y + secondWorkArea.height) {
+    throw new Error('moving live view did not fit the destination work area');
+  }
+  const viewportAfterViewerMove = (await controller.list('ws_browser')).find((item) => item.sessionId === started.sessionId)?.viewport;
+  if (viewportAfterViewerMove?.width !== 1920 || viewportAfterViewerMove.height !== 1080 || viewportAfterViewerMove.mobile) {
+    throw new Error('moving or fitting the live viewer changed the logical viewport');
+  }
   if (liveProjectContents.id !== originalContentsId || liveProjectContents.getURL() !== urlBeforeMove) throw new Error('moving live view replaced or navigated the controlled page');
   if (liveWindow.isFocusable()) throw new Error('moving live view enabled focus');
   const movedSnapshot = await controller.snapshot('ws_browser', started.sessionId, 12, 500);
@@ -412,6 +634,7 @@ try {
   if (controller.getLocalLiveViewerSessionId() !== undefined) throw new Error('live view state survived explicit hide');
   const [hiddenX, hiddenY] = liveWindow.getPosition();
   if (hiddenX > -9_000 || hiddenY > -9_000) throw new Error('hidden live view remained on-screen');
+  await controller.setViewport('ws_browser', started.sessionId, 980, 680, false, 'viewer_restore_compact');
   await controller.showLiveViewerLocally(started.sessionId, firstWorkArea);
   stage('live-view-ready');
   const fileSnapshot = await controller.snapshot('ws_browser', started.sessionId, 12, 500);
@@ -471,6 +694,10 @@ try {
   await controller.completeHumanControlLocally(started.sessionId);
   const humanReady = await controller.humanControlStatus('ws_browser', started.sessionId);
   if (humanReady.state !== 'ready') throw new Error('human control was not handed back');
+  const restoredViewport = (await controller.list('ws_browser')).find((item) => item.sessionId === started.sessionId)?.viewport;
+  if (restoredViewport?.width !== 980 || restoredViewport.height !== 680 || restoredViewport.mobile) {
+    throw new Error('human handoff did not restore the viewport selected for agent QA');
+  }
   let preHandoffRefRejected = false;
   try {
     await controller.click('ws_browser', started.sessionId, fileSnapshot.snapshotId, indirectFileButton, 'stale_after_manual');
@@ -573,6 +800,22 @@ try {
   await pendingHandoff;
   handoffConfirmation = async () => true;
   stage('handoff-race-closed');
+  const failedDialog = await controller.start('ws_browser', 'app', 'browser_start_failed_dialog');
+  await controller.requestHumanControl('ws_browser', failedDialog.sessionId, 'manual_step', 'human_failed_dialog');
+  await controller.openHumanControlLocally(failedDialog.sessionId);
+  handoffConfirmation = async () => { throw new Error('fixture dialog failure'); };
+  let failedDialogClosed = false;
+  try {
+    await controller.completeHumanControlLocally(failedDialog.sessionId);
+  } catch (error) {
+    failedDialogClosed = error instanceof Error && 'code' in error && error.code === 'INTERNAL_ERROR';
+  } finally {
+    handoffConfirmation = async () => true;
+  }
+  if (!failedDialogClosed || (await controller.list('ws_browser')).find((entry) => entry.sessionId === failedDialog.sessionId)?.state !== 'stopped') {
+    throw new Error('un fallo del diálogo dejó control humano o la sesión activos');
+  }
+  stage('handoff-dialog-failure-closed');
   const multiservice = await controller.startApplication('ws_browser', 'multiservice', [
     { service: 'frontend', processId: 'process_cccccccccccccccccccccccc', listenerRef: 'listener_cccccccccccccccccccccccc' },
     { service: 'api', processId: 'process_dddddddddddddddddddddddd', listenerRef: 'listener_dddddddddddddddddddddddd' },
@@ -615,6 +858,9 @@ try {
       observedAt: new Date().toISOString(),
     },
   ], 'browser_project_multiservice_1');
+  if (projectBrowser.viewport.width !== 1920 || projectBrowser.viewport.height !== 1080 || projectBrowser.viewport.mobile) {
+    throw new Error('el navegador de proyecto no inició con la resolución de prueba 1920x1080');
+  }
   stage('project-multiservice-started');
   await waitForConsole(controller, 'ws_browser', projectBrowser.sessionId, 'MULTISERVICE_LOGIN_OK');
   await waitForConsole(controller, 'ws_browser', projectBrowser.sessionId, 'MULTISERVICE_HMR_OPEN');
@@ -642,6 +888,9 @@ try {
     exclusive: true,
     observedAt: new Date().toISOString(),
   }, 'browser_dynamic_1');
+  if (dynamic.viewport.width !== 1920 || dynamic.viewport.height !== 1080 || dynamic.viewport.mobile) {
+    throw new Error('el navegador de proceso no inició con la resolución de prueba 1920x1080');
+  }
   dynamicListenerAllowed = false;
   let dynamicRequestBlocked = false;
   try {
@@ -661,6 +910,13 @@ try {
   if (listedAfterRevocation.length !== 0) throw new Error('revocation should block listing');
   process.stdout.write(`${JSON.stringify({
     isolated: true,
+    defaultProjectViewport1920x1080: true,
+    customViewportSupported: viewport.width === 980 && viewport.height === 680 && !viewport.mobile,
+    losslessBrowserEvidenceSaved: true,
+    motionInspectAndCapture: true,
+    fullLogicalViewportFittedInViewer: true,
+    largeBrowserCaptureTransportFallback: true,
+    viewportRestoredAfterHuman: true,
     idempotent: true,
     accessibilityNodes: snapshot.nodes.length,
     screenshotBytes: Buffer.from(screenshot.dataBase64, 'base64').length,
@@ -670,6 +926,10 @@ try {
     externalWebSocketBlocked: true,
     navigation: true,
     controlledInteraction: true,
+    typedWaitsAndAssertions: true,
+    pointerHitTesting: true,
+    hoverScrollSelectDragDialog: true,
+    interactionIdempotencyConflict: true,
     staleSnapshotRejected: true,
     sensitiveInputRejected: true,
     directFileChooserBlocked: true,
@@ -688,7 +948,7 @@ try {
     liveViewerAgentControlPreserved: true,
     liveViewerExecutionPreserved: true,
     liveViewerHumanAutoHide: true,
-    liveViewerMovedWithoutResize: true,
+    liveViewerFitsWorkArea: true,
     liveViewerMovedWithoutNavigation: true,
     liveViewerMoveAgentControlPreserved: true,
     signInReasonSupported: true,
@@ -697,6 +957,7 @@ try {
     oneHumanSessionAtATime: true,
     humanCrossOriginRedirectBlocked: true,
     handoffRaceClosed: true,
+    failedHandoffDialogClosed: true,
     projectMultiserviceLocalhost: true,
     projectMultiserviceAuthorityRevoked: true,
     humanSecretsNotObserved: true,

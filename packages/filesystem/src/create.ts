@@ -7,6 +7,7 @@ import { isPathDenied, resolveWriteTarget, type AuthorizedWorkspace } from "@loc
 
 import { atomicWrite } from "./atomic-write.js";
 import { mutationLockKey, withMutationLock } from "./mutex.js";
+import { runAuthorizedEffect, type MutationOptions } from "./mutation-options.js";
 
 export interface FileCreateResult {
   path: string;
@@ -19,18 +20,16 @@ export async function createWorkspaceFile(
   workspace: AuthorizedWorkspace,
   relativePath: string,
   content: string,
+  options: MutationOptions = {},
 ): Promise<FileCreateResult> {
   const buffer = Buffer.from(content, "utf8");
   if (buffer.byteLength > workspace.limits.maxFileBytes) {
     throw new LocalBridgeError("FILE_TOO_LARGE");
   }
 
-  // Primera pasada fuera del mutex: valida la ruta y crea los directorios
-  // padre que falten. Aceptamos como compromiso menor que, si el resultado
-  // termina denegado por la denylist, pueda quedar un directorio vacío creado
-  // de más — no escribe contenido en ningún sitio, así que no es un problema
-  // de seguridad, solo una limpieza cosmética pendiente.
-  const target = await resolveWriteTarget(workspace.rootPath, relativePath, { createParentDirs: true });
+  // La primera pasada no crea directorios: también son efectos y deben quedar
+  // dentro de la sección crítica de autoridad.
+  const target = await resolveWriteTarget(workspace.rootPath, relativePath, { createParentDirs: false });
 
   if (isPathDenied(target.relativePath, workspace.denyPatterns)) {
     throw new LocalBridgeError("PATH_DENIED");
@@ -42,19 +41,16 @@ export async function createWorkspaceFile(
     // pasada y la adquisición del lock. No se crean directorios aquí: si algo
     // desapareció, es una condición de carrera genuina, no algo que arreglar
     // silenciosamente.
-    const revalidated = await resolveWriteTarget(workspace.rootPath, relativePath, { createParentDirs: false });
-
-    if (revalidated.exists) {
-      throw new LocalBridgeError("FILE_ALREADY_EXISTS");
-    }
-
-    await atomicWrite(revalidated.realParentDir, revalidated.basename, buffer);
-
-    return {
-      path: target.relativePath,
-      sha256: createHash("sha256").update(buffer).digest("hex"),
-      size: buffer.byteLength,
-      created: true as const,
-    };
+    return runAuthorizedEffect(options, async () => {
+      const revalidated = await resolveWriteTarget(workspace.rootPath, relativePath, { createParentDirs: true });
+      if (revalidated.exists) throw new LocalBridgeError("FILE_ALREADY_EXISTS");
+      await atomicWrite(revalidated.realParentDir, revalidated.basename, buffer);
+      return {
+        path: target.relativePath,
+        sha256: createHash("sha256").update(buffer).digest("hex"),
+        size: buffer.byteLength,
+        created: true as const,
+      };
+    });
   });
 }

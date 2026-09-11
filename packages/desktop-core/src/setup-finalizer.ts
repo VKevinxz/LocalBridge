@@ -147,7 +147,7 @@ export async function finalizeSetupPlan(options: FinalizeSetupOptions): Promise<
   });
   if (isSplit) nextWorkspaces.push(...updatedById.values());
   const nextRegistry: WorkspaceRegistry = {
-    schemaVersion: 4,
+    schemaVersion: 5,
     workspaces: nextWorkspaces,
     applications: application === undefined ? options.registry.applications : [...options.registry.applications, application],
   };

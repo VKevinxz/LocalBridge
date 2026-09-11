@@ -14,7 +14,7 @@ const inputSchema = z.object({
   relativePath: z.string().min(1).default('.'),
   maxDepth: z.number().int().positive().optional(),
   maxEntries: z.number().int().positive().optional(),
-});
+}).strict();
 
 const outputSchema = z.object({
   path: z.string(),

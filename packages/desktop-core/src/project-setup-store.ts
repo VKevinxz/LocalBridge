@@ -61,6 +61,14 @@ export async function listProjectSetupSessions(filePath: string): Promise<Projec
   return [...(await readStore(filePath)).sessions];
 }
 
+export async function removeProjectSetupSessions(filePath: string, projectId: string): Promise<number> {
+  const current = await readStore(filePath);
+  const sessions = current.sessions.filter((session) => session.projectId !== projectId);
+  const removed = current.sessions.length - sessions.length;
+  if (removed > 0) await writeStore(filePath, { schemaVersion: 1, sessions });
+  return removed;
+}
+
 export async function updateProjectSetupSession(filePath: string, session: ProjectSetupSession): Promise<ProjectSetupSession> {
   const validated = projectSetupSessionSchema.parse(session);
   const current = await readStore(filePath);

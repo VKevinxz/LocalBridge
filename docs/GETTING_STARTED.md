@@ -1,7 +1,8 @@
 # Instalar LocalBridge en cinco minutos
 
-LocalBridge `v1.1.0` se distribuye como preview para Windows x64. Usa únicamente archivos
-publicados en la sección oficial de Releases del repositorio.
+El árbol local de LocalBridge corresponde al candidato `v1.7.0` para Windows x64. La última
+preview publicada sigue siendo `v1.2.1.2`; usa únicamente artefactos de Releases o un
+`win-unpacked` generado y verificado desde este mismo árbol.
 
 ## 1. Descargar y verificar
 
@@ -11,7 +12,7 @@ publicados en la sección oficial de Releases del repositorio.
 3. Calcula el hash:
 
 ```powershell
-Get-FileHash -Algorithm SHA256 '.\LocalBridge MCP Setup 1.1.0.exe'
+Get-FileHash -Algorithm SHA256 '.\LocalBridge MCP Setup <versión>.exe'
 ```
 
 4. Comprueba que coincide exactamente con `SHA256SUMS.txt`.
@@ -50,7 +51,8 @@ Comprueba la conexión con una solicitud sencilla:
 
 > Valida la conexión de LocalBridge y enumera los proyectos disponibles sin modificar nada.
 
-La respuesta debe indicar `ready`, versión `1.1.0` y protocolo `2026-07-28`.
+La respuesta debe indicar `ready`, versión `1.7.0` para el candidato local y protocolo
+`2026-07-28`.
 
 ## 4. Primera prueba segura
 
@@ -62,7 +64,28 @@ Autoriza una carpeta de demostración y solicita:
 Después prueba una validación o servidor previamente aprobado. Revisa siempre el resumen
 antes de permitir un commit, push o Control total.
 
-## 5. Siguiente paso
+## 5. Activar el navegador de Internet
+
+1. Abre **Acceso a Internet** dentro de Configuración.
+2. Revisa el alcance y pulsa **Habilitar navegación por Internet**. La descarga de
+   documentos es opcional y no concede escritura en carpetas.
+3. Usa las opciones avanzadas solo si necesitas limitar un sitio o revisar perfiles.
+4. Inicia una conversación nueva o actualiza el conector para que el host descubra las 89
+   tools del candidato.
+5. Pide: «Investiga este tema en dos fuentes públicas, compáralas y cita los enlaces».
+6. Mientras la sesión siga activa, abre **Actividad**, elige una pantalla y pulsa
+   **Ver y seguir**. La ventana es de solo lectura; ciérrala u ocúltala sin detener la tarea.
+
+No hace falta autorizar una carpeta para investigar. Para guardar una descarga o informe,
+autoriza después una carpeta y habilita creación de archivos; el perfil web no concede
+escritura por sí solo.
+
+Puedes fijar una pestaña para mantenerla visible aunque ChatGPT trabaje en otra. Pulsa
+**Tomar control** para un login o cualquier paso manual: la vista pasiva se cierra antes de
+habilitar entrada. Al devolver una sesión pública, confirma el hostname exacto que ChatGPT
+podrá continuar durante un máximo de 15 minutos.
+
+## 6. Siguiente paso
 
 - Uso diario: [USER_GUIDE.md](USER_GUIDE.md).
 - Privacidad y revocación: [PRIVACY_AND_TRUST.md](PRIVACY_AND_TRUST.md).

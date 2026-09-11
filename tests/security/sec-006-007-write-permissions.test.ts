@@ -1,6 +1,7 @@
 import os from 'node:os';
 import path from 'node:path';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
+import { readFile } from 'node:fs/promises';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { TARGET_PROTOCOL_REVISION } from '@localbridge/shared';
@@ -101,5 +102,53 @@ describe('[SEC-007] file.write_guarded con overwrite=false', () => {
     });
     expect(write.isError).toBe(true);
     expect((write.parsed['error'] as { code: string }).code).toBe('CAPABILITY_DISABLED');
+  });
+
+  it('file.patch_guarded también exige overwrite=true', async () => {
+    const configPath = path.join(os.tmpdir(), `localbridge-sec007c-${randomUUID()}`, 'workspaces.json');
+    await writeRegistryFile(configPath, [
+      buildWorkspace({
+        id: workspaceId,
+        rootPath: workspace.root,
+        permissions: { read: true, write: true, overwrite: false, gitRead: false, validations: false, gitWrite: false },
+      }),
+    ]);
+    harness = await createHarness({ pinProtocol: TARGET_PROTOCOL_REVISION, workspaceConfigPath: configPath });
+    const read = await callToolJson(harness.client, 'file.read', { workspaceId, path: 'README.md' });
+
+    const patch = await callToolJson(harness.client, 'file.patch_guarded', {
+      workspaceId,
+      path: 'README.md',
+      expectedSha256: read.parsed['sha256'],
+      edits: [{ oldText: 'sample', newText: 'changed' }],
+    });
+
+    expect(patch.isError).toBe(true);
+    expect((patch.parsed['error'] as { code: string }).code).toBe('CAPABILITY_DISABLED');
+    expect((await callToolJson(harness.client, 'file.read', { workspaceId, path: 'README.md' })).parsed['content']).toBe('# sample\n');
+  });
+
+  it('file.patch_guarded exige read=true además de overwrite=true', async () => {
+    const configPath = path.join(os.tmpdir(), `localbridge-sec007d-${randomUUID()}`, 'workspaces.json');
+    await writeRegistryFile(configPath, [
+      buildWorkspace({
+        id: workspaceId,
+        rootPath: workspace.root,
+        permissions: { read: false, write: false, overwrite: true, gitRead: false, validations: false, gitWrite: false },
+      }),
+    ]);
+    harness = await createHarness({ pinProtocol: TARGET_PROTOCOL_REVISION, workspaceConfigPath: configPath });
+    const original = await readFile(path.join(workspace.root, 'README.md'));
+
+    const patch = await callToolJson(harness.client, 'file.patch_guarded', {
+      workspaceId,
+      path: 'README.md',
+      expectedSha256: createHash('sha256').update(original).digest('hex'),
+      edits: [{ oldText: 'sample', newText: 'changed' }],
+    });
+
+    expect(patch.isError).toBe(true);
+    expect((patch.parsed['error'] as { code: string }).code).toBe('CAPABILITY_DISABLED');
+    expect(await readFile(path.join(workspace.root, 'README.md'), 'utf8')).toBe('# sample\n');
   });
 });

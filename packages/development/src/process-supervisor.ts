@@ -1,4 +1,4 @@
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { stat } from 'node:fs/promises';
 import type { Readable } from 'node:stream';
@@ -77,6 +77,7 @@ interface MutableProcess {
   readonly processId: string;
   readonly workspaceId: string;
   readonly profile: string;
+  readonly profileFingerprint: string;
   readonly child: ChildProcessWithoutNullStreams;
   readonly startedAtMs: number;
   readonly deadlineMs: number;
@@ -132,7 +133,8 @@ function listenerSummary(listener: MutableProcessListener): ProcessListenerSumma
 
 export class ProcessSupervisor {
   private readonly entries = new Map<string, MutableProcess>();
-  private readonly operations = new Map<string, string>();
+  private readonly operations = new Map<string, { processId: string; profile: string }>();
+  private readonly startTails = new Map<string, Promise<void>>();
   private readonly platform: NodeJS.Platform;
   private readonly now: () => number;
   private readonly reconciliationTimer: NodeJS.Timeout;
@@ -150,6 +152,21 @@ export class ProcessSupervisor {
     if (!workspace.enabled) brokerError('WORKSPACE_DISABLED', 'El workspace está deshabilitado.');
     if (workspace.permissions.processes !== true) brokerError('CAPABILITY_DISABLED', 'El permiso de procesos está deshabilitado.');
     return workspace;
+  }
+
+  private async withStartLock<T>(key: string, action: () => Promise<T>): Promise<T> {
+    const previous = this.startTails.get(key) ?? Promise.resolve();
+    let release: (() => void) | undefined;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const tail = previous.then(() => gate);
+    this.startTails.set(key, tail);
+    await previous;
+    try {
+      return await action();
+    } finally {
+      release?.();
+      if (this.startTails.get(key) === tail) this.startTails.delete(key);
+    }
   }
 
   private addLog(entry: MutableProcess, stream: 'stdout' | 'stderr', chunk: Buffer): void {
@@ -234,18 +251,30 @@ export class ProcessSupervisor {
 
   async start(workspaceId: string, profileName: string, operationId?: string): Promise<ProcessSummary> {
     const operationKey = operationId === undefined ? undefined : `${workspaceId}:${operationId}`;
-    const previousId = operationKey === undefined ? undefined : this.operations.get(operationKey);
-    if (previousId !== undefined) {
-      const previous = this.entries.get(previousId);
-      if (previous !== undefined) return summary(previous);
-    }
-
     const workspace = await this.requireWorkspace(workspaceId);
     const verification = await verifyProcessProfile(workspace, profileName);
     if (!verification.ok || verification.profile === undefined) {
       brokerError(verification.code, 'El perfil no está disponible o su definición cambió.');
     }
     const profile = verification.profile;
+    const profileFingerprint = createHash('sha256').update(JSON.stringify(profile)).digest('hex');
+    return this.withStartLock(`${workspaceId}:${profileName}`, async () => {
+    const previousRecord = operationKey === undefined ? undefined : this.operations.get(operationKey);
+    if (previousRecord !== undefined) {
+      if (previousRecord.profile !== profileName) brokerError('IDEMPOTENCY_CONFLICT', 'El operationId ya fue usado con otro perfil.');
+      const previous = this.entries.get(previousRecord.processId);
+      if (previous !== undefined && previous.workspaceId === workspaceId) return summary(previous);
+    }
+    // ApplicationSupervisor owns and stops the processes it launches, so it
+    // must not adopt a standalone process implicitly. Direct process.start
+    // calls can safely rediscover the same managed profile across chats.
+    const compatible = operationId?.startsWith('application:') === true ? undefined : [...this.entries.values()].find((entry) =>
+      entry.workspaceId === workspaceId && entry.profile === profileName && entry.state === 'running' &&
+      entry.profileFingerprint === profileFingerprint);
+    if (compatible !== undefined) {
+      if (operationKey !== undefined) this.operations.set(operationKey, { processId: compatible.processId, profile: profileName });
+      return summary(compatible);
+    }
     const running = [...this.entries.values()].filter((entry) => entry.state === 'running');
     if (running.length >= MAX_RUNNING_GLOBAL || running.filter((entry) => entry.workspaceId === workspaceId).length >= MAX_RUNNING_PER_WORKSPACE) {
       brokerError('RATE_LIMITED', 'Se alcanzó el límite de procesos activos.');
@@ -292,6 +321,7 @@ export class ProcessSupervisor {
       processId,
       workspaceId,
       profile: profileName,
+      profileFingerprint,
       child,
       startedAtMs,
       deadlineMs,
@@ -306,7 +336,7 @@ export class ProcessSupervisor {
       listeners: new Map(),
     };
     this.entries.set(processId, entry);
-    if (operationKey !== undefined) this.operations.set(operationKey, processId);
+    if (operationKey !== undefined) this.operations.set(operationKey, { processId, profile: profileName });
 
     child.stdout.on('data', (chunk: Buffer) => this.addLog(entry, 'stdout', chunk));
     child.stderr.on('data', (chunk: Buffer) => this.addLog(entry, 'stderr', chunk));
@@ -327,6 +357,7 @@ export class ProcessSupervisor {
       entry.resolveClose();
     });
     return summary(entry);
+    });
   }
 
   async list(workspaceId: string): Promise<readonly ProcessSummary[]> {
@@ -438,7 +469,10 @@ export class ProcessSupervisor {
         return;
       }
       const verification = await verifyProcessProfile(workspace, entry.profile).catch(() => ({ ok: false as const }));
-      if (!verification.ok) await this.terminate(entry, 'stopped');
+      if (!verification.ok || verification.profile === undefined ||
+          createHash('sha256').update(JSON.stringify(verification.profile)).digest('hex') !== entry.profileFingerprint) {
+        await this.terminate(entry, 'stopped');
+      }
     }));
   }
 

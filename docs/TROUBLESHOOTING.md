@@ -20,6 +20,18 @@ un artefacto de distribución.
 
 LocalBridge no requiere desactivar antivirus, firewall o controles corporativos.
 
+## Windows solicita permitir LocalBridge en redes privadas o públicas
+
+La navegación web aislada usa un proxy temporal que escucha únicamente en
+`127.0.0.1`. No necesita aceptar conexiones entrantes desde la LAN ni desde una red
+pública. Puedes denegar la solicitud del Firewall de Windows y seguir usando la salida
+HTTPS de LocalBridge. No desactives el firewall ni crees una regla entrante amplia para
+resolver problemas de navegación.
+
+Si ya concediste acceso, eso no demuestra por sí solo que LocalBridge esté expuesto: revisa
+que sus listeners estén vinculados a `127.0.0.1`. La aplicación no modifica ni elimina
+reglas del firewall automáticamente.
+
 ## Solo aparecen algunos proyectos o servicios
 
 El asistente de aplicaciones muestra únicamente servicios con perfil aprobado. Revisa la
@@ -52,6 +64,26 @@ añadas orígenes de Internet ni desactives la política del navegador para corr
 El visor ligero usa capturas periódicas y no pretende reproducir video a FPS completo. Usa
 la vista en vivo para observar animaciones fluidas. La vista en vivo es solo lectura bajo
 control del agente y se oculta antes de entregar control humano.
+
+## El visor 1920×1080 se ve recortado o más pequeño
+
+Revisa las métricas de la sesión en **Actividad**. **Render** es el viewport que usa
+ChatGPT y **visible** es el área física disponible. En **Encajar**, ambos pueden tener
+dimensiones distintas y una escala menor de 100 %, pero deben verse los cuatro bordes sin
+deformación. En **1:1** la escala es 100 % y el recorte es intencional; usa las flechas para
+desplazar la vista local. Ese pan no desplaza la página ni cambia screenshots.
+
+Si Encajar corta un borde, copia el diagnóstico indicando monitor, escala DPI, Render,
+visible y porcentaje. Cambiar la resolución con los presets modifica el viewport de prueba;
+no lo uses para corregir un problema de presentación.
+
+## Una captura de movimiento se detuvo
+
+Navegar, cerrar, revocar acceso, pulsar **Tomar control** o **Cancelar captura** invalida la
+traza. Si ya había comenzado el scroll, LocalBridge informa efecto incierto y no repite el
+mismo `operationId`. Inspecciona la pestaña, decide si debes recargar o volver al inicio y
+crea una operación nueva. Un destino `.lbmotion` parcial no debe quedar publicado; el
+staging se limpia durante el fallo y también al reiniciar tras un cierre abrupto.
 
 ## Necesito login o seleccionar un archivo
 

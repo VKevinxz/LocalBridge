@@ -105,7 +105,11 @@ describe('SEC-032 — publicación fail-closed', () => {
       .update(fixture)
       .digest('hex');
 
-    expect(script).toContain(`'tests/helpers/fixtures.ts' = '${blob}'`);
+    const allowlist = script.match(/'tests\/helpers\/fixtures\.ts'\s*=\s*@\(([\s\S]*?)\r?\n\s*\)/)?.[1] ?? '';
+    expect(allowlist).toContain(`'${blob}'`);
+    const allowedBlobs = [...allowlist.matchAll(/'([^']+)'/g)].map((match) => match[1] ?? '');
+    expect(allowedBlobs.length).toBeGreaterThan(0);
+    expect(allowedBlobs.every((value) => /^[a-f0-9]{40}$/.test(value))).toBe(true);
   });
 
   it('actionlint se descarga de una versión y hash cerrados', async () => {

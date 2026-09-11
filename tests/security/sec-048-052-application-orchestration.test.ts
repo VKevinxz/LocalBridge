@@ -55,11 +55,11 @@ describe('SEC-050 — migración nunca amplía permisos ni fusiona conflictos', 
 
 describe('SEC-051 — portabilidad v4 vuelve a default-deny', () => {
   it('apaga runtime, interacción, autenticación y wildcard y exige revisión', () => {
-    const registry: WorkspaceRegistry = { schemaVersion: 4, workspaces: [workspace], applications: [{ ...application, services: [{ ...application.services[0]!, allowManagedWildcard: true }] }] };
+    const registry: WorkspaceRegistry = { schemaVersion: 5, workspaces: [workspace], applications: [{ ...application, services: [{ ...application.services[0]!, allowManagedWildcard: true }] }] };
     const portable = buildPortableConfig(DEFAULT_DESKTOP_SETTINGS, registry);
     const ref = portable.workspaces[0]?.ref;
     if (ref === undefined) throw new Error('ref ausente');
-    const imported = applyPortableConfig(portable, { [ref]: 'C:\\mapped' }, DEFAULT_DESKTOP_SETTINGS, { schemaVersion: 4, workspaces: [], applications: [] });
+    const imported = applyPortableConfig(portable, { [ref]: 'C:\\mapped' }, DEFAULT_DESKTOP_SETTINGS, { schemaVersion: 5, workspaces: [], applications: [] });
     expect(imported.workspaces[0]?.permissions).toMatchObject({ processes: false, browserRead: false, browserInteract: false, browserHumanControl: false });
     expect(imported.applications[0]).toMatchObject({ reviewState: 'needs-review' });
     expect(imported.applications[0]?.services[0]?.allowManagedWildcard).toBe(false);
@@ -68,9 +68,9 @@ describe('SEC-051 — portabilidad v4 vuelve a default-deny', () => {
 
 describe('SEC-052 — entidades incompletas no son persistibles', () => {
   it('rechaza principal ausente, órdenes discontinuos y nombres globales equivalentes', () => {
-    expect(registryFileSchema.safeParse({ schemaVersion: 4, workspaces: [workspace], applications: [{ ...application, primaryServiceId: opaque('service', 'f') }] }).success).toBe(false);
-    expect(registryFileSchema.safeParse({ schemaVersion: 4, workspaces: [workspace], applications: [{ ...application, services: [{ ...application.services[0]!, startupOrder: 1 }] }] }).success).toBe(false);
-    expect(registryFileSchema.safeParse({ schemaVersion: 4, workspaces: [workspace], applications: [application, { ...application, id: opaque('app', 'b'), name: 'local' }] }).success).toBe(false);
+    expect(registryFileSchema.safeParse({ schemaVersion: 5, workspaces: [workspace], applications: [{ ...application, primaryServiceId: opaque('service', 'f') }] }).success).toBe(false);
+    expect(registryFileSchema.safeParse({ schemaVersion: 5, workspaces: [workspace], applications: [{ ...application, services: [{ ...application.services[0]!, startupOrder: 1 }] }] }).success).toBe(false);
+    expect(registryFileSchema.safeParse({ schemaVersion: 5, workspaces: [workspace], applications: [application, { ...application, id: opaque('app', 'b'), name: 'local' }] }).success).toBe(false);
   });
 });
 

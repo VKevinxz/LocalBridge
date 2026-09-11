@@ -22,6 +22,11 @@ const projectSchema = z.object({
    */
   state: z.enum(["ready", "review", "unavailable", "conflict"]).default("ready"),
   scanCoverage: z.enum(["complete", "partial", "unknown"]).default("unknown"),
+  execution: z.object({
+    trustMode: z.enum(["guided", "project-agent", "full-host"]),
+    terminalAvailable: z.boolean(),
+    blockedReason: z.enum(["trust-inactive", "device-mismatch", "guided-mode", "sandbox-unavailable", "project-not-ready"]).optional(),
+  }).strict(),
 }).strict();
 const planSummarySchema = z.object({
   planSha256: z.string().regex(/^[a-f0-9]{64}$/),
@@ -71,7 +76,7 @@ export function registerProjectListTool(server: McpServer, ctx: ToolContext): vo
   const outputSchema = z.object({ projects: z.array(projectSchema).max(500) }).strict();
   server.registerTool("project.list", {
     title: "List assisted local projects",
-    description: "Lists user-created project groupings, their readiness and the coverage of the last local structure scan. A partial coverage means the reported structure is incomplete, not that the project is unavailable. It returns opaque references only and never returns roots, commands, manifests, dependencies, logs, environment values or permissions.",
+    description: "Lists user-created project groupings, their readiness, scan coverage and effective terminal availability. A blockedReason explains why execution is closed without granting it. It returns opaque references only and never returns roots, commands, manifests, dependencies, logs or environment values.",
     inputSchema: z.object({}).strict(),
     outputSchema,
     annotations: { readOnlyHint: true, idempotentHint: true, destructiveHint: false, openWorldHint: false },

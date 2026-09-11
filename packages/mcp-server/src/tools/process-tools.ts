@@ -55,8 +55,8 @@ function audit(ctx: ToolContext, tool: string, riskLevel: string, workspaceId: s
 export function registerProcessStartTool(server: McpServer, ctx: ToolContext): void {
   server.registerTool('process.start', {
     title: 'Start an approved development process',
-    description: 'Starts one process profile previously reviewed in LocalBridge. The model supplies only the workspace and profile name; it cannot supply a command, arguments, environment or working directory. Requires the processes capability.',
-    inputSchema: z.object({ ...workspaceInput, profile: z.string().min(1).max(64), operationId: operationIdSchema }),
+    description: 'Starts one process profile previously reviewed in LocalBridge, or returns the already-running compatible instance for that workspace and profile. Call process.list first after reconnecting. The model supplies no command, arguments, environment or working directory. Requires the processes capability.',
+    inputSchema: z.object({ ...workspaceInput, profile: z.string().min(1).max(64), operationId: operationIdSchema }).strict(),
     outputSchema: processSummarySchema,
     annotations: { readOnlyHint: false, idempotentHint: true, destructiveHint: false, openWorldHint: false },
   }, async ({ workspaceId, profile, operationId }) => {
@@ -76,7 +76,7 @@ export function registerProcessListTool(server: McpServer, ctx: ToolContext): vo
   server.registerTool('process.list', {
     title: 'List development processes',
     description: 'Lists LocalBridge-managed processes for one authorized workspace without exposing operating-system PIDs or commands. Requires the processes capability.',
-    inputSchema: z.object(workspaceInput),
+    inputSchema: z.object(workspaceInput).strict(),
     outputSchema,
     annotations: { readOnlyHint: true, idempotentHint: true, destructiveHint: false, openWorldHint: false },
   }, async ({ workspaceId }) => {
@@ -96,7 +96,7 @@ export function registerProcessListenersTool(server: McpServer, ctx: ToolContext
   server.registerTool('process.listeners', {
     title: 'List verified loopback listeners',
     description: 'Lists TCP listeners that Windows proves belong to one LocalBridge-managed process tree. Exact loopback listeners are directly adoptable; managed wildcard listeners are reported with an explicit warning and can only be used by a locally reviewed multiservice application. Stdout URLs and ports owned by other processes never create authority. Requires the processes capability.',
-    inputSchema: z.object({ ...workspaceInput, processId: processIdSchema }),
+    inputSchema: z.object({ ...workspaceInput, processId: processIdSchema }).strict(),
     outputSchema,
     annotations: { readOnlyHint: true, idempotentHint: true, destructiveHint: false, openWorldHint: false },
   }, async ({ workspaceId, processId }) => {
@@ -121,7 +121,7 @@ export function registerProcessLogsTool(server: McpServer, ctx: ToolContext): vo
   server.registerTool('process.logs', {
     title: 'Read bounded process logs',
     description: 'Reads a bounded cursor-based window of stdout/stderr from a LocalBridge-managed process. Requires the processes capability.',
-    inputSchema: z.object({ ...workspaceInput, processId: processIdSchema, cursor: z.number().int().nonnegative().default(0), maxBytes: z.number().int().min(1).max(65_536).default(65_536) }),
+    inputSchema: z.object({ ...workspaceInput, processId: processIdSchema, cursor: z.number().int().nonnegative().default(0), maxBytes: z.number().int().min(1).max(65_536).default(65_536) }).strict(),
     outputSchema,
     annotations: { readOnlyHint: true, idempotentHint: true, destructiveHint: false, openWorldHint: false },
   }, async ({ workspaceId, processId, cursor, maxBytes }) => {
@@ -140,7 +140,7 @@ export function registerProcessStopTool(server: McpServer, ctx: ToolContext): vo
   server.registerTool('process.stop', {
     title: 'Stop a managed development process',
     description: 'Stops one LocalBridge-managed process and its complete child tree. It cannot target arbitrary operating-system processes. Requires the processes capability.',
-    inputSchema: z.object({ ...workspaceInput, processId: processIdSchema, operationId: operationIdSchema }),
+    inputSchema: z.object({ ...workspaceInput, processId: processIdSchema, operationId: operationIdSchema }).strict(),
     outputSchema: processSummarySchema,
     annotations: { readOnlyHint: false, idempotentHint: true, destructiveHint: false, openWorldHint: false },
   }, async ({ workspaceId, processId, operationId }) => {

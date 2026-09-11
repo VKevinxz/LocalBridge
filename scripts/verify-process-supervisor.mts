@@ -127,7 +127,11 @@ const supervisor = new ProcessSupervisor({
 });
 
 try {
-  const started = await supervisor.start('ws_supervisor', 'dev', 'operation_start_1');
+  const [started, reusedAcrossChat] = await Promise.all([
+    supervisor.start('ws_supervisor', 'dev', 'operation_start_1'),
+    supervisor.start('ws_supervisor', 'dev', 'operation_start_other_chat'),
+  ]);
+  if (started.processId !== reusedAcrossChat.processId) throw new Error('compatible concurrent starts created duplicate managed processes');
   const repeated = await supervisor.start('ws_supervisor', 'dev', 'operation_start_1');
   if (started.processId !== repeated.processId) throw new Error('start operation was not idempotent');
   await waitFor(true);
@@ -164,7 +168,7 @@ try {
     revoked = error instanceof Error && 'code' in error && error.code === 'CAPABILITY_DISABLED';
   }
   if (!revoked) throw new Error('permission revocation did not take effect');
-  process.stdout.write(`${JSON.stringify({ processId: started.processId, restartedProcessId: restarted.processId, idempotent: true, logs: true, treeStopped: true, verifiedLoopbackListener: true, verifiedManagedWildcard: true, foreignListenerRejected: true, forgedStdoutRejected: true, controlPipeNotInherited: true, staleListenerRejected: true, revocationImmediate: true })}\n`);
+  process.stdout.write(`${JSON.stringify({ processId: started.processId, restartedProcessId: restarted.processId, idempotent: true, reusedAcrossChat: true, concurrentStartSerialized: true, logs: true, treeStopped: true, verifiedLoopbackListener: true, verifiedManagedWildcard: true, foreignListenerRejected: true, forgedStdoutRejected: true, controlPipeNotInherited: true, staleListenerRejected: true, revocationImmediate: true })}\n`);
 } finally {
   processesAllowed = true;
   await supervisor.close();

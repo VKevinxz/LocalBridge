@@ -57,6 +57,8 @@ export interface TunnelConnectOptions {
   /** Credenciales efímeras del broker privado; nunca se persisten ni registran. */
   readonly developmentBrokerEndpoint?: string;
   readonly developmentBrokerToken?: string;
+  /** Worker PDF empaquetado; solo el proceso local decide esta ruta. */
+  readonly documentWorkerPath?: string;
 }
 
 export interface TunnelSupervisorCallbacks {
@@ -110,6 +112,12 @@ export class TunnelSupervisor {
     return this.status;
   }
 
+  getEffectiveGitApprovalMode(): GitApprovalMode | undefined {
+    return this.status === "connecting" || this.status === "connected"
+      ? this.lastConnectOptions?.gitApprovalMode
+      : undefined;
+  }
+
   connect(options: TunnelConnectOptions): void {
     if (this.status === "connecting" || this.status === "connected") {
       throw new Error(`ya hay una conexión en curso (estado: ${this.status})`);
@@ -156,6 +164,9 @@ export class TunnelSupervisor {
           {
             CONTROL_PLANE_API_KEY: options.apiKey,
             LOCALBRIDGE_GIT_APPROVAL_MODE: options.gitApprovalMode,
+            ...(options.documentWorkerPath === undefined
+              ? {}
+              : { LOCALBRIDGE_DOCUMENT_WORKER_PATH: options.documentWorkerPath }),
             ...(options.developmentBrokerEndpoint === undefined || options.developmentBrokerToken === undefined
               ? {}
               : {

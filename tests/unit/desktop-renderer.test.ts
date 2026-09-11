@@ -6,7 +6,7 @@ import path from 'node:path';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { DesktopApi, OnboardingViewSnapshot } from '../../apps/desktop/src/preload/index.js';
-import type { DesktopSettings, TunnelStatus } from '@localbridge/desktop-core';
+import type { DesktopSettings, TunnelStatus, WebProfile } from '@localbridge/desktop-core';
 import type { AuthorizedWorkspace, DevelopmentProject, LocalApplication, ProjectSetupSession } from '@localbridge/workspace';
 
 declare global {
@@ -37,9 +37,33 @@ function workspace(overrides: Partial<AuthorizedWorkspace> = {}): AuthorizedWork
     enabled: true,
     createdAt: '2026-08-20T00:00:00.000Z',
     permissions: PERMISSIONS,
-    limits: { maxFileBytes: 1_048_576, maxTreeEntries: 300, maxTreeDepth: 3 },
+    limits: { maxFileBytes: 1_048_576, maxTreeEntries: 300, maxTreeDepth: 3, largeArtifacts: { mode: 'standard', reserve: { minimumFreeBytes: 1024 * 1024 * 1024, minimumFreePercent: 10 }, maxConcurrentJobs: 1 } },
     denyPatterns: ['.env'],
     validationProfiles: {},
+    ...overrides,
+  };
+}
+
+function webProfile(overrides: Partial<WebProfile> = {}): WebProfile {
+  return {
+    id: `webprofile_${'a'.repeat(24)}`,
+    name: 'Investigación pública',
+    kind: 'public-research',
+    enabled: false,
+    reviewRequired: false,
+    destinations: [],
+    supportHosts: [],
+    permissions: { read: true, interact: true, download: false, humanControl: false },
+    limits: {
+      maxSessions: 2,
+      maxTabsPerSession: 8,
+      maxExtractedChars: 50_000,
+      maxDownloadBytes: 25 * 1024 * 1024,
+      maxTotalDownloadBytes: 1024 * 1024 * 1024,
+      transferPolicy: { mode: 'fixed' },
+    },
+    createdAt: '2026-09-05T00:00:00.000Z',
+    updatedAt: '2026-09-05T00:00:00.000Z',
     ...overrides,
   };
 }
@@ -49,6 +73,7 @@ function onboardingSettings(step: number) {
     onboardingStep: step,
     onboardingCompleted: false,
     minimizeToTray: true,
+    largeArtifactPreference: { mode: 'standard' as const, reserve: { minimumFreeBytes: 1024 * 1024 * 1024, minimumFreePercent: 10 }, maxConcurrentJobs: 1 as const },
     gitApprovalMode: 'mrtr' as const,
     activeConnectionProfileId: 'profile_default0',
     connectionProfiles: [{ id: 'profile_default0', name: 'Personal', tunnelId: '' }],
@@ -65,6 +90,7 @@ function makeApiSettings(): DesktopSettings {
     onboardingStep: 0,
     onboardingCompleted: true,
     minimizeToTray: true,
+    largeArtifactPreference: { mode: 'standard', reserve: { minimumFreeBytes: 1024 * 1024 * 1024, minimumFreePercent: 10 }, maxConcurrentJobs: 1 },
     gitApprovalMode: 'mrtr',
     activeConnectionProfileId: 'profile_default0',
     connectionProfiles: [{ id: 'profile_default0', name: 'Personal', tunnelId: '' }],
@@ -122,6 +148,13 @@ function onboardingAt(
 
 function makeApi(overrides: Partial<DesktopApi> = {}): DesktopApi {
   return {
+    cancelAnalysisJob: vi.fn(async () => undefined),
+    setBrowserViewport: vi.fn(async () => undefined),
+    setWebViewport: vi.fn(async () => undefined),
+    setBrowserLiveViewerPresentation: vi.fn(async () => undefined),
+    cancelBrowserMotion: vi.fn(async () => undefined),
+    setWebLiveViewerPresentation: vi.fn(async () => undefined),
+    cancelWebMotion: vi.fn(async () => undefined),
     getOnboardingSnapshot: vi.fn(async () => completedOnboarding()),
     restartOnboarding: vi.fn(async () => completedOnboarding()),
     nextOnboarding: vi.fn(async () => { throw new Error('not configured'); }),
@@ -143,7 +176,14 @@ function makeApi(overrides: Partial<DesktopApi> = {}): DesktopApi {
     setAssistedProjectPolicy: vi.fn(async () => { throw new Error('not configured'); }),
     approveAssistedProject: vi.fn(async () => { throw new Error('not configured'); }),
     cancelAssistedProject: vi.fn(async () => undefined),
-    removeDevelopmentProject: vi.fn(async () => undefined),
+    removeDevelopmentProject: vi.fn(async () => ({
+      removed: true,
+      workspacesRemoved: 0,
+      applicationsRemoved: 0,
+      sharedWorkspacesKept: 0,
+      sharedApplicationsKept: 0,
+      filesDeleted: false as const,
+    })),
     onAssistedProjectsChange: vi.fn(() => () => undefined),
     listWorkspaces: vi.fn(async () => []),
     pickFolder: vi.fn(async () => ROOT_PATH),
@@ -173,6 +213,24 @@ function makeApi(overrides: Partial<DesktopApi> = {}): DesktopApi {
     moveBrowserLiveViewer: vi.fn(async () => undefined),
     hideBrowserLiveViewer: vi.fn(async () => undefined),
     onDevelopmentActivityChange: vi.fn(() => () => undefined),
+    getWebProfiles: vi.fn(async () => ({ state: 'missing' as const, document: { schemaVersion: 1 as const, profiles: [] }, sha256: null })),
+    enableWebBrowsing: vi.fn(async () => ({ state: 'ready' as const, document: { schemaVersion: 1 as const, profiles: [] }, sha256: 'a'.repeat(64) })),
+    createWebProfile: vi.fn(async () => ({ state: 'ready' as const, document: { schemaVersion: 1 as const, profiles: [] }, sha256: 'a'.repeat(64) })),
+    updateWebProfile: vi.fn(async () => ({ state: 'ready' as const, document: { schemaVersion: 1 as const, profiles: [] }, sha256: 'a'.repeat(64) })),
+    removeWebProfile: vi.fn(async () => ({ state: 'ready' as const, document: { schemaVersion: 1 as const, profiles: [] }, sha256: 'a'.repeat(64) })),
+    resetWebProfiles: vi.fn(async () => ({ state: 'ready' as const, document: { schemaVersion: 1 as const, profiles: [] }, sha256: 'a'.repeat(64) })),
+    listWebActivity: vi.fn(async () => []),
+    getWebLiveViewerState: vi.fn(async () => ({ visible: false as const, displays: [], recommendedDisplayId: '' })),
+    listWebTabs: vi.fn(async () => []),
+    showWebLiveViewer: vi.fn(async () => undefined),
+    moveWebLiveViewer: vi.fn(async () => undefined),
+    hideWebLiveViewer: vi.fn(async () => undefined),
+    takeWebHumanControl: vi.fn(async () => undefined),
+    cycleWebHumanTab: vi.fn(async () => undefined),
+    returnWebHumanControl: vi.fn(async () => undefined),
+    declineWebHumanControl: vi.fn(async () => undefined),
+    stopWebSession: vi.fn(async () => undefined),
+    onWebActivityChange: vi.fn(() => () => undefined),
     getSettings: vi.fn(async () => makeApiSettings()),
     saveSettings: vi.fn(async () => undefined),
     getRuntimeInfo: vi.fn(async () => ({
@@ -200,7 +258,7 @@ function makeApi(overrides: Partial<DesktopApi> = {}): DesktopApi {
     exportPortableConfig: vi.fn(async () => true),
     selectPortableImport: vi.fn(async () => undefined),
     mapPortableWorkspace: vi.fn(async () => true),
-    applyPortableImport: vi.fn(async () => ({ settings: makeApiSettings(), registry: { schemaVersion: 4 as const, workspaces: [], applications: [] }, workspaces: [], applications: [], projects: [], importedProfileIds: [] })),
+    applyPortableImport: vi.fn(async () => ({ settings: makeApiSettings(), registry: { schemaVersion: 5 as const, workspaces: [], applications: [] }, workspaces: [], applications: [], projects: [], importedProfileIds: [] })),
     listAuditEvents: vi.fn(async () => []),
     listPendingApprovals: vi.fn(async () => []),
     pickTunnelBinary: vi.fn(async () => undefined),
@@ -210,6 +268,7 @@ function makeApi(overrides: Partial<DesktopApi> = {}): DesktopApi {
     diagnoseTunnel: vi.fn(async () => ({ ok: true, output: 'OK' })),
     disconnectTunnel: vi.fn(async () => undefined),
     getTunnelStatus: vi.fn(async (): Promise<TunnelStatus> => 'disconnected'),
+    getEffectiveGitApprovalMode: vi.fn(async () => undefined),
     onTunnelStatusChange: vi.fn(() => () => undefined),
     onTunnelLog: vi.fn(() => () => undefined),
     getSavedTunnelKey: vi.fn(async () => undefined),
@@ -279,18 +338,22 @@ describe('renderer desktop — workspaces', () => {
     });
 
     click('#show-create-form');
-    setValue('input[name="name"]', 'Proyecto nuevo');
+    setValue('#workspace-form input[name="name"]', 'Proyecto nuevo');
     click('#pick-folder');
     await vi.waitFor(() => expect(document.querySelector<HTMLInputElement>('input[name="rootPath"]')?.value).toBe(ROOT_PATH));
     click('#detect-commands');
     await vi.waitFor(() => expect(document.querySelector('input[data-detected="test"]')).not.toBeNull());
     click('#authorize-all-detected');
+    click('[data-workspace-tab="advanced"]');
+    setValue('select[name="maxFileBytes"]', String(8 * 1024 * 1024));
     submit('#workspace-form');
 
     await vi.waitFor(() =>
       expect(api.createWorkspace).toHaveBeenCalledWith({
         name: 'Proyecto nuevo',
         rootPath: ROOT_PATH,
+        maxFileBytes: 8 * 1024 * 1024,
+        largeArtifacts: { mode: 'standard', reserve: { minimumFreeBytes: 1024 * 1024 * 1024, minimumFreePercent: 10 }, maxConcurrentJobs: 1 },
         permissions: { ...PERMISSIONS, processes: false, browserRead: false, browserInteract: false, browserHumanControl: false },
         validationProfiles: { test: ['pnpm', 'run', 'test'] },
         processProfiles: {},
@@ -306,8 +369,9 @@ describe('renderer desktop — workspaces', () => {
 
     click('[data-action="edit"]');
     expect(document.querySelectorAll('[data-workspace-tab]')).toHaveLength(4);
-    setValue('input[name="name"]', 'Demo editado');
+    setValue('#workspace-form input[name="name"]', 'Demo editado');
     click('[data-workspace-tab="advanced"]');
+    setValue('select[name="maxFileBytes"]', String(8 * 1024 * 1024));
     setValue('textarea[name="validationProfiles"]', '{"lint":["pnpm","lint"]}');
     submit('#workspace-form');
 
@@ -315,6 +379,7 @@ describe('renderer desktop — workspaces', () => {
       expect(api.updateWorkspace).toHaveBeenCalledWith({
         ...existing,
         name: 'Demo editado',
+        limits: { ...existing.limits, maxFileBytes: 8 * 1024 * 1024 },
         permissions: { ...existing.permissions, processes: false, browserRead: false, browserInteract: false, browserHumanControl: false },
         validationProfiles: { lint: ['pnpm', 'lint'] },
         processProfiles: {},
@@ -376,7 +441,7 @@ describe('renderer desktop — workspaces', () => {
         { alias: 'frontend', workspaceId: 'ws_frontend', processProfile: 'dev', hostMode: 'manual-localhost', allowManagedWildcard: false },
         { alias: 'api', workspaceId: 'ws_api', processProfile: 'dev', hostMode: 'manual-localhost', allowManagedWildcard: true },
       ],
-      viewport: { width: 1280, height: 800 },
+      viewport: { width: 1920, height: 1080 },
     }));
     expect(document.body.textContent).not.toContain('Aplicaciones multiservicio (JSON avanzado)');
   });
@@ -508,8 +573,8 @@ describe('renderer desktop — workspaces', () => {
     expect(cards[0]?.textContent).toContain('Seleccionado');
     expect(document.querySelector('.workspace-edit-layout')).not.toBeNull();
     expect(document.querySelector('#workspace-form-title')?.textContent).toContain('Seleccionado');
-    expect(document.querySelector<HTMLInputElement>('input[name="name"]')?.value).toBe('Seleccionado');
-    expect(document.activeElement).toBe(document.querySelector('input[name="name"]'));
+    expect(document.querySelector<HTMLInputElement>('#workspace-form input[name="name"]')?.value).toBe('Seleccionado');
+    expect(document.activeElement).toBe(document.querySelector('#workspace-form input[name="name"]'));
   });
 
   it('restaura la cuadrícula y el foco al cancelar la edición', async () => {
@@ -529,13 +594,13 @@ describe('renderer desktop — workspaces', () => {
     await boot({ detectProjectCommands: vi.fn(async () => Promise.reject(new Error('manifiesto ilegible'))) });
 
     click('#show-create-form');
-    setValue('input[name="name"]', 'Borrador importante');
+    setValue('#workspace-form input[name="name"]', 'Borrador importante');
     click('#pick-folder');
     await vi.waitFor(() => expect(document.querySelector<HTMLInputElement>('input[name="rootPath"]')?.value).toBe(ROOT_PATH));
     click('#detect-commands');
 
     await vi.waitFor(() => expect(document.querySelector('#form-error')?.textContent).toContain('manifiesto ilegible'));
-    expect(document.querySelector<HTMLInputElement>('input[name="name"]')?.value).toBe('Borrador importante');
+    expect(document.querySelector<HTMLInputElement>('#workspace-form input[name="name"]')?.value).toBe('Borrador importante');
   });
 });
 
@@ -609,6 +674,29 @@ describe('renderer desktop — proyectos asistidos v0.9', () => {
     select.dispatchEvent(new Event('change', { bubbles: true }));
     await vi.waitFor(() => expect(setAssistedProjectPolicy).toHaveBeenCalledWith(project.id, 'manual'));
   });
+
+  it('elimina el desarrollo y sus accesos desde una sola acción local', async () => {
+    const removeDevelopmentProject = vi.fn(async () => ({
+      removed: true,
+      workspacesRemoved: 1,
+      applicationsRemoved: 1,
+      sharedWorkspacesKept: 0,
+      sharedApplicationsKept: 0,
+      filesDeleted: false as const,
+    }));
+    await boot({
+      listAssistedProjects: vi.fn(async () => ({ projects: [project], sessions: [session], runs: [] })),
+      removeDevelopmentProject,
+    });
+    click('[data-section="assisted"]');
+
+    expect(document.querySelector('[data-assisted-remove]')?.textContent).toContain('Eliminar desarrollo y accesos');
+    click('[data-assisted-remove]');
+
+    await vi.waitFor(() => expect(removeDevelopmentProject).toHaveBeenCalledWith(project.id));
+    await vi.waitFor(() => expect(document.querySelector('#global-feedback')?.textContent).toContain('1 carpeta(s) autorizada(s)'));
+    expect(document.querySelector('#global-feedback')?.textContent).toContain('Los archivos reales permanecen en el disco');
+  });
 });
 
 describe('renderer desktop — proyectos y confianza v1.0', () => {
@@ -670,6 +758,32 @@ describe('renderer desktop — proyectos y confianza v1.0', () => {
     expect(document.body.textContent).toContain('puede operar fuera de esta carpeta');
     click('[data-v1-revoke]');
     await vi.waitFor(() => expect(revokeV1ProjectTrust).toHaveBeenCalledWith(projectId));
+  });
+
+  it('mantiene Control total disponible cuando solo la preparación guiada pide revisión', async () => {
+    const setupProject: DevelopmentProject = {
+      id: projectId, name: 'Producto completo', description: '', workspaceIds: ['ws_demo'],
+      setupStatus: 'review-required', createdAt: '2026-08-26T00:00:00.000Z', updatedAt: '2026-08-26T00:00:00.000Z',
+    };
+    const setupSession: ProjectSetupSession = {
+      id: `setup_${'c'.repeat(24)}`, projectId, provisionalWorkspaceId: 'ws_demo', policy: 'restricted',
+      initializeGit: false, phase: 'awaiting-local-review',
+      plan: {
+        id: `plan_${'d'.repeat(24)}`, projectId, topology: 'single', proposedWorkspaceRoots: ['.'],
+        manifestRefs: [], lockfileRefs: [], packageManagers: ['npm'], directDependencyCount: 1,
+        directDevDependencyCount: 1, toolchainFingerprint: 'e'.repeat(64), actions: [],
+        proposedProfiles: [], policy: 'restricted', planSha256: 'f'.repeat(64), createdAt: '2026-08-26T00:00:00.000Z',
+      },
+      createdAt: '2026-08-26T00:00:00.000Z', updatedAt: '2026-08-26T00:00:00.000Z',
+    };
+    await boot({
+      listV1Projects: vi.fn(async () => ({ projects: [catalogProject], decisions: [fullHostDecision], sandboxAvailable: false })),
+      listAssistedProjects: vi.fn(async () => ({ projects: [setupProject], sessions: [setupSession], runs: [] })),
+    });
+    click('[data-section="assisted"]');
+    expect(document.body.textContent).toContain('Tu terminal sigue disponible');
+    expect(document.body.textContent).toContain('Revisar preparación guiada');
+    expect(document.querySelector('.state-danger')?.textContent).toBe('Control total');
   });
 });
 
@@ -773,6 +887,7 @@ describe('renderer desktop — configuración y errores', () => {
         onboardingStep: 4,
         onboardingCompleted: true,
         minimizeToTray: true,
+        largeArtifactPreference: { mode: 'standard', reserve: { minimumFreeBytes: 1024 * 1024 * 1024, minimumFreePercent: 10 }, maxConcurrentJobs: 1 },
         gitApprovalMode: 'mrtr',
         activeConnectionProfileId: 'profile_default0',
         connectionProfiles: [{ id: 'profile_default0', name: 'Personal', tunnelId: '' }],
@@ -819,10 +934,10 @@ describe('renderer desktop — configuración y errores', () => {
     });
 
     click('#show-create-form');
-    setValue('input[name="name"]', 'Texto sin perder');
+    setValue('#workspace-form input[name="name"]', 'Texto sin perder');
     emitLog?.('actividad', 'stdout');
 
-    expect(document.querySelector<HTMLInputElement>('input[name="name"]')?.value).toBe('Texto sin perder');
+    expect(document.querySelector<HTMLInputElement>('#workspace-form input[name="name"]')?.value).toBe('Texto sin perder');
     expect(document.querySelector('#tunnel-log')?.textContent).toContain('actividad');
   });
 });
@@ -1049,7 +1164,7 @@ describe('renderer desktop — portabilidad y confianza', () => {
           processes: false, browserRead: false, browserInteract: false,
           browserAuthenticate: false, browserManualControl: false,
         },
-        limits: { maxFileBytes: 1024, maxTreeEntries: 30, maxTreeDepth: 2 },
+        limits: { maxFileBytes: 1024, maxTreeEntries: 30, maxTreeDepth: 2, largeArtifacts: { mode: 'standard' as const, reserve: { minimumFreeBytes: 1024 * 1024 * 1024, minimumFreePercent: 10 }, maxConcurrentJobs: 1 as const } },
         denyPatterns: ['.env'], validationProfiles: {}, processProfiles: {}, browserProfiles: {},
         automationReviewRequired: false,
       }],
@@ -1058,7 +1173,7 @@ describe('renderer desktop — portabilidad y confianza', () => {
       selectPortableImport: vi.fn(async () => ({ sessionId: '00000000-0000-4000-8000-000000000000', config })),
       applyPortableImport: vi.fn(async () => {
         const workspaces = [workspace({ name: 'Importado' })];
-        return { settings: makeApiSettings(), registry: { schemaVersion: 4 as const, workspaces, applications: [] }, workspaces, applications: [], projects: [], importedProfileIds: ['profile_new00000'] };
+        return { settings: makeApiSettings(), registry: { schemaVersion: 5 as const, workspaces, applications: [] }, workspaces, applications: [], projects: [], importedProfileIds: ['profile_new00000'] };
       }),
     });
     click('#nav-settings');
@@ -1099,7 +1214,7 @@ describe('renderer desktop — portabilidad y confianza', () => {
       }]),
     });
 
-    expect(document.body.textContent).toContain('Esperando aprobación en ChatGPT');
+    expect(document.body.textContent).toContain('Esperando confirmación del cliente MCP');
     expect(document.body.textContent).toContain('Crear commit');
     expect(document.body.textContent).toContain('Demo');
   });
@@ -1172,7 +1287,8 @@ describe('renderer desktop — portabilidad y confianza', () => {
     click('#nav-activity');
     await vi.waitFor(() => expect(document.querySelector<HTMLButtonElement>('[data-terminal-open]')?.disabled).toBe(true));
     expect(document.body.textContent).toContain('Puerto no exclusivo');
-    expect(document.body.textContent).toContain('Visible en red local');
+    expect(document.body.textContent).toContain('Escucha en todas las redes');
+    expect(document.body.textContent).toContain('Usa 127.0.0.1 o ::1');
   });
 
   it('abre y cierra la navegación compacta conservando el foco', async () => {
@@ -1198,6 +1314,416 @@ describe('renderer desktop — portabilidad y confianza', () => {
     expect(document.querySelectorAll('.audit-row')).toHaveLength(40);
     click('#audit-show-more');
     expect(document.querySelectorAll('.audit-row')).toHaveLength(45);
+  });
+
+  it('muestra el código causal seguro de un diagnóstico temporal', async () => {
+    const event = {
+      id: 'event_motion', timestamp: '2026-09-07T12:00:00.000Z', requestId: 'req_motion',
+      workspaceId: 'ws_demo', action: 'web.motion.diagnostic', riskLevel: 'R2', decision: 'allow' as const,
+      outcome: 'error' as const, errorCode: 'FILE_TOO_LARGE', durationMs: 1,
+    };
+    await boot({ listWorkspaces: vi.fn(async () => [workspace()]), listAuditEvents: vi.fn(async () => [event]) });
+    click('#nav-activity');
+    await vi.waitFor(() => expect(document.querySelector('.audit-row')?.textContent).toContain('FILE_TOO_LARGE'));
+    expect(document.querySelector('.audit-row')?.textContent).toContain('Diagnosticó una captura temporal externa');
+  });
+
+  it('anida diagnósticos correlacionados y oculta diagnósticos correctos sin operación', async () => {
+    const events = [{
+      id: 'event_download', timestamp: '2026-09-07T12:00:00.000Z', requestId: 'req_download',
+      workspaceId: 'ws_demo', action: 'web.download', riskLevel: 'R4', decision: 'deny' as const,
+      outcome: 'error' as const, errorCode: 'WEB_MEDIA_TYPE_MISMATCH', operationId: 'download_1', durationMs: 5,
+    }, {
+      id: 'event_download_diag', timestamp: '2026-09-07T12:00:00.001Z', requestId: 'req_download_diag',
+      workspaceId: 'ws_demo', action: 'web.download.diagnostic', riskLevel: 'R2', decision: 'allow' as const,
+      outcome: 'error' as const, errorCode: 'WEB_MEDIA_TYPE_MISMATCH', operationId: 'download_1', durationMs: 0,
+    }, {
+      id: 'event_capture_diag', timestamp: '2026-09-07T12:00:01.000Z', requestId: 'req_capture_diag',
+      workspaceId: 'ws_demo', action: 'web.screenshot.diagnostic', riskLevel: 'R2', decision: 'allow' as const,
+      outcome: 'success' as const, durationMs: 0,
+    }];
+    await boot({ listWorkspaces: vi.fn(async () => [workspace()]), listAuditEvents: vi.fn(async () => events) });
+    click('#nav-activity');
+    await vi.waitFor(() => expect(document.querySelectorAll('.audit-row')).toHaveLength(1));
+    expect(document.querySelector('.audit-diagnostics')?.textContent).toContain('WEB_MEDIA_TYPE_MISMATCH');
+    expect(document.querySelector('#audit-events')?.textContent).not.toContain('Diagnosticó una captura web sin registrar contenido');
+    expect(document.querySelector('.audit-summary')?.textContent).toContain('1 operaciones');
+    expect(document.querySelector('.audit-summary')?.textContent).toContain('1 fallos reales');
+    expect(document.querySelector('.audit-summary')?.textContent).toContain('0 recuperadas');
+    expect(document.querySelector('.audit-summary')?.textContent).toContain('2 detalles');
+  });
+
+  it('marca como recuperada solo una operación exitosa cuyo diagnóstico confirma recuperación', async () => {
+    const events = [{
+      id: 'event_navigation', timestamp: '2026-09-07T12:00:00.000Z', requestId: 'req_navigation',
+      action: 'web.navigate', riskLevel: 'R2', decision: 'allow' as const, outcome: 'success' as const,
+      operationId: 'navigate_1', durationMs: 5,
+    }, {
+      id: 'event_navigation_diag', timestamp: '2026-09-07T12:00:00.001Z', requestId: 'req_navigation_diag',
+      action: 'web.navigate.diagnostic', resource: 'session:tab:recovered', riskLevel: 'R2', decision: 'allow' as const,
+      outcome: 'success' as const, errorCode: 'WEB_NAVIGATION_FAILED', operationId: 'navigate_1', durationMs: 0,
+    }];
+    await boot({ listAuditEvents: vi.fn(async () => events) });
+    click('#nav-activity');
+    await vi.waitFor(() => expect(document.querySelector('.audit-row')?.textContent).toContain('Recuperado'));
+    expect(document.querySelector('.audit-summary')?.textContent).toContain('1 recuperadas');
+  });
+
+  it('agrupa texto, páginas renderizadas e imágenes en cobertura documental', async () => {
+    const events = [{
+      id: 'event_document_text', timestamp: '2026-09-08T12:00:00.000Z', requestId: 'req_document_text',
+      workspaceId: 'ws_demo', action: 'document.read',
+      resource: 'docs/report#final.pdf#textPages=1,2;total=5;sha=0123456789ab;mode=mixed;warnings=DOCUMENT_NO_TEXT', riskLevel: 'R2',
+      decision: 'allow' as const, outcome: 'success' as const, durationMs: 4,
+    }, {
+      id: 'event_document_render', timestamp: '2026-09-08T12:00:01.000Z', requestId: 'req_document_render',
+      workspaceId: 'ws_demo', action: 'document.render',
+      resource: 'docs/report#final.pdf#pages=1,2,3;total=5;sha=0123456789ab;warnings=none', riskLevel: 'R2',
+      decision: 'allow' as const, outcome: 'success' as const, durationMs: 20,
+    }, {
+      id: 'event_image', timestamp: '2026-09-08T12:00:02.000Z', requestId: 'req_image',
+      workspaceId: 'ws_demo', action: 'image.read',
+      resource: 'images/chart.png#image=1;sha=fedcba987654;mime=image/png', riskLevel: 'R2',
+      decision: 'allow' as const, outcome: 'success' as const, durationMs: 3,
+    }];
+    await boot({ listWorkspaces: vi.fn(async () => [workspace()]), listAuditEvents: vi.fn(async () => events) });
+    click('#nav-activity');
+    await vi.waitFor(() => expect(document.querySelector('#document-coverage')?.textContent).toContain('3 página(s) preparadas'));
+    const coverage = document.querySelector('#document-coverage')?.textContent;
+    expect(coverage).toContain('2 archivo(s)');
+    expect(coverage).toContain('1 con texto');
+    expect(coverage).toContain('2 visual(es)');
+    expect(coverage).toContain('report#final.pdf');
+    expect(coverage).toContain('chart.png');
+    expect(coverage).toContain('2 página(s) con texto extraído');
+    expect(coverage).toContain('3/5 página(s) renderizada(s)');
+    expect(coverage).toContain('modo mixed');
+    expect(coverage).toContain('SHA-256 0123456789ab…');
+    expect(coverage).toContain('1 aviso(s)');
+  });
+});
+
+describe('renderer desktop — navegador web cotidiano', () => {
+  it('mantiene Desarrollo y Acceso a Internet y lleva la operación a Actividad', async () => {
+    await boot();
+    click('[data-section-target="activity"]');
+    expect(document.querySelector('[data-view="activity"]')?.hasAttribute('hidden')).toBe(false);
+    click('#nav-web');
+    expect(document.querySelector('[data-view="web"]')?.hasAttribute('hidden')).toBe(false);
+    expect(document.querySelector('[data-view="web"]')?.textContent).toContain('Las sesiones y la toma de control aparecen en Actividad');
+    click('#nav-assisted');
+    expect(document.querySelector('[data-view="assisted"]')?.hasAttribute('hidden')).toBe(false);
+  });
+
+  it('habilita la navegación pública con una sola acción local', async () => {
+    const enabled = webProfile({ enabled: true });
+    const enableWebBrowsing = vi.fn(async () => ({
+      state: 'ready' as const,
+      document: { schemaVersion: 1 as const, profiles: [enabled] },
+      sha256: 'b'.repeat(64),
+    }));
+    await boot({ enableWebBrowsing });
+    click('#nav-web');
+    expect(document.body.textContent).toContain('Habilitar navegación por Internet');
+    click('#enable-web-browsing');
+    await vi.waitFor(() => expect(enableWebBrowsing).toHaveBeenCalledWith(null, false));
+    await vi.waitFor(() => expect(document.body.textContent).toContain('Navegación por Internet habilitada'));
+  });
+
+  it('reúne navegadores LOCAL e INTERNET y permite tomar una sesión pública activa', async () => {
+    const project = workspace({
+      permissions: { ...PERMISSIONS, browserRead: true, browserInteract: true, browserHumanControl: true },
+    });
+    const sessionId = `websession_${'c'.repeat(24)}`;
+    const tabId = `webtab_${'d'.repeat(24)}`;
+    const takeWebHumanControl = vi.fn(async () => undefined);
+    const listWebActivity = vi.fn(async () => [{
+      sessionId, webProfileId: webProfile().id, profileName: 'Público', profileKind: 'public-research' as const,
+      state: 'running' as const, startedAt: '2026-09-06T12:00:00.000Z', controlState: 'agent_control' as const, tabCount: 1,
+    }]);
+    await boot({
+      listWorkspaces: vi.fn(async () => [project]),
+      listDevelopmentActivity: vi.fn(async () => ({
+        processes: [], applications: [], terminals: [],
+        browsers: [{
+          workspaceId: project.id, sessionId: `session_${'a'.repeat(24)}`, profile: 'dev', state: 'running' as const,
+          title: 'Local', path: '/', startedAt: '2026-09-06T12:00:00.000Z', controlState: 'agent_control' as const,
+        }],
+      })),
+      listWebActivity,
+      listWebTabs: vi.fn(async () => [{ tabId, title: 'Sitio', url: 'https://example.com/', state: 'ready' as const, openedAt: '2026-09-06T12:00:00.000Z' }]),
+      takeWebHumanControl,
+    });
+    click('#nav-activity');
+    await vi.waitFor(() => expect(listWebActivity.mock.calls.length).toBeGreaterThanOrEqual(2));
+    await vi.waitFor(() => expect(document.querySelectorAll('[data-view="activity"] .source-pill')).toHaveLength(2));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(document.querySelector('[data-view="activity"]')?.textContent).toContain('LOCAL');
+    expect(document.querySelector('[data-view="activity"]')?.textContent).toContain('INTERNET');
+    click(`[data-web-take="${sessionId}"]`);
+    await vi.waitFor(() => expect(takeWebHumanControl).toHaveBeenCalledWith(sessionId, tabId));
+  });
+
+  it('muestra 1920x1080 como baseline y aplica presets distintos en LOCAL e INTERNET', async () => {
+    const project = workspace({ permissions: { ...PERMISSIONS, browserRead: true, browserInteract: true } });
+    const browserSessionId = `session_${'a'.repeat(24)}`;
+    const webSessionId = `websession_${'c'.repeat(24)}`;
+    const tabId = `webtab_${'d'.repeat(24)}`;
+    const setBrowserViewport = vi.fn(async () => undefined);
+    const setWebViewport = vi.fn(async () => undefined);
+    await boot({
+      listWorkspaces: vi.fn(async () => [project]),
+      listDevelopmentActivity: vi.fn(async () => ({
+        processes: [], applications: [], terminals: [],
+        browsers: [{
+          workspaceId: project.id, sessionId: browserSessionId, profile: 'dev', state: 'running' as const,
+          title: 'Local', path: '/', startedAt: '2026-09-06T12:00:00.000Z', controlState: 'agent_control' as const,
+          viewport: { width: 1920, height: 1080, mobile: false },
+        }],
+      })),
+      listWebActivity: vi.fn(async () => [{
+        sessionId: webSessionId, webProfileId: webProfile().id, profileName: 'Público', profileKind: 'public-research' as const,
+        state: 'running' as const, startedAt: '2026-09-06T12:00:00.000Z', controlState: 'agent_control' as const, tabCount: 1,
+      }]),
+      listWebTabs: vi.fn(async () => [{
+        tabId, title: 'Referencia', url: 'https://example.com/', state: 'ready' as const,
+        openedAt: '2026-09-06T12:00:00.000Z', viewport: { width: 1920, height: 1080, mobile: false },
+      }]),
+      setBrowserViewport,
+      setWebViewport,
+    });
+    click('#nav-activity');
+    await vi.waitFor(() => expect(document.querySelector(`[data-browser-viewport="${browserSessionId}"]`)).not.toBeNull());
+    await vi.waitFor(() => expect(document.querySelector(`[data-web-viewport="${webSessionId}"]`)).not.toBeNull());
+    expect(document.querySelector('[data-view="activity"]')?.textContent).toContain('Render: 1920×1080');
+
+    click(`[data-browser-viewport="${browserSessionId}"][data-viewport-width="390"]`);
+    click(`[data-web-viewport="${webSessionId}"][data-viewport-width="1440"]`);
+    await vi.waitFor(() => expect(setBrowserViewport).toHaveBeenCalledWith(project.id, browserSessionId, 390, 844, true));
+    await vi.waitFor(() => expect(setWebViewport).toHaveBeenCalledWith(webSessionId, tabId, 1440, 900, false));
+  });
+
+  it('muestra el progreso de capturas temporales LOCAL e INTERNET en Actividad', async () => {
+    const project = workspace({ permissions: { ...PERMISSIONS, browserRead: true, browserInteract: true } });
+    const webSessionId = `websession_${'c'.repeat(24)}`;
+    const api = await boot({
+      listWorkspaces: vi.fn(async () => [project]),
+      listDevelopmentActivity: vi.fn(async () => ({
+        processes: [], applications: [], terminals: [],
+        browsers: [{
+          workspaceId: project.id, sessionId: `session_${'a'.repeat(24)}`, profile: 'dev', state: 'running' as const,
+          title: 'Local', path: '/', startedAt: '2026-09-06T12:00:00.000Z', controlState: 'agent_control' as const,
+          motionCapture: { completed: 4, total: 12, mode: 'stepped' as const },
+          lastMotionCapture: { path: 'evidence/scroll.lbmotion', frameCount: 12, totalSize: 2048, captureMode: 'stepped' as const, warnings: [] },
+        }],
+      })),
+      listWebActivity: vi.fn(async () => [{
+        sessionId: webSessionId, webProfileId: webProfile().id, profileName: 'Público', profileKind: 'public-research' as const,
+        state: 'running' as const, startedAt: '2026-09-06T12:00:00.000Z', controlState: 'agent_control' as const, tabCount: 1,
+      }]),
+      listWebTabs: vi.fn(async () => [{
+        tabId: `webtab_${'d'.repeat(24)}`, title: 'Referencia', url: 'https://example.com/', state: 'ready' as const,
+        openedAt: '2026-09-06T12:00:00.000Z', motionCapture: { completed: 7, total: 12, mode: 'screencast' as const },
+      }]),
+    });
+    click('#nav-activity');
+    await vi.waitFor(() => expect(document.querySelectorAll('[data-view="activity"] .motion-progress')).toHaveLength(2));
+    expect(document.querySelector('[data-view="activity"]')?.textContent).toContain('Capturando movimiento 4/12');
+    expect(document.querySelector('[data-view="activity"]')?.textContent).toContain('Capturando movimiento 7/12');
+    expect(document.querySelector('[data-view="activity"]')?.textContent).toContain('evidence/scroll.lbmotion');
+    expect([...document.querySelectorAll<HTMLProgressElement>('[data-view="activity"] progress')].map((item) => item.value)).toEqual([4, 7]);
+    expect(document.querySelectorAll('[data-view="activity"] [data-browser-cancel-motion], [data-view="activity"] [data-web-cancel-motion]')).toHaveLength(2);
+    click('[data-browser-cancel-motion]');
+    click('[data-web-cancel-motion]');
+    await vi.waitFor(() => expect(api.cancelBrowserMotion).toHaveBeenCalledTimes(1));
+    await vi.waitFor(() => expect(api.cancelWebMotion).toHaveBeenCalledTimes(1));
+  });
+
+  it('ordena una intervención INTERNET antes de un navegador LOCAL normal', async () => {
+    await boot({
+      listDevelopmentActivity: vi.fn(async () => ({
+        processes: [], applications: [], terminals: [],
+        browsers: [{
+          workspaceId: 'ws_demo', sessionId: `session_${'a'.repeat(24)}`, profile: 'dev', state: 'running' as const,
+          title: 'Local', path: '/', startedAt: '2026-09-06T11:00:00.000Z', controlState: 'agent_control' as const,
+        }],
+      })),
+      listWebActivity: vi.fn(async () => [{
+        sessionId: `websession_${'c'.repeat(24)}`, webProfileId: webProfile().id, profileName: 'Intervención',
+        profileKind: 'public-research' as const, state: 'running' as const, startedAt: '2026-09-06T12:00:00.000Z',
+        controlState: 'waiting_for_human' as const, tabCount: 1,
+      }]),
+    });
+    click('#nav-activity');
+    await vi.waitFor(() => expect(document.querySelectorAll('[data-view="activity"] .source-pill')).toHaveLength(2));
+    expect([...document.querySelectorAll('[data-view="activity"] .source-pill')].map((entry) => entry.textContent)).toEqual(['INTERNET', 'LOCAL']);
+    expect(document.querySelector('#stop-all-development')?.textContent).toBe('Detener entorno de desarrollo');
+    expect(document.querySelector('[data-web-stop]')?.textContent).toBe('Cerrar sesión y borrar estado');
+  });
+
+  it('bloquea un doble clic al tomar control de una sesión web', async () => {
+    const sessionId = `websession_${'c'.repeat(24)}`;
+    const tabId = `webtab_${'d'.repeat(24)}`;
+    let resolveTake!: () => void;
+    const takeWebHumanControl = vi.fn(() => new Promise<void>((resolve) => { resolveTake = resolve; }));
+    const listWebActivity = vi.fn(async () => [{
+      sessionId, webProfileId: webProfile().id, profileName: 'Público', profileKind: 'public-research' as const,
+      state: 'running' as const, startedAt: '2026-09-06T12:00:00.000Z', controlState: 'agent_control' as const, tabCount: 1,
+    }]);
+    await boot({
+      listWebActivity,
+      listWebTabs: vi.fn(async () => [{
+        tabId, title: 'Sitio', url: 'https://example.com/', state: 'ready' as const, openedAt: '2026-09-06T12:00:00.000Z',
+      }]),
+      takeWebHumanControl,
+    });
+    click('#nav-activity');
+    await vi.waitFor(() => expect(listWebActivity.mock.calls.length).toBeGreaterThanOrEqual(2));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    await vi.waitFor(() => expect(document.querySelector(`[data-web-take="${sessionId}"]`)).not.toBeNull());
+    const button = document.querySelector<HTMLButtonElement>(`[data-web-take="${sessionId}"]`)!;
+    button.click();
+    button.click();
+    expect(button.disabled).toBe(true);
+    expect(button.textContent).toBe('Entregando control…');
+    expect(takeWebHumanControl).toHaveBeenCalledTimes(1);
+    resolveTake();
+  });
+
+  it('filtra actividad sin perder el foco del control elegido', async () => {
+    await boot({
+      listDevelopmentActivity: vi.fn(async () => ({
+        browsers: [], applications: [], terminals: [],
+        processes: [{
+          workspaceId: 'ws_demo', processId: `process_${'a'.repeat(24)}`, profile: 'dev', state: 'running' as const,
+          startedAt: '2026-09-06T12:00:00.000Z', deadline: '2026-09-06T13:00:00.000Z', listeners: [],
+        }],
+      })),
+    });
+    click('#nav-activity');
+    const filter = document.querySelector<HTMLButtonElement>('#activity-filter-browsers');
+    if (filter === null) throw new Error('filtro de navegadores no encontrado');
+    filter.focus();
+    if (document.scrollingElement !== null) document.scrollingElement.scrollTop = 240;
+    filter.click();
+    expect(document.activeElement?.id).toBe('activity-filter-browsers');
+    expect(document.scrollingElement?.scrollTop).toBe(240);
+    expect(document.querySelector('[data-view="activity"] #development-activity')?.textContent).not.toContain('Servidor · dev');
+    expect(document.querySelector('#activity-filter-browsers')?.getAttribute('aria-pressed')).toBe('true');
+  });
+
+  it('abre la vista web local en seguimiento o fijada sin exponer consultas', async () => {
+    const sessionId = `websession_${'c'.repeat(24)}`;
+    const tabId = `webtab_${'d'.repeat(24)}`;
+    const showWebLiveViewer = vi.fn(async () => undefined);
+    const listWebTabs = vi.fn(async () => [{
+      tabId,
+      title: '<img src=x onerror=alert(1)> Resultados',
+      url: 'https://example.com/search?secret=abc#private',
+      state: 'ready' as const,
+      openedAt: '2026-09-06T12:00:00.000Z',
+    }]);
+    const api = await boot({
+      listWebActivity: vi.fn(async () => [{
+        sessionId, webProfileId: webProfile().id, profileName: 'Investigación pública', profileKind: 'public-research' as const,
+        state: 'running' as const, startedAt: '2026-09-06T12:00:00.000Z', controlState: 'agent_control' as const, tabCount: 1,
+      }]),
+      getWebLiveViewerState: vi.fn(async () => ({
+        visible: false as const,
+        displays: [{ id: '101', ordinal: 1, label: 'Principal', isPrimary: true }],
+        recommendedDisplayId: '101',
+      })),
+      listWebTabs,
+      showWebLiveViewer,
+    });
+    click('#nav-activity');
+    await vi.waitFor(() => expect(document.querySelector('[data-web-view-pinned]')).not.toBeNull());
+    expect(document.querySelector('.web-tab-row img')).toBeNull();
+    expect(document.body.textContent).toContain('<img src=x onerror=alert(1)> Resultados');
+    expect(document.body.textContent).toContain('example.com/search');
+    expect(document.body.textContent).not.toContain('secret=abc');
+    click('[data-web-view-follow]');
+    await vi.waitFor(() => expect(showWebLiveViewer).toHaveBeenCalledWith(sessionId, 'follow', '101', undefined, 'fit'));
+    click('[data-web-view-pinned]');
+    await vi.waitFor(() => expect(showWebLiveViewer).toHaveBeenCalledWith(sessionId, 'pinned', '101', tabId, 'fit'));
+    expect(api.listWebTabs).toHaveBeenCalledWith(sessionId);
+  });
+
+  it('explica la frontera y habilita un perfil solo mediante acción local', async () => {
+    const profile = webProfile();
+    const snapshot = { state: 'ready' as const, document: { schemaVersion: 1 as const, profiles: [profile] }, sha256: 'd'.repeat(64) };
+    const updateWebProfile = vi.fn(async (_hash: string | null, next: WebProfile) => ({
+      state: 'ready' as const,
+      document: { schemaVersion: 1 as const, profiles: [next] },
+      sha256: 'e'.repeat(64),
+    }));
+    const api = await boot({ getWebProfiles: vi.fn(async () => snapshot), updateWebProfile });
+    click('#nav-web');
+
+    expect(document.body.textContent).toContain('No usa tu Chrome personal ni controla aplicaciones de Windows');
+    expect(document.body.textContent).toContain('Loopback, LAN, link-local, metadata');
+    expect(document.body.textContent).toContain('no requiere conexiones entrantes desde redes privadas o públicas');
+    expect(document.querySelector(`[data-web-toggle="${profile.id}"]`)?.textContent).toContain('Habilitar acceso');
+    click(`[data-web-toggle="${profile.id}"]`);
+    await vi.waitFor(() => expect(updateWebProfile).toHaveBeenCalledWith('d'.repeat(64), expect.objectContaining({ id: profile.id, enabled: true })));
+    expect(api.createWebProfile).not.toHaveBeenCalled();
+  });
+
+  it('guarda permisos separados y no convierte investigación pública en inicio de sesión', async () => {
+    const profile = webProfile();
+    const snapshot = { state: 'ready' as const, document: { schemaVersion: 1 as const, profiles: [profile] }, sha256: 'a'.repeat(64) };
+    const updateWebProfile = vi.fn(async (_hash: string | null, next: WebProfile) => ({ ...snapshot, document: { schemaVersion: 1 as const, profiles: [next] } }));
+    await boot({ getWebProfiles: vi.fn(async () => snapshot), updateWebProfile });
+    click('#nav-web');
+    const download = document.querySelector<HTMLInputElement>(`input[data-web-profile="${profile.id}"][data-web-permission="download"]`);
+    if (download === null) throw new Error('permiso de descarga no encontrado');
+    download.checked = true;
+    const assetLimit = document.querySelector<HTMLSelectElement>(`select[data-web-profile="${profile.id}"][data-web-limit="maxDownloadBytes"]`);
+    const totalLimit = document.querySelector<HTMLSelectElement>(`select[data-web-profile="${profile.id}"][data-web-limit="maxTotalDownloadBytes"]`);
+    if (assetLimit === null || totalLimit === null) throw new Error('cuotas web no encontradas');
+    expect([...assetLimit.options].map((option) => option.value)).toContain(String(1024 * 1024 * 1024));
+    assetLimit.value = String(100 * 1024 * 1024);
+    totalLimit.value = String(2 * 1024 * 1024 * 1024);
+    click(`[data-web-save="${profile.id}"]`);
+    await vi.waitFor(() => expect(updateWebProfile).toHaveBeenCalledWith('a'.repeat(64), expect.objectContaining({
+      permissions: { read: true, interact: true, download: true, humanControl: false },
+      limits: expect.objectContaining({ maxDownloadBytes: 100 * 1024 * 1024, maxTotalDownloadBytes: 2 * 1024 * 1024 * 1024 }),
+    })));
+  });
+
+  it('falla cerrado con registro corrupto y restablece usando el hash observado', async () => {
+    const corrupt = { state: 'corrupt' as const, document: { schemaVersion: 1 as const, profiles: [] }, sha256: 'f'.repeat(64) };
+    const resetWebProfiles = vi.fn(async () => ({ state: 'ready' as const, document: { schemaVersion: 1 as const, profiles: [] }, sha256: '1'.repeat(64) }));
+    await boot({ getWebProfiles: vi.fn(async () => corrupt), resetWebProfiles });
+    click('#nav-web');
+    expect(document.body.textContent).toContain('acceso está bloqueado');
+    expect(document.querySelector<HTMLButtonElement>('#add-public-web-profile')?.disabled).toBe(true);
+    click('#reset-web-profiles');
+    await vi.waitFor(() => expect(resetWebProfiles).toHaveBeenCalledWith('f'.repeat(64)));
+  });
+
+  it('muestra el handoff y entrega control únicamente desde la UI local', async () => {
+    const profile = webProfile({
+      kind: 'site-account', destinations: [{ hostname: 'example.com', includeSubdomains: true }],
+      permissions: { read: true, interact: true, download: false, humanControl: true },
+    });
+    const takeWebHumanControl = vi.fn(async () => undefined);
+    const listWebTabs = vi.fn(async () => [{ tabId: `webtab_${'d'.repeat(24)}`, title: 'Privado', url: 'https://example.com/private', state: 'ready' as const, openedAt: '2026-09-05T00:00:00.000Z' }]);
+    await boot({
+      getWebProfiles: vi.fn(async () => ({ state: 'ready' as const, document: { schemaVersion: 1 as const, profiles: [profile] }, sha256: 'a'.repeat(64) })),
+      listWebActivity: vi.fn(async () => [{
+        sessionId: `websession_${'b'.repeat(24)}`, webProfileId: profile.id, profileName: profile.name, profileKind: profile.kind,
+        state: 'running' as const, startedAt: '2026-09-05T00:00:00.000Z', controlState: 'waiting_for_human' as const, tabCount: 1,
+      }]),
+      listWebTabs,
+      takeWebHumanControl,
+    });
+    click('#nav-activity');
+    expect(document.body.textContent).toContain('ChatGPT pausado');
+    expect(document.body.textContent).not.toContain('Privado');
+    expect(listWebTabs).not.toHaveBeenCalled();
+    click(`[data-web-take="websession_${'b'.repeat(24)}"]`);
+    await vi.waitFor(() => expect(takeWebHumanControl).toHaveBeenCalledWith(`websession_${'b'.repeat(24)}`, undefined));
   });
 });
 
@@ -1321,6 +1847,10 @@ describe('renderer desktop — control humano y visor local', () => {
         sessionId,
         profile: 'dev', state: 'running' as const, title: 'App', path: '/video',
         startedAt: '2026-08-25T00:00:00.000Z', controlState: 'agent_control' as const,
+        ...(liveViewerSessionId === undefined ? {} : { viewerPresentation: {
+          mode: 'fit' as const, renderWidth: 1920, renderHeight: 1080,
+          viewWidth: 1536, viewHeight: 864, scale: 0.8, panX: 0, panY: 0,
+        } }),
       }],
     }));
     const showBrowserLiveViewer = vi.fn(async (_sessionId: string, displayId?: string) => {
@@ -1329,12 +1859,14 @@ describe('renderer desktop — control humano y visor local', () => {
     });
     const moveBrowserLiveViewer = vi.fn(async (_sessionId: string, displayId: string) => { liveViewerDisplayId = displayId; });
     const hideBrowserLiveViewer = vi.fn(async () => { liveViewerSessionId = undefined; });
+    const setBrowserLiveViewerPresentation = vi.fn(async () => undefined);
     const api = await boot({
       listWorkspaces: vi.fn(async () => [project]),
       listDevelopmentActivity,
       showBrowserLiveViewer,
       moveBrowserLiveViewer,
       hideBrowserLiveViewer,
+      setBrowserLiveViewerPresentation,
     });
     click('#nav-activity');
     await vi.waitFor(() => expect(document.querySelector('[data-show-live-browser]')).not.toBeNull());
@@ -1342,11 +1874,15 @@ describe('renderer desktop — control humano y visor local', () => {
     setValue('[data-live-display]', '202');
     document.querySelector<HTMLSelectElement>('[data-live-display]')?.dispatchEvent(new Event('change', { bubbles: true }));
     click('[data-show-live-browser]');
-    await vi.waitFor(() => expect(showBrowserLiveViewer).toHaveBeenCalledWith(sessionId, '202'));
+    await vi.waitFor(() => expect(showBrowserLiveViewer).toHaveBeenCalledWith(sessionId, '202', 'fit'));
     await vi.waitFor(() => expect(document.body.textContent).toContain('ventana en vivo abierta'));
     expect(api.captureBrowserViewer).not.toHaveBeenCalled();
     expect(document.querySelector('[data-view-browser]')).toBeNull();
     expect(window.localStorage.getItem('localbridge.liveViewerDisplayId')).toBe('202');
+    await vi.waitFor(() => expect(document.body.textContent).toContain('Render 1920×1080 · visible 1536×864 · 80%'));
+    click('[data-viewer-presentation="browser"][data-mode="actual"]');
+    await vi.waitFor(() => expect(setBrowserLiveViewerPresentation).toHaveBeenCalledWith(sessionId, 'actual', 0, 0));
+    expect(window.localStorage.getItem('localbridge.liveViewerPresentationMode')).toBe('actual');
 
     setValue('[data-live-display]', '101');
     document.querySelector<HTMLSelectElement>('[data-live-display]')?.dispatchEvent(new Event('change', { bubbles: true }));
@@ -1380,7 +1916,7 @@ describe('renderer desktop — control humano y visor local', () => {
     click('[data-view-browser]');
     await vi.waitFor(() => expect(captureBrowserViewer).toHaveBeenCalledTimes(1));
     click('[data-show-live-browser]');
-    await vi.waitFor(() => expect(api.showBrowserLiveViewer).toHaveBeenCalledWith(sessionId, undefined));
+    await vi.waitFor(() => expect(api.showBrowserLiveViewer).toHaveBeenCalledWith(sessionId, undefined, 'fit'));
     await vi.waitFor(() => expect(document.querySelector('.browser-viewer-backdrop')).toBeNull());
     await vi.advanceTimersByTimeAsync(2_000);
     expect(captureBrowserViewer).toHaveBeenCalledTimes(1);

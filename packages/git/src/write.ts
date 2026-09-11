@@ -19,7 +19,7 @@ import os from "node:os";
 import path from "node:path";
 
 import { LocalBridgeError } from "@localbridge/shared";
-import { isPathDenied, resolveSafePath, type AuthorizedWorkspace } from "@localbridge/workspace";
+import { isPathDenied, resolveWriteTarget, type AuthorizedWorkspace } from "@localbridge/workspace";
 
 import { resolveGitContext, toGitPathspec } from "./context.js";
 import { runGit, runGitChecked } from "./runner.js";
@@ -28,6 +28,8 @@ export interface StageResult {
   readonly staged: readonly string[];
 }
 
+const MAX_MANAGED_GIT_ASSET_BYTES = 1024 * 1024 * 1024;
+
 /**
  * Valida cada ruta contra el mismo sandbox que `file.read` (existe, dentro del
  * workspace, sin symlink de escape) y contra la denylist de secretos, antes de
@@ -35,26 +37,42 @@ export interface StageResult {
  * workspace autorizado o meter en el índice un archivo que el resto del
  * sistema trata como secreto (`.env`, claves, etc.).
  */
-export async function stageFiles(workspace: AuthorizedWorkspace, paths: readonly string[]): Promise<StageResult> {
+export interface GitMutationOptions {
+  readonly withAuthorizedEffect?: <T>(effect: () => Promise<T>) => Promise<T>;
+}
+
+function runAuthorizedEffect<T>(options: GitMutationOptions, effect: () => Promise<T>): Promise<T> {
+  return options.withAuthorizedEffect?.(effect) ?? effect();
+}
+
+export async function stageFiles(
+  workspace: AuthorizedWorkspace,
+  paths: readonly string[],
+  options: GitMutationOptions = {},
+): Promise<StageResult> {
   if (paths.length === 0) {
     throw new LocalBridgeError("INVALID_INPUT", { reason: "empty paths" });
   }
 
+  const context = await resolveGitContext(workspace);
+  const existingPaths = new Set<string>();
   await Promise.all(paths.map(async (relativePath) => {
     if (isPathDenied(relativePath, workspace.denyPatterns)) {
       throw new LocalBridgeError("PATH_DENIED", { path: relativePath });
     }
-    const safe = await resolveSafePath(workspace.rootPath, relativePath);
-    if (!safe.exists) {
-      throw new LocalBridgeError("FILE_NOT_FOUND", { path: relativePath });
+    const target = await resolveWriteTarget(workspace.rootPath, relativePath, { createParentDirs: false });
+    if (!target.exists) {
+      const tracked = await runGit(["ls-files", "--error-unmatch", "--", toGitPathspec(relativePath)], { cwd: context.cwd });
+      if (tracked.exitCode !== 0) throw new LocalBridgeError("FILE_NOT_FOUND", { path: relativePath });
+      return;
     }
-    const stats = await stat(safe.realPath);
-    if (!stats.isFile()) throw new LocalBridgeError("NOT_A_FILE", { path: relativePath });
-    if (stats.size > workspace.limits.maxFileBytes) throw new LocalBridgeError("FILE_TOO_LARGE", { path: relativePath });
+    if (target.type !== "file") throw new LocalBridgeError("NOT_A_FILE", { path: relativePath });
+    const stats = await stat(path.join(target.realParentDir, target.basename));
+    if (stats.size > MAX_MANAGED_GIT_ASSET_BYTES) throw new LocalBridgeError("FILE_TOO_LARGE", { path: relativePath });
+    existingPaths.add(relativePath);
   }));
 
-  const context = await resolveGitContext(workspace);
-  await Promise.all(paths.map(async (relativePath) => {
+  await Promise.all([...existingPaths].map(async (relativePath) => {
     // Un clean filter puede ejecutar un programa durante `git add`. Se rechaza
     // cualquier path con atributo `filter`; LocalBridge nunca ejecuta filtros
     // definidos por el repositorio de forma implícita.
@@ -65,7 +83,7 @@ export async function stageFiles(workspace: AuthorizedWorkspace, paths: readonly
     }
   }));
   const pathspecs = paths.map(toGitPathspec);
-  await runGitChecked(["add", "--", ...pathspecs], { cwd: context.cwd });
+  await runAuthorizedEffect(options, () => runGitChecked(["add", "--", ...pathspecs], { cwd: context.cwd }));
 
   return { staged: [...paths] };
 }
@@ -76,7 +94,7 @@ export interface CommitResult {
 
 export interface CommitSnapshot {
   readonly treeHash: string;
-  readonly parentHash: string;
+  readonly parentHash?: string;
   readonly branchRef: string;
 }
 
@@ -93,19 +111,25 @@ export async function getCommitSnapshot(workspace: AuthorizedWorkspace): Promise
 
   const [tree, parent, branch] = await Promise.all([
     runGitChecked(["write-tree"], { cwd: context.cwd }),
-    runGitChecked(["rev-parse", "HEAD"], { cwd: context.cwd }),
+    runGit(["rev-parse", "--verify", "HEAD"], { cwd: context.cwd }),
     runGit(["symbolic-ref", "--quiet", "HEAD"], { cwd: context.cwd }),
   ]);
   if (branch.exitCode !== 0) {
     throw new LocalBridgeError("INVALID_INPUT", { reason: "detached HEAD" });
   }
 
-  const snapshot = {
+  const branchRef = branch.stdout.trim();
+  const parentHash = parent.exitCode === 0 ? parent.stdout.trim() : undefined;
+  if (parentHash === undefined) {
+    const branchExists = await runGit(["show-ref", "--verify", "--quiet", branchRef], { cwd: context.cwd });
+    if (branchExists.exitCode !== 1) throw new LocalBridgeError("INTERNAL_ERROR");
+  }
+  const snapshot: CommitSnapshot = {
     treeHash: tree.stdout.trim(),
-    parentHash: parent.stdout.trim(),
-    branchRef: branch.stdout.trim(),
+    ...(parentHash === undefined ? {} : { parentHash }),
+    branchRef,
   };
-  if (!isObjectId(snapshot.treeHash) || !isObjectId(snapshot.parentHash) || !snapshot.branchRef.startsWith("refs/heads/")) {
+  if (!isObjectId(snapshot.treeHash) || (snapshot.parentHash !== undefined && !isObjectId(snapshot.parentHash)) || !snapshot.branchRef.startsWith("refs/heads/")) {
     throw new LocalBridgeError("INTERNAL_ERROR");
   }
   return snapshot;
@@ -120,29 +144,34 @@ export async function commitStaged(
   workspace: AuthorizedWorkspace,
   message: string,
   snapshot: CommitSnapshot,
+  options: GitMutationOptions = {},
 ): Promise<CommitResult> {
   const context = await resolveGitContext(workspace);
   requireRepositoryRoot(context.prefix);
-  await validateCommitSnapshot(context.cwd, snapshot);
+  return runAuthorizedEffect(options, async () => {
+    // La revalidación, la creación del objeto y el compare-and-swap de la rama
+    // comparten la misma sección de autoridad. Una revocación no puede quedar
+    // intercalada dejando un objeto nuevo después de haber devuelto éxito local.
+    await validateCommitSnapshot(context.cwd, snapshot);
+    const commit = await runGitChecked(
+      ["-c", `core.hooksPath=${DISABLED_HOOKS_PATH}`, "-c", "commit.gpgSign=false", "commit-tree", snapshot.treeHash, ...(snapshot.parentHash === undefined ? [] : ["-p", snapshot.parentHash]), "-m", message],
+      { cwd: context.cwd },
+    );
+    const commitHash = commit.stdout.trim();
+    if (!isObjectId(commitHash)) {
+      throw new LocalBridgeError("INTERNAL_ERROR");
+    }
 
-  const commit = await runGitChecked(
-    ["-c", `core.hooksPath=${DISABLED_HOOKS_PATH}`, "-c", "commit.gpgSign=false", "commit-tree", snapshot.treeHash, "-p", snapshot.parentHash, "-m", message],
-    { cwd: context.cwd },
-  );
-  const commitHash = commit.stdout.trim();
-  if (!isObjectId(commitHash)) {
-    throw new LocalBridgeError("INTERNAL_ERROR");
-  }
-
-  const update = await runGit(
-    ["-c", `core.hooksPath=${DISABLED_HOOKS_PATH}`, "update-ref", snapshot.branchRef, commitHash, snapshot.parentHash],
-    { cwd: context.cwd },
-  );
-  if (update.exitCode !== 0) {
-    throw new LocalBridgeError("APPROVAL_INVALID", { reason: "branch changed after approval" });
-  }
-
-  return { commitHash };
+    const expectedOld = snapshot.parentHash ?? "0".repeat(commitHash.length);
+    const update = await runGit(
+      ["-c", `core.hooksPath=${DISABLED_HOOKS_PATH}`, "update-ref", snapshot.branchRef, commitHash, expectedOld],
+      { cwd: context.cwd },
+    );
+    if (update.exitCode !== 0) {
+      throw new LocalBridgeError("APPROVAL_INVALID", { reason: "branch changed after approval" });
+    }
+    return { commitHash };
+  });
 }
 
 export interface PushResult {
@@ -181,6 +210,7 @@ export interface PushSnapshot {
 }
 
 const PUSH_PREVIEW_MAX_COMMITS = 20;
+const GIT_REMOTE_TIMEOUT_MS = 120_000;
 const PREVIEW_FIELD_SEPARATOR = String.fromCharCode(31);
 const PREVIEW_RECORD_SEPARATOR = String.fromCharCode(30);
 
@@ -290,7 +320,11 @@ export async function getPushSnapshot(
  * etc.) es `GIT_PUSH_REJECTED` — un resultado operativo esperado, no un fallo
  * interno — nunca se reintenta con `--force` automáticamente.
  */
-export async function pushCommits(workspace: AuthorizedWorkspace, snapshot: PushSnapshot): Promise<PushResult> {
+export async function pushCommits(
+  workspace: AuthorizedWorkspace,
+  snapshot: PushSnapshot,
+  options: GitMutationOptions = {},
+): Promise<PushResult> {
   const context = await resolveGitContext(workspace);
   requireRepositoryRoot(context.prefix);
   validateRemoteName(snapshot.remote);
@@ -312,40 +346,48 @@ export async function pushCommits(workspace: AuthorizedWorkspace, snapshot: Push
     "-c", "credential.helper=",
     ...helpers.flatMap((helper) => ["-c", `credential.helper=${helper}`]),
   ];
-  const remoteBefore = await readRemoteHead(context.cwd, remoteConfigArgs, snapshot);
-  const alreadyUpToDate = remoteBefore.reachable && remoteBefore.hash === snapshot.headHash;
+  return runAuthorizedEffect(options, async () => {
+    const remoteBefore = await readRemoteHead(context.cwd, remoteConfigArgs, snapshot);
+    const alreadyUpToDate = remoteBefore.reachable && remoteBefore.hash === snapshot.headHash;
+    let result: Awaited<ReturnType<typeof runGit>> | undefined;
+    let timedOut = false;
 
-  if (!alreadyUpToDate) {
-    const result = await runGit(
-      [...remoteConfigArgs, "push", "--no-verify", snapshot.remoteUrl, `${snapshot.headHash}:refs/heads/${snapshot.branch}`],
-      { cwd: context.cwd },
-    );
+    if (!alreadyUpToDate) {
+      try {
+        result = await runGit(
+          [...remoteConfigArgs, "push", "--no-verify", snapshot.remoteUrl, `${snapshot.headHash}:refs/heads/${snapshot.branch}`],
+          { cwd: context.cwd, timeoutMs: GIT_REMOTE_TIMEOUT_MS },
+        );
+      } catch (error) {
+        if (!(error instanceof LocalBridgeError) || error.code !== "TIMEOUT") throw error;
+        timedOut = true;
+      }
+    }
 
-    if (result.exitCode !== 0) {
-      if (/not a git repository|no está en un repositorio|unsafe repository/i.test(result.stderr)) {
+    // Se hace read-back también después de exit no-cero: el transporte puede
+    // cortar la respuesta después de que el remoto ya aceptó la referencia.
+    const remoteAfter = alreadyUpToDate ? remoteBefore : await readRemoteHead(context.cwd, remoteConfigArgs, snapshot);
+    const remoteVerified = remoteAfter.reachable && remoteAfter.hash === snapshot.headHash;
+    if (!remoteVerified) {
+      if (result !== undefined && /not a git repository|no está en un repositorio|unsafe repository/i.test(result.stderr)) {
         throw new LocalBridgeError("GIT_NOT_REPOSITORY");
       }
-      throw new LocalBridgeError("GIT_PUSH_REJECTED", { exitCode: result.exitCode });
+      if (result !== undefined && result.exitCode !== 0 && remoteAfter.reachable) {
+        throw new LocalBridgeError("GIT_PUSH_REJECTED", { exitCode: result.exitCode });
+      }
+      throw new LocalBridgeError("GIT_PUSH_UNCERTAIN", { timedOut });
     }
-  }
 
-  // `git push <URL>` preserva el destino exacto aprobado, pero Git no refresca
-  // `refs/remotes/origin/*`. Se verifica por read-back y solo entonces se
-  // sincroniza la referencia local mediante CAS; una carrera nunca se pisa.
-  const remoteAfter = alreadyUpToDate ? remoteBefore : await readRemoteHead(context.cwd, remoteConfigArgs, snapshot);
-  const remoteVerified = remoteAfter.reachable && remoteAfter.hash === snapshot.headHash;
-  const localTrackingSynchronized = remoteVerified
-    ? await synchronizeLocalTrackingRef(context.cwd, snapshot)
-    : false;
-
-  return {
-    status: alreadyUpToDate ? "up_to_date" : "pushed",
-    commitHash: snapshot.headHash,
-    remote: snapshot.remote,
-    branch: snapshot.branch,
-    remoteVerified,
-    localTrackingSynchronized,
-  };
+    const localTrackingSynchronized = await synchronizeLocalTrackingRef(context.cwd, snapshot);
+    return {
+      status: alreadyUpToDate ? "up_to_date" : "pushed",
+      commitHash: snapshot.headHash,
+      remote: snapshot.remote,
+      branch: snapshot.branch,
+      remoteVerified,
+      localTrackingSynchronized,
+    };
+  });
 }
 
 const DISABLED_HOOKS_PATH = path.join(os.tmpdir(), `localbridge-disabled-hooks-${randomUUID()}`);
@@ -409,7 +451,7 @@ async function readRemoteHead(
   const expectedRef = `refs/heads/${snapshot.branch}`;
   let result: Awaited<ReturnType<typeof runGit>>;
   try {
-    result = await runGit([...remoteConfigArgs, "ls-remote", snapshot.remoteUrl, expectedRef], { cwd });
+    result = await runGit([...remoteConfigArgs, "ls-remote", snapshot.remoteUrl, expectedRef], { cwd, timeoutMs: GIT_REMOTE_TIMEOUT_MS });
   } catch {
     // El read-back es evidencia adicional. Si falla antes del push se intenta
     // la operación normal; si falla después, no se convierte un push ya
@@ -455,7 +497,7 @@ async function synchronizeLocalTrackingRef(cwd: string, snapshot: PushSnapshot):
 }
 
 async function validateCommitSnapshot(cwd: string, snapshot: CommitSnapshot): Promise<void> {
-  if (!isObjectId(snapshot.treeHash) || !isObjectId(snapshot.parentHash) || !snapshot.branchRef.startsWith("refs/heads/")) {
+  if (!isObjectId(snapshot.treeHash) || (snapshot.parentHash !== undefined && !isObjectId(snapshot.parentHash)) || !snapshot.branchRef.startsWith("refs/heads/")) {
     throw new LocalBridgeError("INVALID_INPUT", { reason: "invalid commit snapshot" });
   }
   await validateBranch(cwd, snapshot.branchRef.slice("refs/heads/".length));

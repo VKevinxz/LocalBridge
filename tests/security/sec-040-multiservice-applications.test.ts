@@ -154,10 +154,10 @@ describe('SEC-047 — referencias cruzadas fallan cerradas', () => {
       createdAt: '2026-08-24T00:00:00.000Z', updatedAt: '2026-08-24T00:00:00.000Z',
     };
     expect(registryFileSchema.safeParse({
-      schemaVersion: 4, workspaces: [frontend], applications: [application],
+      schemaVersion: 5, workspaces: [frontend], applications: [application],
     }).success).toBe(false);
     expect(registryFileSchema.safeParse({
-      schemaVersion: 4, workspaces: [frontend, workspace('ws_api')],
+      schemaVersion: 5, workspaces: [frontend, workspace('ws_api')],
       applications: [{ ...application, services: [{ ...application.services[0], workspaceId: 'ws_api', processProfile: 'missing' }] }],
     }).success).toBe(false);
   });

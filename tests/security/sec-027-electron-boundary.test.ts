@@ -39,6 +39,7 @@ describe('SEC-027 — frontera privilegiada de Electron', () => {
     expect(vite).toContain("entryFileNames: 'index.cjs'");
     expect(vite).toContain("format: 'cjs'");
     expect(main).toContain('app.requestSingleInstanceLock()');
+    expect(main).toContain('app.exit(0)');
     expect(main).toContain('app.on("second-instance", showMainWindow)');
   });
 
@@ -48,9 +49,13 @@ describe('SEC-027 — frontera privilegiada de Electron', () => {
 
     expect(workflow).toContain('./scripts/smoke-packaged-desktop.ps1');
     expect(smoke).toContain('MainWindowHandle -ne 0');
+    expect(smoke).toContain("MainWindowTitle -notmatch '^LocalBridge MCP . Escritorio$'");
     expect(smoke).toContain("throw 'A second launch created another desktop instance.'");
     expect(smoke).toContain('Uncaught TypeError|Unable to load preload script');
     expect(smoke).toContain('Refusing to reuse or stop');
+    expect(smoke).toContain('$env:USERPROFILE = $userProfilePath');
+    expect(smoke).toContain('verify-packaged-first-run.mjs');
+    expect(smoke).toContain('did not exit through app:quit');
   });
 
   it('no hereda el entorno completo al proceso de túnel', async () => {
@@ -78,6 +83,7 @@ describe('SEC-027 — frontera privilegiada de Electron', () => {
     expect(main).not.toContain('ELECTRON_RUN_AS_NODE');
     expect(builder).toContain('from: out/server');
     expect(builder).toContain('from: vendor/node');
+    expect(builder).toContain('!node_modules/@localbridge/**/*');
   });
 
   it('mantiene una CSP cerrada para scripts, objetos y frames', async () => {

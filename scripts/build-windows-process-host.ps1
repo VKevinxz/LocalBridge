@@ -3,6 +3,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
 Set-StrictMode -Version Latest
 
 $ZigVersion = '0.16.0'
@@ -33,11 +34,13 @@ if (-not (Test-Path -LiteralPath $ZigBinary -PathType Leaf)) {
   $ExtractRoot = Join-Path $TempRoot 'extract'
   New-Item -ItemType Directory -Path $ExtractRoot -Force | Out-Null
   try {
+    Write-Host "Descargando Zig $ZigVersion para el build nativo..."
     Invoke-WebRequest -Uri $ZigUrl -OutFile $ZipPath
     $ActualHash = Get-Sha256Hex $ZipPath
     if ($ActualHash -ne $ZigSha256) {
       throw "El SHA-256 de Zig no coincide: $ActualHash"
     }
+    Write-Host 'SHA-256 de Zig verificado; extrayendo el compilador...'
     Expand-Archive -LiteralPath $ZipPath -DestinationPath $ExtractRoot
     $Extracted = Join-Path $ExtractRoot "zig-x86_64-windows-$ZigVersion"
     if (-not (Test-Path -LiteralPath (Join-Path $Extracted 'zig.exe') -PathType Leaf)) {
@@ -63,6 +66,7 @@ if (-not (Test-Path -LiteralPath $ZigBinary -PathType Leaf)) {
 
 New-Item -ItemType Directory -Path $ResolvedDestination -Force | Out-Null
 $Output = Join-Path $ResolvedDestination 'localbridge-process-host.exe'
+Write-Host 'Compilando el proceso host de Windows...'
 & $ZigBinary cc $Source -target x86_64-windows-gnu -O2 -s -municode '-Wl,--subsystem,console' -liphlpapi -lws2_32 -o $Output
 if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $Output -PathType Leaf)) {
   throw 'No se pudo compilar localbridge-process-host.exe.'

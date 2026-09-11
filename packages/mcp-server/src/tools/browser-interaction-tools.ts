@@ -20,6 +20,21 @@ const outputSchema = z.object({
   applied: z.literal(true),
   snapshotInvalidated: z.literal(true),
 });
+const conditionSchema = z.discriminatedUnion('kind', [
+  z.object({ kind: z.literal('path'), value: z.string().min(1).max(2048), operator: z.enum(['equals', 'contains']).default('equals') }).strict(),
+  z.object({ kind: z.literal('title'), value: z.string().min(1).max(256), operator: z.enum(['equals', 'contains']).default('equals') }).strict(),
+  z.object({ kind: z.literal('text'), value: z.string().min(1).max(512), state: z.enum(['present', 'absent']).default('present') }).strict(),
+  z.object({ kind: z.literal('element'), snapshotId: baseInput.snapshotId, elementRef: baseInput.elementRef, state: z.enum(['attached', 'visible', 'enabled', 'checked', 'selected']), expected: z.boolean().default(true) }).strict(),
+  z.object({ kind: z.literal('response'), path: z.string().min(1).max(2048).regex(/^\/(?!\/)/), status: z.number().int().min(100).max(599).optional(), afterCursor: z.number().int().nonnegative().default(0) }).strict(),
+  z.object({ kind: z.literal('no-console-errors'), afterCursor: z.number().int().nonnegative().default(0) }).strict(),
+  z.object({ kind: z.literal('dialog'), state: z.enum(['open', 'closed']) }).strict(),
+]);
+const conditionOutputSchema = z.object({
+  sessionId: baseInput.sessionId,
+  satisfied: z.literal(true),
+  conditionKind: z.enum(['path', 'title', 'text', 'element', 'response', 'no-console-errors', 'dialog']),
+  waitedMs: z.number().int().nonnegative().optional(),
+}).strict();
 
 function client(ctx: ToolContext) {
   if (ctx.developmentClient === undefined) throw new LocalBridgeError('FEATURE_UNAVAILABLE');
@@ -39,6 +54,10 @@ async function requireInteraction(ctx: ToolContext, workspaceId: string): Promis
   await requireAuthorizedWorkspace(ctx.workspaceConfigPath, ctx.logger, workspaceId, 'browserInteract');
 }
 
+async function requireRead(ctx: ToolContext, workspaceId: string): Promise<void> {
+  await requireAuthorizedWorkspace(ctx.workspaceConfigPath, ctx.logger, workspaceId, 'browserRead');
+}
+
 function audit(ctx: ToolContext, tool: string, workspaceId: string, elementRef: string, operationId?: string) {
   return {
     dbPath: ctx.config.auditDbPath,
@@ -55,7 +74,7 @@ export function registerBrowserClickTool(server: McpServer, ctx: ToolContext): v
   server.registerTool('browser.click', {
     title: 'Click an element from the current snapshot',
     description: 'Clicks only an opaque element reference issued by the current accessibility snapshot. CSS/XPath selectors and coordinates are not accepted. The snapshot is invalidated after the action. Requires browserRead and browserInteract.',
-    inputSchema: z.object(baseInput),
+    inputSchema: z.object(baseInput).strict(),
     outputSchema,
     annotations: { readOnlyHint: false, idempotentHint: true, destructiveHint: false, openWorldHint: false },
   }, async ({ workspaceId, sessionId, snapshotId, elementRef, operationId }) => {
@@ -74,7 +93,7 @@ export function registerBrowserFillTool(server: McpServer, ctx: ToolContext): vo
   server.registerTool('browser.fill', {
     title: 'Fill a non-sensitive field from the current snapshot',
     description: 'Replaces text in an approved non-sensitive field referenced by the current snapshot. Password, file, hidden, token, payment and one-time-code fields are rejected. Text is never recorded in LocalBridge audit logs. Requires browserRead and browserInteract.',
-    inputSchema: z.object({ ...baseInput, text: z.string().max(8192) }),
+    inputSchema: z.object({ ...baseInput, text: z.string().max(8192) }).strict(),
     outputSchema,
     annotations: { readOnlyHint: false, idempotentHint: true, destructiveHint: false, openWorldHint: false },
   }, async ({ workspaceId, sessionId, snapshotId, elementRef, text, operationId }) => {
@@ -93,7 +112,7 @@ export function registerBrowserPressTool(server: McpServer, ctx: ToolContext): v
   server.registerTool('browser.press', {
     title: 'Press an allowed key on a snapshot element',
     description: 'Focuses an opaque snapshot element and presses one key from a fixed allowlist. Arbitrary key sequences and shortcuts are not accepted. Requires browserRead and browserInteract.',
-    inputSchema: z.object({ ...baseInput, key: z.enum(['Enter', 'Escape', 'Tab', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight']) }),
+    inputSchema: z.object({ ...baseInput, key: z.enum(['Enter', 'Escape', 'Tab', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight']) }).strict(),
     outputSchema,
     annotations: { readOnlyHint: false, idempotentHint: true, destructiveHint: false, openWorldHint: false },
   }, async ({ workspaceId, sessionId, snapshotId, elementRef, key, operationId }) => {
@@ -105,5 +124,123 @@ export function registerBrowserPressTool(server: McpServer, ctx: ToolContext): v
     } catch (error) {
       return toolError(mapBrokerError(error), ctx.logger, { tool: 'browser.press', workspaceId, sessionId, elementRef }, auditBase);
     }
+  });
+}
+
+export function registerBrowserAssertTool(server: McpServer, ctx: ToolContext): void {
+  server.registerTool('browser.assert', {
+    title: 'Assert a typed browser condition',
+    description: 'Checks a bounded path, title, accessible text, opaque element state, observed response, console-error absence or dialog state. It never accepts JavaScript or selectors. Requires browserRead.',
+    inputSchema: z.object({ workspaceId: baseInput.workspaceId, sessionId: baseInput.sessionId, condition: conditionSchema }).strict(),
+    outputSchema: conditionOutputSchema,
+    annotations: { readOnlyHint: true, idempotentHint: true, destructiveHint: false, openWorldHint: false },
+  }, async ({ workspaceId, sessionId, condition }) => {
+    const auditBase = audit(ctx, 'browser.assert', workspaceId, sessionId);
+    try {
+      await requireRead(ctx, workspaceId);
+      const result = await client(ctx).call('browser.assert', { workspaceId, sessionId, condition });
+      return toolSuccess(conditionOutputSchema.parse(result), { context: auditBase, logger: ctx.logger });
+    } catch (error) {
+      return toolError(mapBrokerError(error), ctx.logger, { tool: 'browser.assert', workspaceId, sessionId }, auditBase);
+    }
+  });
+}
+
+export function registerBrowserWaitTool(server: McpServer, ctx: ToolContext): void {
+  server.registerTool('browser.wait', {
+    title: 'Wait for a typed browser condition',
+    description: 'Waits up to 30 seconds for a bounded typed condition. It never accepts JavaScript or selectors and returns TIMEOUT when unmet. Keep the 5 second default unless the condition is known to be immediate; a 1 second wait is usually too short for a page transition. Requires browserRead.',
+    inputSchema: z.object({ workspaceId: baseInput.workspaceId, sessionId: baseInput.sessionId, condition: conditionSchema, timeoutMs: z.number().int().min(100).max(30_000).default(5_000) }).strict(),
+    outputSchema: conditionOutputSchema,
+    annotations: { readOnlyHint: true, idempotentHint: true, destructiveHint: false, openWorldHint: false },
+  }, async ({ workspaceId, sessionId, condition, timeoutMs }) => {
+    const auditBase = audit(ctx, 'browser.wait', workspaceId, sessionId);
+    try {
+      await requireRead(ctx, workspaceId);
+      const result = await client(ctx).call('browser.wait', { workspaceId, sessionId, condition, timeoutMs });
+      return toolSuccess(conditionOutputSchema.parse(result), { context: auditBase, logger: ctx.logger });
+    } catch (error) {
+      return toolError(mapBrokerError(error), ctx.logger, { tool: 'browser.wait', workspaceId, sessionId }, auditBase);
+    }
+  });
+}
+
+export function registerBrowserHoverTool(server: McpServer, ctx: ToolContext): void {
+  server.registerTool('browser.hover', {
+    title: 'Hover a visible snapshot element',
+    description: 'Moves the pointer to the visible center of an opaque element reference after hit testing. Requires browserRead and browserInteract.',
+    inputSchema: z.object(baseInput).strict(), outputSchema,
+    annotations: { readOnlyHint: false, idempotentHint: true, destructiveHint: false, openWorldHint: false },
+  }, async ({ workspaceId, sessionId, snapshotId, elementRef, operationId }) => {
+    const auditBase = audit(ctx, 'browser.hover', workspaceId, elementRef, operationId);
+    try {
+      await requireInteraction(ctx, workspaceId);
+      const result = await client(ctx).call('browser.hover', { workspaceId, sessionId, snapshotId, elementRef, operationId });
+      return toolSuccess(outputSchema.parse(result), { context: auditBase, logger: ctx.logger });
+    } catch (error) { return toolError(mapBrokerError(error), ctx.logger, { tool: 'browser.hover', workspaceId, sessionId, elementRef }, auditBase); }
+  });
+}
+
+export function registerBrowserScrollTool(server: McpServer, ctx: ToolContext): void {
+  server.registerTool('browser.scroll', {
+    title: 'Scroll the current browser viewport',
+    description: 'Scrolls the current document by a bounded amount in one direction. It accepts no coordinates or JavaScript. Requires browserRead and browserInteract.',
+    inputSchema: z.object({ workspaceId: baseInput.workspaceId, sessionId: baseInput.sessionId, direction: z.enum(['up', 'down', 'left', 'right']), amount: z.number().int().min(1).max(5000), operationId: baseInput.operationId }).strict(), outputSchema,
+    annotations: { readOnlyHint: false, idempotentHint: true, destructiveHint: false, openWorldHint: false },
+  }, async ({ workspaceId, sessionId, direction, amount, operationId }) => {
+    const auditBase = audit(ctx, 'browser.scroll', workspaceId, sessionId, operationId);
+    try {
+      await requireInteraction(ctx, workspaceId);
+      const result = await client(ctx).call('browser.scroll', { workspaceId, sessionId, direction, amount, operationId });
+      return toolSuccess(outputSchema.parse(result), { context: auditBase, logger: ctx.logger });
+    } catch (error) { return toolError(mapBrokerError(error), ctx.logger, { tool: 'browser.scroll', workspaceId, sessionId }, auditBase); }
+  });
+}
+
+export function registerBrowserSelectTool(server: McpServer, ctx: ToolContext): void {
+  server.registerTool('browser.select', {
+    title: 'Choose an option from a snapshot select',
+    description: 'Chooses one bounded value in an opaque select reference and dispatches input/change. Selectors and JavaScript are not accepted. Requires browserRead and browserInteract.',
+    inputSchema: z.object({ ...baseInput, value: z.string().max(1024) }).strict(), outputSchema,
+    annotations: { readOnlyHint: false, idempotentHint: true, destructiveHint: false, openWorldHint: false },
+  }, async ({ workspaceId, sessionId, snapshotId, elementRef, value, operationId }) => {
+    const auditBase = audit(ctx, 'browser.select', workspaceId, elementRef, operationId);
+    try {
+      await requireInteraction(ctx, workspaceId);
+      const result = await client(ctx).call('browser.select', { workspaceId, sessionId, snapshotId, elementRef, value, operationId });
+      return toolSuccess(outputSchema.parse(result), { context: auditBase, logger: ctx.logger });
+    } catch (error) { return toolError(mapBrokerError(error), ctx.logger, { tool: 'browser.select', workspaceId, sessionId, elementRef }, auditBase); }
+  });
+}
+
+export function registerBrowserDragTool(server: McpServer, ctx: ToolContext): void {
+  server.registerTool('browser.drag', {
+    title: 'Drag between two snapshot elements',
+    description: 'Dispatches bounded pointer events between two visible hit-tested opaque references from the same snapshot. Requires browserRead and browserInteract.',
+    inputSchema: z.object({ ...baseInput, targetElementRef: baseInput.elementRef }).strict(), outputSchema,
+    annotations: { readOnlyHint: false, idempotentHint: true, destructiveHint: false, openWorldHint: false },
+  }, async ({ workspaceId, sessionId, snapshotId, elementRef, targetElementRef, operationId }) => {
+    const auditBase = audit(ctx, 'browser.drag', workspaceId, elementRef, operationId);
+    try {
+      await requireInteraction(ctx, workspaceId);
+      const result = await client(ctx).call('browser.drag', { workspaceId, sessionId, snapshotId, elementRef, targetElementRef, operationId });
+      return toolSuccess(outputSchema.parse(result), { context: auditBase, logger: ctx.logger });
+    } catch (error) { return toolError(mapBrokerError(error), ctx.logger, { tool: 'browser.drag', workspaceId, sessionId, elementRef }, auditBase); }
+  });
+}
+
+export function registerBrowserDialogTool(server: McpServer, ctx: ToolContext): void {
+  server.registerTool('browser.dialog', {
+    title: 'Accept or dismiss a JavaScript dialog',
+    description: 'Handles the currently open JavaScript alert/confirm dialog with a fixed accept or dismiss action. Prompt text is never supplied. Requires browserRead and browserInteract.',
+    inputSchema: z.object({ workspaceId: baseInput.workspaceId, sessionId: baseInput.sessionId, action: z.enum(['accept', 'dismiss']), operationId: baseInput.operationId }).strict(), outputSchema,
+    annotations: { readOnlyHint: false, idempotentHint: true, destructiveHint: false, openWorldHint: false },
+  }, async ({ workspaceId, sessionId, action, operationId }) => {
+    const auditBase = audit(ctx, 'browser.dialog', workspaceId, sessionId, operationId);
+    try {
+      await requireInteraction(ctx, workspaceId);
+      const result = await client(ctx).call('browser.dialog', { workspaceId, sessionId, action, operationId });
+      return toolSuccess(outputSchema.parse(result), { context: auditBase, logger: ctx.logger });
+    } catch (error) { return toolError(mapBrokerError(error), ctx.logger, { tool: 'browser.dialog', workspaceId, sessionId }, auditBase); }
   });
 }

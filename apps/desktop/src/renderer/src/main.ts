@@ -15,18 +15,23 @@ import type {
   TunnelStatus,
   WorkspaceReadinessReport,
   V1ProjectsState,
+  WebActivitySummary,
+  WebLiveViewerState,
+  WebTabActivitySummary,
+  WebProfile,
+  WebProfileStoreSnapshot,
 } from '../../preload/index.js';
 import { onboardingHtml as renderOnboardingHtml } from './onboarding.js';
 import type {
   AuthorizedWorkspace,
   BrowserProfile,
   LocalApplication,
+  LargeArtifactPolicy,
   ProcessProfile,
   WorkspacePermissions,
   SetupPolicy,
   ProjectTrustMode,
 } from '@localbridge/workspace';
-
 const PERMISSION_KEYS: Array<keyof WorkspacePermissions> = [
   'read',
   'write',
@@ -83,11 +88,21 @@ const TUNNEL_STATUS_LABELS: Record<TunnelStatus, string> = {
 };
 const TUNNEL_ID_PATTERN = /^tunnel_[0-9a-f]{32}$/;
 
+function isInterventionControlState(state: string): boolean {
+  return ['waiting_for_human', 'human_control', 'returning_to_agent'].includes(state);
+}
+
+function interventionControlPriority(state: string): number {
+  return isInterventionControlState(state) ? 0 : 1;
+}
+
 interface WorkspaceFormDraft {
   name: string;
   rootPath: string;
   enabled: boolean;
   permissions: WorkspacePermissions;
+  maxFileBytes: number;
+  largeArtifacts: LargeArtifactPolicy;
   validationProfilesText: string;
   processProfilesText: string;
   browserProfilesText: string;
@@ -98,7 +113,9 @@ interface UiFeedback {
   readonly message: string;
 }
 
-type AppSection = 'home' | 'assisted' | 'projects' | 'applications' | 'activity' | 'connection' | 'settings';
+type AppSection = 'home' | 'web' | 'assisted' | 'projects' | 'applications' | 'activity' | 'connection' | 'settings';
+type ActivityFilter = 'all' | 'browsers' | 'resources';
+type BrowserActivityGroup = 'all' | 'attention' | 'regular';
 type WorkspaceFormTab = 'general' | 'access' | 'services' | 'advanced';
 
 type AccessObjective = 'review' | 'edit' | 'web' | 'complete';
@@ -165,7 +182,10 @@ let settings: DesktopSettings = {
   onboardingStep: 0,
   onboardingCompleted: false,
   minimizeToTray: true,
-  gitApprovalMode: 'mrtr',
+  largeArtifactPreference: {
+    mode: 'standard', reserve: { minimumFreeBytes: 1024 * 1024 * 1024, minimumFreePercent: 10 }, maxConcurrentJobs: 1,
+  },
+  gitApprovalMode: 'host',
   activeConnectionProfileId: 'profile_default0',
   connectionProfiles: [{ id: 'profile_default0', name: 'Personal', tunnelId: '' }],
   tunnelId: '',
@@ -175,6 +195,7 @@ let settings: DesktopSettings = {
   serverCwd: '',
 };
 let settingsDraft: DesktopSettings = { ...settings };
+let effectiveGitApprovalMode: DesktopSettings['gitApprovalMode'] | undefined;
 let runtimeInfo: BundledRuntimePaths | undefined;
 let apiKeyDraft = '';
 let storedApiKey = '';
@@ -194,15 +215,24 @@ let isInitializing = true;
 let lastProblem: string | undefined;
 let workspaceReports: Record<string, WorkspaceReadinessReport> = {};
 let auditEvents: AuditEvent[] = [];
+let documentAuditEvents: AuditEvent[] = [];
 let auditVisibleCount = 20;
 let pendingApprovals: PendingApproval[] = [];
 let pendingApprovalExpiryTimer: number | undefined;
 let auditLoading = false;
-let developmentActivity: DevelopmentActivity = { processes: [], browsers: [], applications: [], terminals: [] };
+let developmentActivity: DevelopmentActivity = { processes: [], browsers: [], applications: [], terminals: [], jobs: [] };
+let webProfiles: WebProfileStoreSnapshot = { state: 'missing', document: { schemaVersion: 1, profiles: [] }, sha256: null };
+let webActivity: readonly WebActivitySummary[] = [];
+let webLiveViewer: WebLiveViewerState = { visible: false, displays: [], recommendedDisplayId: '' };
+let webTabs: Record<string, readonly WebTabActivitySummary[]> = {};
+let webProfilesError: string | undefined;
+let webRefreshGeneration = 0;
+let activityFilter: ActivityFilter = 'all';
 let browserViewerSessionId: string | undefined;
 let browserViewerTimer: number | undefined;
 let browserViewerCaptureInFlight = false;
 const LIVE_VIEWER_DISPLAY_STORAGE_KEY = 'localbridge.liveViewerDisplayId';
+const LIVE_VIEWER_PRESENTATION_STORAGE_KEY = 'localbridge.liveViewerPresentationMode';
 let auditFilters: { workspaceId?: string; action?: string; outcome?: 'success' | 'error' } = {};
 let portableImport: { sessionId: string; config: PortableConfig; mapped: Set<string> } | undefined;
 
@@ -210,18 +240,59 @@ function escapeHtml(value: string): string {
   return value.replace(/[&<>"']/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[char] ?? char);
 }
 
+function formatBytes(value: number): string {
+  if (value >= 1024 * 1024 * 1024) return `${(value / (1024 * 1024 * 1024)).toFixed(2)} GiB`;
+  if (value >= 1024 * 1024) return `${(value / (1024 * 1024)).toFixed(1)} MiB`;
+  if (value >= 1024) return `${(value / 1024).toFixed(1)} KiB`;
+  return `${value} B`;
+}
+
 function rememberedLiveViewerDisplayId(): string | undefined {
   try {
     const stored = window.localStorage.getItem(LIVE_VIEWER_DISPLAY_STORAGE_KEY) ?? undefined;
-    return (developmentActivity.displays ?? []).some((display) => display.id === stored) ? stored : undefined;
+    return (developmentActivity.displays ?? []).some((display) => display.id === stored) ||
+      webLiveViewer.displays.some((display) => display.id === stored) ? stored : undefined;
   } catch {
     return undefined;
   }
 }
 
 function rememberLiveViewerDisplayId(displayId: string): void {
-  if (!(developmentActivity.displays ?? []).some((display) => display.id === displayId)) return;
+  const developmentDisplayExists = (developmentActivity.displays ?? []).some((display) => display.id === displayId);
+  const webDisplayExists = webLiveViewer.displays.some((display) => display.id === displayId);
+  if (!developmentDisplayExists && !webDisplayExists) return;
   try { window.localStorage.setItem(LIVE_VIEWER_DISPLAY_STORAGE_KEY, displayId); } catch { /* preferencia no crítica */ }
+}
+
+function rememberedViewerPresentationMode(): 'fit' | 'actual' {
+  try { return window.localStorage.getItem(LIVE_VIEWER_PRESENTATION_STORAGE_KEY) === 'actual' ? 'actual' : 'fit'; }
+  catch { return 'fit'; }
+}
+
+function rememberViewerPresentationMode(mode: 'fit' | 'actual'): void {
+  try { window.localStorage.setItem(LIVE_VIEWER_PRESENTATION_STORAGE_KEY, mode); } catch { /* preferencia no crítica */ }
+}
+
+function viewerPresentationHtml(
+  kind: 'browser' | 'web',
+  sessionId: string,
+  presentation: { mode: 'fit' | 'actual'; renderWidth: number; renderHeight: number; viewWidth: number; viewHeight: number; scale: number; panX: number; panY: number } | undefined,
+): string {
+  if (presentation === undefined) return '';
+  const attributes = `data-viewer-presentation="${kind}" data-session-id="${escapeHtml(sessionId)}"`;
+  const metrics = `Render ${presentation.renderWidth}×${presentation.renderHeight} · visible ${presentation.viewWidth}×${presentation.viewHeight} · ${Math.round(presentation.scale * 100)}%`;
+  const pan = presentation.mode !== 'actual' ? '' : `<span class="viewer-pan" aria-label="Desplazar vista 1 a 1">
+    <button type="button" ${attributes} data-mode="actual" data-pan-x="${Math.max(0, presentation.panX - 240)}" data-pan-y="${presentation.panY}" aria-label="Mover vista a la izquierda">←</button>
+    <button type="button" ${attributes} data-mode="actual" data-pan-x="${presentation.panX}" data-pan-y="${Math.max(0, presentation.panY - 135)}" aria-label="Mover vista arriba">↑</button>
+    <button type="button" ${attributes} data-mode="actual" data-pan-x="${presentation.panX}" data-pan-y="${presentation.panY + 135}" aria-label="Mover vista abajo">↓</button>
+    <button type="button" ${attributes} data-mode="actual" data-pan-x="${presentation.panX + 240}" data-pan-y="${presentation.panY}" aria-label="Mover vista a la derecha">→</button></span>`;
+  return `<div class="viewer-presentation"><span class="dependency-note">${metrics}</span><div class="actions"><button type="button" ${attributes} data-mode="fit" data-pan-x="0" data-pan-y="0" ${presentation.mode === 'fit' ? 'disabled aria-pressed="true"' : ''}>Encajar</button><button type="button" ${attributes} data-mode="actual" data-pan-x="${presentation.panX}" data-pan-y="${presentation.panY}" ${presentation.mode === 'actual' ? 'disabled aria-pressed="true"' : ''}>1:1</button>${pan}</div></div>`;
+}
+
+function motionReceiptHtml(receipt: { path: string; frameCount: number; totalSize: number; captureMode: 'stepped' | 'screencast'; warnings: readonly string[] } | undefined): string {
+  if (receipt === undefined) return '';
+  const size = receipt.totalSize >= 1024 * 1024 ? `${(receipt.totalSize / (1024 * 1024)).toFixed(1)} MiB` : `${Math.ceil(receipt.totalSize / 1024)} KiB`;
+  return `<p class="motion-receipt"><strong>Última traza:</strong> ${escapeHtml(receipt.path)} · ${receipt.frameCount} frames · ${size} · ${receipt.captureMode === 'screencast' ? 'tiempo real' : 'paso a paso'}${receipt.warnings.length === 0 ? '' : ` · ${receipt.warnings.length} aviso(s)`}</p>`;
 }
 
 function selectedLiveViewerDisplayId(sessionId: string): string | undefined {
@@ -236,6 +307,21 @@ function liveViewerDisplayPickerHtml(sessionId: string): string {
   if (displays.length === 0) return '';
   const selectedId = selectedLiveViewerDisplayId(sessionId);
   return `<label class="live-viewer-display-picker"><span>Pantalla</span><select data-live-display="${sessionId}" aria-label="Pantalla para la ventana en vivo">${displays
+    .map((display) => `<option value="${escapeHtml(display.id)}" ${display.id === selectedId ? 'selected' : ''}>Pantalla ${display.ordinal}${display.isPrimary ? ' (principal)' : ''}${display.label === `Monitor ${display.ordinal}` ? '' : ` — ${escapeHtml(display.label)}`}</option>`)
+    .join('')}</select></label>`;
+}
+
+function selectedWebLiveViewerDisplayId(sessionId: string): string | undefined {
+  if (webLiveViewer.visible && webLiveViewer.sessionId === sessionId && webLiveViewer.displayId !== undefined) {
+    return webLiveViewer.displayId;
+  }
+  return rememberedLiveViewerDisplayId() ?? webLiveViewer.recommendedDisplayId ?? webLiveViewer.displays[0]?.id;
+}
+
+function webLiveViewerDisplayPickerHtml(sessionId: string): string {
+  if (webLiveViewer.displays.length === 0) return '';
+  const selectedId = selectedWebLiveViewerDisplayId(sessionId);
+  return `<label class="live-viewer-display-picker"><span>Pantalla</span><select data-web-live-display="${sessionId}" aria-label="Pantalla para la investigación en vivo">${webLiveViewer.displays
     .map((display) => `<option value="${escapeHtml(display.id)}" ${display.id === selectedId ? 'selected' : ''}>Pantalla ${display.ordinal}${display.isPrimary ? ' (principal)' : ''}${display.label === `Monitor ${display.ordinal}` ? '' : ` — ${escapeHtml(display.label)}`}</option>`)
     .join('')}</select></label>`;
 }
@@ -337,6 +423,8 @@ function draftFromWorkspace(workspace?: AuthorizedWorkspace): WorkspaceFormDraft
     rootPath: workspace?.rootPath ?? '',
     enabled: workspace?.enabled ?? true,
     permissions: { ...(workspace?.permissions ?? DEFAULT_PERMISSIONS) },
+    maxFileBytes: workspace?.limits.maxFileBytes ?? 1_048_576,
+    largeArtifacts: workspace?.limits.largeArtifacts ?? settingsDraft.largeArtifactPreference,
     validationProfilesText: JSON.stringify(workspace?.validationProfiles ?? {}, null, 2),
     processProfilesText: JSON.stringify(workspace?.processProfiles ?? {}, null, 2),
     browserProfilesText: JSON.stringify(workspace?.browserProfiles ?? {}, null, 2),
@@ -471,7 +559,7 @@ function assistedProjectCardHtml(project: AssistedProjectsState['projects'][numb
   const busy = assistedBusyProjectId === project.id || run?.state === 'running';
   const phase = session?.phase ?? project.setupStatus;
   const label = project.setupStatus === 'ready' ? 'Listo' : phase === 'awaiting-local-review' ? 'Revisión local' : phase === 'installing' || phase === 'finalizing' ? 'Preparando…' : phase === 'failed' ? 'Falló' : phase === 'interrupted' ? 'Interrumpido' : 'Borrador';
-  return `<article class="workspace-card assisted-project-card"><div class="card-heading"><div><h3>${escapeHtml(project.name)}</h3><p>${escapeHtml(project.description || `${project.workspaceIds.length} carpeta(s) autorizada(s)`)}</p></div><span class="state-pill ${project.setupStatus === 'ready' ? 'state-ok' : ''}">${label}</span></div>${setupPlanSummaryHtml(session)}${run?.state === 'running' ? `<p role="status" aria-live="polite">Preparando ${run.completedActions}/${run.totalExecutableActions} acciones…</p>` : ''}${session !== undefined && project.setupStatus !== 'ready' ? `<label>Modo de instalación<select data-assisted-policy="${project.id}" ${busy ? 'disabled' : ''}><option value="restricted" ${session.policy === 'restricted' ? 'selected' : ''}>Restringido</option><option value="compatible" ${session.policy === 'compatible' ? 'selected' : ''}>Compatible con scripts</option><option value="manual" ${session.policy === 'manual' ? 'selected' : ''}>Manual</option></select></label>` : ''}<div class="actions"><button type="button" data-assisted-refresh="${project.id}" ${busy ? 'disabled' : ''}>Analizar de nuevo</button>${session?.phase === 'awaiting-local-review' && session.plan !== undefined ? `<button type="button" class="primary" data-assisted-approve="${project.id}" data-plan-sha="${session.plan.planSha256}" ${busy ? 'disabled aria-busy="true"' : ''}>Revisar y preparar</button>` : ''}${busy ? `<button type="button" class="danger" data-assisted-cancel-run="${project.id}">Cancelar</button>` : ''}<button type="button" data-assisted-remove="${project.id}" ${busy ? 'disabled' : ''}>Eliminar agrupación</button></div>${session?.errorCode !== undefined && session.errorCode !== 'SETUP_MANIFEST_MISSING' ? `<p class="error-text">${escapeHtml(setupErrorLabel(session.errorCode))}</p>` : ''}</article>`;
+  return `<article class="workspace-card assisted-project-card"><div class="card-heading"><div><h3>${escapeHtml(project.name)}</h3><p>${escapeHtml(project.description || `${project.workspaceIds.length} carpeta(s) autorizada(s)`)}</p></div><span class="state-pill ${project.setupStatus === 'ready' ? 'state-ok' : ''}">${label}</span></div>${setupPlanSummaryHtml(session)}${run?.state === 'running' ? `<p role="status" aria-live="polite">Preparando ${run.completedActions}/${run.totalExecutableActions} acciones…</p>` : ''}${session !== undefined && project.setupStatus !== 'ready' ? `<label>Modo de instalación<select data-assisted-policy="${project.id}" ${busy ? 'disabled' : ''}><option value="restricted" ${session.policy === 'restricted' ? 'selected' : ''}>Restringido</option><option value="compatible" ${session.policy === 'compatible' ? 'selected' : ''}>Compatible con scripts</option><option value="manual" ${session.policy === 'manual' ? 'selected' : ''}>Manual</option></select></label>` : ''}<div class="actions"><button type="button" data-assisted-refresh="${project.id}" ${busy ? 'disabled' : ''}>Analizar de nuevo</button>${session?.phase === 'awaiting-local-review' && session.plan !== undefined ? `<button type="button" class="primary" data-assisted-approve="${project.id}" data-plan-sha="${session.plan.planSha256}" ${busy ? 'disabled aria-busy="true"' : ''}>Revisar y preparar</button>` : ''}${busy ? `<button type="button" class="danger" data-assisted-cancel-run="${project.id}">Cancelar</button>` : ''}<button type="button" class="danger" data-assisted-remove="${project.id}" ${busy ? 'disabled' : ''}>Eliminar desarrollo y accesos</button></div>${session?.errorCode !== undefined && session.errorCode !== 'SETUP_MANIFEST_MISSING' ? `<p class="error-text">${escapeHtml(setupErrorLabel(session.errorCode))}</p>` : ''}</article>`;
 }
 
 function adoptProjectHtml(): string {
@@ -502,11 +590,16 @@ function assistedProjectsSectionHtml(): string {
   const newProject = draft === undefined ? '' : `<form id="v1-project-form" class="surface-card" aria-busy="false"><div class="card-heading"><div><p class="eyebrow">Proyecto v1</p><h3>Abrir una carpeta para ChatGPT</h3></div><button type="button" id="v1-project-cancel">Cancelar</button></div><p>Elige una carpeta vacía, un repositorio, un monorepo o un contenedor con varios servicios. El análisis no ejecuta ni instala nada.</p><label>Nombre<input id="v1-project-name" maxlength="80" required value="${escapeHtml(draft.name)}" /></label><label>Descripción opcional<input id="v1-project-description" maxlength="240" value="${escapeHtml(draft.description)}" /></label><label>Carpeta<div class="path-row"><input id="v1-project-root" readonly required value="${escapeHtml(draft.rootPath)}"/><button type="button" id="v1-project-pick">Elegir…</button></div></label><fieldset><legend>Nivel de confianza</legend><label class="objective-option"><input type="radio" name="v1-trust" value="guided" ${draft.trustMode === 'guided' ? 'checked' : ''}/><span><strong>Guiado</strong><small>Usa las herramientas cerradas y permisos clásicos. Sin terminal general.</small></span></label><label class="objective-option"><input type="radio" name="v1-trust" value="project-agent" disabled/><span><strong>Agente en proyecto — no disponible</strong><small>Se habilitará solo cuando el sandbox de Windows pueda demostrarse; nunca degrada a control total.</small></span></label><label class="objective-option risk-high"><input type="radio" name="v1-trust" value="full-host" ${draft.trustMode === 'full-host' ? 'checked' : ''}/><span><strong>Control total del equipo — avanzado</strong><small>Terminal real con tu cuenta de Windows. La carpeta es el inicio, no un límite de seguridad.</small></span></label></fieldset><div class="actions sticky-form-actions"><button class="primary" type="submit" id="v1-project-save">Crear proyecto</button></div><p id="v1-project-error" class="error-text" role="alert"></p></form>`;
   const cards = v1Projects.projects.map((project) => {
     const decision = v1Projects.decisions.find((candidate) => candidate.projectId === project.id);
+    const assistedProject = assistedProjects.projects.find((candidate) => candidate.id === project.id);
+    const setupSession = assistedProjects.sessions.filter((candidate) => candidate.projectId === project.id).at(-1);
     const mode = decision?.status === 'active' ? decision.mode : 'guided';
     const busy = v1BusyProjectId === project.id;
     const label = mode === 'full-host' ? 'Control total' : mode === 'project-agent' ? 'Agente en proyecto' : 'Guiado';
     const review = v1ProjectStateNote(project.state);
-    return `<article class="workspace-card"><div class="card-heading"><div><h3>${escapeHtml(project.displayName)}</h3><p>${escapeHtml(project.description || project.selectedRoot)}</p></div><span class="state-pill ${mode === 'full-host' ? 'state-danger' : ''}">${label}</span></div><p><strong>Estructura:</strong> ${escapeHtml(project.topology)} · ${project.nodes.length} nodo(s)</p>${review}${mode === 'full-host' ? '<p class="risk-note risk-high">La terminal puede operar fuera de esta carpeta con la autoridad de tu cuenta.</p>' : '<p class="dependency-note">La terminal general está desactivada. Los permisos existentes siguen iguales.</p>'}<div class="actions"><button type="button" data-v1-rescan="${project.id}" ${busy ? 'disabled aria-busy="true"' : ''}>Revisar estructura</button>${mode === 'full-host' ? `<button type="button" data-v1-guided="${project.id}" ${busy ? 'disabled' : ''}>Volver a Guiado</button><button type="button" class="danger" data-v1-revoke="${project.id}" ${busy ? 'disabled' : ''}>Revocar</button>` : `<button type="button" class="primary" data-v1-full="${project.id}" ${busy || project.state !== 'ready' ? 'disabled' : ''}>Habilitar control total</button>`}<button type="button" data-assisted-remove="${project.id}" ${busy ? 'disabled' : ''}>Eliminar ficha</button></div></article>`;
+    const pendingSetup = assistedProject?.setupStatus === 'review-required' && setupSession?.phase === 'awaiting-local-review'
+      ? `<div class="setup-summary">${setupPlanSummaryHtml(setupSession)}<p class="dependency-note">${mode === 'full-host' ? 'La propuesta guiada cambió. Tu terminal sigue disponible; revísala solo si quieres que LocalBridge aplique estos perfiles o instalaciones.' : 'Esta propuesta solo afecta la preparación guiada. Revísala para aplicar perfiles o instalaciones.'}</p>${setupSession.plan === undefined ? '' : `<button type="button" data-assisted-approve="${project.id}" data-plan-sha="${setupSession.plan.planSha256}" ${busy ? 'disabled' : ''}>Revisar preparación guiada</button>`}</div>`
+      : '';
+    return `<article class="workspace-card"><div class="card-heading"><div><h3>${escapeHtml(project.displayName)}</h3><p>${escapeHtml(project.description || project.selectedRoot)}</p></div><span class="state-pill ${mode === 'full-host' ? 'state-danger' : ''}">${label}</span></div><p><strong>Estructura:</strong> ${escapeHtml(project.topology)} · ${project.nodes.length} nodo(s)</p>${review}${pendingSetup}${mode === 'full-host' ? '<p class="risk-note risk-high">La terminal puede operar fuera de esta carpeta con la autoridad de tu cuenta.</p>' : '<p class="dependency-note">La terminal general está desactivada. Los permisos existentes siguen iguales.</p>'}<div class="actions"><button type="button" data-v1-rescan="${project.id}" ${busy ? 'disabled aria-busy="true"' : ''}>Revisar estructura</button>${mode === 'full-host' ? `<button type="button" data-v1-guided="${project.id}" ${busy ? 'disabled' : ''}>Volver a Guiado</button><button type="button" class="danger" data-v1-revoke="${project.id}" ${busy ? 'disabled' : ''}>Revocar</button>` : `<button type="button" class="primary" data-v1-full="${project.id}" ${busy || project.state !== 'ready' ? 'disabled' : ''}>Habilitar control total</button>`}<button type="button" class="danger" data-assisted-remove="${project.id}" ${busy ? 'disabled' : ''}>Eliminar desarrollo y accesos</button></div></article>`;
   }).join('');
   const v1ProjectIds = new Set(v1Projects.projects.map((project) => project.id));
   const legacyProjects = assistedProjects.projects.filter((project) => !v1ProjectIds.has(project.id));
@@ -520,6 +613,8 @@ function assistedProjectsSectionHtml(): string {
 function workspaceFormHtml(existing?: AuthorizedWorkspace): string {
   const draft = workspaceFormDraft ?? draftFromWorkspace(existing);
   const perms = draft.permissions;
+  const artifactPolicy = draft.largeArtifacts;
+  const gib = 1024 * 1024 * 1024;
 
   return `
     <form id="workspace-form" aria-labelledby="workspace-form-title">
@@ -586,6 +681,43 @@ function workspaceFormHtml(existing?: AuthorizedWorkspace): string {
       <section class="form-tab-panel" role="tabpanel" ${activeWorkspaceFormTab === 'advanced' ? '' : 'hidden'}>
         <p>Edición técnica opcional. El flujo normal no requiere modificar JSON.</p>
         <label>
+          Tamaño máximo para archivos de texto
+          <select name="maxFileBytes">
+            ${[1, 4, 8, 16, 25].map((mib) => {
+              const bytes = mib * 1024 * 1024;
+              const recommendation = mib === 8 ? ' — recomendado para capturas 1920×1080' : '';
+              return `<option value="${bytes}" ${draft.maxFileBytes === bytes ? 'selected' : ''}>${mib} MiB${recommendation}</option>`;
+            }).join('')}
+            ${[1, 4, 8, 16, 25].some((mib) => draft.maxFileBytes === mib * 1024 * 1024) ? '' : `<option value="${draft.maxFileBytes}" selected>Actual: ${(draft.maxFileBytes / (1024 * 1024)).toFixed(2)} MiB</option>`}
+          </select>
+          <small>Aplica a lectura y edición de código. Las descargas web y trazas visuales usan streaming administrado de hasta 1 GiB sin cambiar este permiso.</small>
+        </label>
+        <label>
+          Análisis de artefactos grandes
+          <select name="largeArtifactMode" id="large-artifact-mode">
+            <option value="standard" ${artifactPolicy.mode === 'standard' ? 'selected' : ''}>Estándar</option>
+            <option value="adaptive" ${artifactPolicy.mode === 'adaptive' ? 'selected' : ''}>Adaptativo — sin límite fijo</option>
+            <option value="custom" ${artifactPolicy.mode === 'custom' ? 'selected' : ''}>Límite personalizado</option>
+          </select>
+          <small>Se aplica a trabajos administrados por streaming. Adaptativo conserva una reserva de disco y nunca carga el archivo completo en memoria.</small>
+        </label>
+        <label>
+          Máximo por fuente personalizada (GiB)
+          <input name="largeArtifactCustomGiB" type="number" min="0.001" step="0.001" value="${artifactPolicy.mode === 'custom' ? artifactPolicy.customSourceBytes / gib : 1}" ${artifactPolicy.mode === 'custom' ? '' : 'disabled'} />
+        </label>
+        <label>
+          Reserva mínima de disco (GiB)
+          <input name="largeArtifactReserveGiB" type="number" min="0.0625" step="0.0625" value="${artifactPolicy.reserve.minimumFreeBytes / gib}" />
+        </label>
+        <label>
+          Reserva mínima de disco (%)
+          <input name="largeArtifactReservePercent" type="number" min="1" max="50" step="1" value="${artifactPolicy.reserve.minimumFreePercent}" />
+        </label>
+        <label>
+          Trabajos pesados simultáneos
+          <select name="largeArtifactConcurrentJobs"><option value="1" ${artifactPolicy.maxConcurrentJobs === 1 ? 'selected' : ''}>1</option><option value="2" ${artifactPolicy.maxConcurrentJobs === 2 ? 'selected' : ''}>2</option></select>
+        </label>
+        <label>
           Perfiles de validación (JSON avanzado)
           <textarea name="validationProfiles" rows="3">${escapeHtml(draft.validationProfilesText)}</textarea>
         </label>
@@ -624,6 +756,7 @@ function workspaceCardHtml(workspace: AuthorizedWorkspace, selected = false): st
         <span class="state-pill ${workspace.enabled ? 'state-ok' : 'state-muted'}">${workspace.enabled ? 'Autorizado' : 'Pausado'}</span>
       </div>
       <p><strong>${enabledPermissionCount(workspace.permissions)} capacidades:</strong> ${escapeHtml(permissionsSummary(workspace.permissions))}</p>
+      <p><strong>Límite de texto:</strong> ${(workspace.limits.maxFileBytes / (1024 * 1024)).toFixed(workspace.limits.maxFileBytes % (1024 * 1024) === 0 ? 0 : 2)} MiB · artefactos ${workspace.limits.largeArtifacts.mode === 'adaptive' ? 'adaptativos sin límite fijo' : workspace.limits.largeArtifacts.mode === 'custom' ? `hasta ${(workspace.limits.largeArtifacts.customSourceBytes / (1024 * 1024 * 1024)).toFixed(2)} GiB` : 'en modo estándar'}</p>
       ${memberships.length > 0 ? `<p><strong>${memberships.length} aplicación(es):</strong> ${escapeHtml(memberships.map((application) => application.name).join(', '))}</p>` : '<p class="dependency-note">Todavía no participa en una aplicación.</p>'}
       <p class="risk-note risk-${permissionRisk(workspace.permissions)}">${permissionRisk(workspace.permissions) === 'high' ? 'Incluye capacidades de mayor impacto.' : permissionRisk(workspace.permissions) === 'medium' ? 'Puede modificar archivos.' : 'Acceso conservador de lectura.'}</p>
       <div class="actions card-actions">
@@ -793,8 +926,14 @@ function applicationsSectionHtml(): string {
   return `<div class="section-heading"><div><p class="eyebrow">Aplicaciones</p><h2>Entornos locales</h2><p>Inicia frontend, API y otros servicios como una sola unidad.</p></div><button type="button" id="show-app-wizard" class="primary">Crear aplicación</button></div>${error}${applications.length === 0 && applicationsError === undefined ? '<div class="empty-state"><strong>Aún no hay aplicaciones</strong><p>Crea una para poder decir “levanta el proyecto y prueba el login”.</p><button type="button" id="show-app-wizard-empty">Crear mi primera aplicación</button></div>' : `<div class="workspace-grid">${applications.map(applicationCardHtml).join('')}</div>`}`;
 }
 
+function approvalLabel(mode: DesktopSettings['gitApprovalMode']): string {
+  return mode === 'host' ? 'Cuadro nativo de ChatGPT' : 'MRTR estricto';
+}
+
 function connectionSectionHtml(): string {
   const nativeApproval = settingsDraft.gitApprovalMode === 'host';
+  const reconnectPending = effectiveGitApprovalMode !== undefined && effectiveGitApprovalMode !== settings.gitApprovalMode;
+  const effectiveLabel = effectiveGitApprovalMode === undefined ? 'Se aplicará en la próxima conexión' : approvalLabel(effectiveGitApprovalMode);
   return `
     <div class="section-heading"><div><p class="eyebrow">Conexión</p><h2>ChatGPT y Secure MCP Tunnel</h2><p>Conecta o diagnostica sin usar una terminal.</p></div><span id="tunnel-status" data-tunnel-status class="status-badge status-${tunnelStatus}" role="status">${TUNNEL_STATUS_LABELS[tunnelStatus]}</span></div>
     <div class="connection-grid">
@@ -811,6 +950,7 @@ function connectionSectionHtml(): string {
             </select>
             <small id="git-approval-help" class="field-help">El modo de ChatGPT evita una segunda aprobación incompatible. Se aplica al volver a conectar.</small>
           </label>
+          <p class="dependency-note"><strong>Guardado:</strong> ${approvalLabel(settings.gitApprovalMode)} · <strong>Efectivo:</strong> ${effectiveLabel}${reconnectPending ? ' · Reconexión pendiente' : ''}</p>
           ${nativeApproval ? '<p class="risk-note risk-high"><strong>Delegación explícita:</strong> ChatGPT debe mostrar su cuadro antes de llamar a commit o push. LocalBridge no puede comprobar qué botón pulsaste, pero conserva todos los límites del proyecto y las verificaciones exactas de Git.</p>' : '<p class="dependency-note">MRTR exige una confirmación firmada por LocalBridge y es el modo más estricto.</p>'}
           <label>ID público del túnel<input type="text" name="tunnelId" required placeholder="tunnel_…" value="${escapeHtml(settingsDraft.tunnelId)}" aria-describedby="tunnel-id-help tunnel-id-error" autocomplete="off" spellcheck="false" /><small id="tunnel-id-help" class="field-help">Cópialo desde Tunnels. Empieza por tunnel_; no es una clave secreta.</small></label>
           <p id="tunnel-id-error" class="error-text field-error" role="alert"></p>
@@ -858,6 +998,163 @@ function runtimeReportHtml(): string {
     .join('')}</ul>`;
 }
 
+async function refreshWebState(shouldRender = true): Promise<void> {
+  const generation = ++webRefreshGeneration;
+  const [profilesResult, activityResult, viewerResult] = await Promise.allSettled([
+    window.desktop.getWebProfiles(),
+    window.desktop.listWebActivity(),
+    window.desktop.getWebLiveViewerState(),
+  ]);
+  if (generation !== webRefreshGeneration) return;
+  let nextTabs: Record<string, readonly WebTabActivitySummary[]> = {};
+  if (activityResult.status === 'fulfilled') {
+    const visibleSessions = activityResult.value.filter((session) => session.state === 'running' && session.controlState === 'agent_control');
+    const tabResults = await Promise.allSettled(visibleSessions.map(async (session) => ({
+      sessionId: session.sessionId,
+      tabs: await window.desktop.listWebTabs(session.sessionId),
+    })));
+    if (generation !== webRefreshGeneration) return;
+    nextTabs = Object.fromEntries(tabResults.flatMap((result) => result.status === 'fulfilled'
+      ? [[result.value.sessionId, result.value.tabs] as const]
+      : []));
+  }
+  if (profilesResult.status === 'fulfilled') {
+    webProfiles = profilesResult.value;
+    webProfilesError = undefined;
+  } else {
+    webProfilesError = errorMessage(profilesResult.reason);
+  }
+  if (activityResult.status === 'fulfilled') {
+    webActivity = activityResult.value;
+    webTabs = nextTabs;
+  } else {
+    webTabs = {};
+  }
+  if (viewerResult.status === 'fulfilled') webLiveViewer = viewerResult.value;
+  if (shouldRender) render();
+}
+
+function safeWebLocation(url: string): string {
+  try {
+    const parsed = new URL(url);
+    return `${parsed.hostname}${parsed.pathname === '/' ? '' : parsed.pathname}`;
+  } catch {
+    return 'Página web';
+  }
+}
+
+function viewportPresetsHtml(attributes: string, current: { width: number; height: number; mobile: boolean }): string {
+  const presets = [
+    { width: 1920, height: 1080, mobile: false, label: '1920×1080' },
+    { width: 1440, height: 900, mobile: false, label: '1440×900' },
+    { width: 1024, height: 768, mobile: false, label: '1024×768' },
+    { width: 390, height: 844, mobile: true, label: '390×844' },
+  ];
+  return `<div class="actions viewport-presets" aria-label="Viewport renderizado"><span class="dependency-note">Render: ${current.width}×${current.height}${current.mobile ? ' móvil' : ''}</span>${presets.map((preset) => {
+    const active = preset.width === current.width && preset.height === current.height && preset.mobile === current.mobile;
+    return `<button type="button" ${attributes} data-viewport-width="${preset.width}" data-viewport-height="${preset.height}" data-viewport-mobile="${preset.mobile}" ${active ? 'disabled aria-pressed="true"' : ''}>${preset.label}</button>`;
+  }).join('')}</div>`;
+}
+
+function webLiveViewerControlsHtml(session: WebActivitySummary): string {
+  if (session.controlState !== 'agent_control') return '';
+  const tabs = webTabs[session.sessionId] ?? [];
+  const isVisible = webLiveViewer.visible && webLiveViewer.sessionId === session.sessionId;
+  const status = isVisible
+    ? `${webLiveViewer.mode === 'follow' ? 'Siguiendo actividad' : 'Pestaña fijada'} · ${webLiveViewer.pageState === 'action' ? 'ChatGPT actuando' : webLiveViewer.pageState === 'loading' ? 'Cargando' : webLiveViewer.pageState === 'failed' ? 'Carga fallida' : 'En espera'}`
+    : 'Visor oculto';
+  const connection = tunnelStatus === 'connected' ? 'Cliente conectado' : `Conexión ${TUNNEL_STATUS_LABELS[tunnelStatus].toLocaleLowerCase()}`;
+  const tabList = tabs.length === 0
+    ? '<p class="dependency-note">Aún no hay pestañas observables.</p>'
+    : `<div class="web-tab-list">${tabs.map((tab) => {
+      const pinned = isVisible && webLiveViewer.mode === 'pinned' && webLiveViewer.tabId === tab.tabId;
+      const motion = tab.motionCapture === undefined ? '' : `<div class="motion-progress" role="status"><span>Capturando movimiento ${tab.motionCapture.completed}/${tab.motionCapture.total}</span><progress max="${tab.motionCapture.total}" value="${tab.motionCapture.completed}"></progress><button type="button" data-web-cancel-motion="${escapeHtml(session.sessionId)}" data-web-tab-id="${escapeHtml(tab.tabId)}">Cancelar captura</button></div>`;
+      return `<div class="web-tab-row"><div><strong>${escapeHtml(tab.title || 'Sin título')}</strong><small>${escapeHtml(safeWebLocation(tab.url))} · ${tab.state === 'loading' ? 'cargando' : tab.state === 'failed' ? 'falló' : 'lista'}</small>${motion}${motionReceiptHtml(tab.lastMotionCapture)}${viewportPresetsHtml(`data-web-viewport="${escapeHtml(session.sessionId)}" data-web-tab-id="${escapeHtml(tab.tabId)}"`, tab.viewport ?? { width: 1920, height: 1080, mobile: false })}</div><button type="button" data-web-view-pinned="${escapeHtml(session.sessionId)}" data-web-tab-id="${escapeHtml(tab.tabId)}" ${pinned ? 'disabled aria-pressed="true"' : ''}>${pinned ? 'Fijada' : 'Fijar'}</button></div>`;
+    }).join('')}</div>`;
+  return `<div class="web-live-viewer-controls"><p class="dependency-note"><strong>Vista en vivo:</strong> ${status} · ${connection}. Solo lectura; los clics y el teclado no llegan a la página.</p>${isVisible ? viewerPresentationHtml('web', session.sessionId, webLiveViewer.presentation) : ''}<div class="actions">${webLiveViewerDisplayPickerHtml(session.sessionId)}<button type="button" class="primary" data-web-view-follow="${escapeHtml(session.sessionId)}" ${isVisible && webLiveViewer.mode === 'follow' ? 'disabled aria-pressed="true"' : ''}>${isVisible && webLiveViewer.mode === 'follow' ? 'Siguiendo' : 'Ver y seguir'}</button>${isVisible ? `<button type="button" data-web-hide-viewer="${escapeHtml(session.sessionId)}">Ocultar visor</button>` : ''}</div>${tabList}</div>`;
+}
+
+function webActivityHtml(group: BrowserActivityGroup = 'all', showEmpty = true): string {
+  const running = webActivity.filter((session) => session.state === 'running' &&
+    (group === 'all' || isInterventionControlState(session.controlState) === (group === 'attention'))).toSorted((left, right) =>
+    interventionControlPriority(left.controlState) - interventionControlPriority(right.controlState) || left.startedAt.localeCompare(right.startedAt));
+  const closeLabels: Record<NonNullable<WebActivitySummary['closeReason']>, string> = {
+    user: 'cerrada por ti', agent: 'cerrada por el cliente', policy: 'cerrada por cambio de autoridad', expired: 'caducada', failed: 'cerrada por fallo',
+  };
+  const recentlyClosed = webActivity.filter((session) => session.state === 'stopped' && session.closedAt !== undefined)
+    .toSorted((left, right) => (right.closedAt ?? '').localeCompare(left.closedAt ?? '')).slice(0, 3);
+  const closedHtml = recentlyClosed.length === 0 ? '' : `<details class="advanced-panel"><summary>Sesiones de Internet cerradas recientemente</summary><div class="audit-list">${recentlyClosed.map((session) => `<article class="audit-row"><span class="source-pill">INTERNET</span><div><strong>${escapeHtml(session.profileName)}</strong><p>${escapeHtml(session.closeReason === undefined ? 'cerrada' : closeLabels[session.closeReason])} · ${new Date(session.closedAt ?? '').toLocaleString()}</p></div></article>`).join('')}</div></details>`;
+  if (running.length === 0) return `${showEmpty ? '<div class="empty-state compact-empty"><strong>Sin sesiones web activas</strong><p>ChatGPT podrá iniciar una cuando exista un perfil habilitado.</p></div>' : ''}${group === 'attention' ? '' : closedHtml}`;
+  return `<div class="audit-list">${running.map((session) => {
+    const privateControl = ['waiting_for_human', 'human_control', 'returning_to_agent'].includes(session.controlState);
+    const profile = webProfiles.document.profiles.find((candidate) => candidate.id === session.webProfileId);
+    const canTakeDirectly = session.profileKind === 'public-research' || profile?.permissions.humanControl === true;
+    const selectedTabId = webLiveViewer.sessionId === session.sessionId && webLiveViewer.tabId !== undefined
+      ? webLiveViewer.tabId
+      : webTabs[session.sessionId]?.[0]?.tabId;
+    const takeButton = session.controlState === 'agent_control' && canTakeDirectly
+      ? `<button type="button" class="primary" data-web-take="${session.sessionId}"${selectedTabId === undefined ? '' : ` data-web-tab-id="${escapeHtml(selectedTabId)}"`}>Tomar control</button>`
+      : '';
+    const waitingActions = session.controlState === 'waiting_for_human'
+      ? `<button type="button" class="primary" data-web-take="${session.sessionId}">Tomar control</button><button type="button" data-web-decline="${session.sessionId}">Cancelar</button>`
+      : '';
+    const humanActions = session.controlState === 'human_control'
+      ? `${session.tabCount > 1 ? `<button type="button" data-web-cycle="previous" data-web-session-id="${session.sessionId}" aria-label="Pestaña web anterior">←</button><button type="button" data-web-cycle="next" data-web-session-id="${session.sessionId}" aria-label="Pestaña web siguiente">→</button>` : ''}<button type="button" class="primary" data-web-return="${session.sessionId}">Devolver a ChatGPT</button><button type="button" data-web-decline="${session.sessionId}">Cancelar sesión</button>`
+      : '';
+    const delegated = session.delegatedSite === undefined ? '' : `<p class="dependency-note">Acceso temporal: ${escapeHtml(session.delegatedSite)} · hasta ${new Date(session.delegatedExpiresAt ?? '').toLocaleTimeString()}</p>`;
+    return `<article class="audit-row web-activity-row"><span class="source-pill">INTERNET</span><div class="web-activity-body"><strong>${escapeHtml(session.profileName)}</strong><p>${session.tabCount} pestaña(s) · ${new Date(session.startedAt).toLocaleString()} · ${privateControl ? 'ChatGPT pausado' : 'Control de ChatGPT'}</p>${privateControl ? '<p class="risk-note risk-high">Ventana privada: ChatGPT no puede observar ni actuar.</p>' : webLiveViewerControlsHtml(session)}${delegated}${session.controlState === 'agent_control' && !canTakeDirectly ? '<p class="dependency-note">Activa el control privado para este acceso en Configuración.</p>' : ''}</div><div class="actions">${takeButton}${waitingActions}${humanActions}${session.controlState === 'returning_to_agent' ? '<button type="button" disabled>Devolviendo…</button>' : ''}<button type="button" class="danger" data-web-stop="${session.sessionId}" title="Cierra esta sesión aislada y sus pestañas">Cerrar sesión y borrar estado</button></div></article>`;
+  }).join('')}</div>${group === 'attention' ? '' : closedHtml}`;
+}
+
+function webProfileCardHtml(profile: WebProfile): string {
+  const scope = profile.kind === 'public-research'
+    ? 'Cualquier sitio HTTPS público; bloquea redes locales, cuentas y campos sensibles.'
+    : `Destinos: ${profile.destinations.map((rule) => `${rule.includeSubdomains ? '*.' : ''}${rule.hostname}`).join(', ')}`;
+  const activeSessions = webActivity.filter((session) => session.webProfileId === profile.id && session.state === 'running').length;
+  const perAssetOptions = [25, 50, 100, 250, 500, 1024].map((mib) => {
+    const bytes = mib * 1024 * 1024;
+    return `<option value="${bytes}" ${profile.limits.maxDownloadBytes === bytes ? 'selected' : ''}>${mib} MiB${mib === 1024 ? ' · recomendado' : ''}</option>`;
+  }).join('');
+  const totalOptions = [1, 2, 5, 10].map((gib) => {
+    const bytes = gib * 1024 * 1024 * 1024;
+    return `<option value="${bytes}" ${profile.limits.maxTotalDownloadBytes === bytes ? 'selected' : ''}>${gib} GiB${gib === 10 ? ' · recomendado' : ''}</option>`;
+  }).join('');
+  // A legacy snapshot can briefly be visible while the main process migrates
+  // the registry. Preserve its fixed-limit behavior instead of failing render.
+  const adaptiveTransfer = profile.limits.transferPolicy?.mode === 'adaptive';
+  return `<article class="workspace-card"><div class="card-heading"><div><h3>${escapeHtml(profile.name)}</h3><p>${escapeHtml(scope)}</p></div><span class="state-pill ${profile.enabled ? 'state-ok' : 'state-muted'}">${profile.enabled ? 'Habilitado' : 'Deshabilitado'}</span></div>
+    <p><strong>Almacenamiento:</strong> efímero · <strong>Sesiones:</strong> ${activeSessions}/${profile.limits.maxSessions} · <strong>Pestañas:</strong> hasta ${profile.limits.maxTabsPerSession}</p>
+    <label>Transferencias grandes<select data-web-transfer-policy data-web-profile="${profile.id}"><option value="fixed" ${adaptiveTransfer ? '' : 'selected'}>Límites fijos</option><option value="adaptive" ${adaptiveTransfer ? 'selected' : ''}>Sin límite fijo · streaming</option></select><small>El modo adaptativo conserva la reserva de disco del proyecto y no cambia dominios ni permisos.</small></label>
+    <div class="permission-grid compact-permissions"><label>Máximo por asset<select data-web-limit="maxDownloadBytes" data-web-profile="${profile.id}" ${adaptiveTransfer ? 'disabled' : ''}>${perAssetOptions}</select><small>Se aplica en modo fijo; no usa el límite de archivos de código.</small></label><label>Máximo acumulado por sesión<select data-web-limit="maxTotalDownloadBytes" data-web-profile="${profile.id}" ${adaptiveTransfer ? 'disabled' : ''}>${totalOptions}</select><small>Se aplica en modo fijo.</small></label></div>
+    ${profile.kind === 'site-account' && profile.supportHosts.length > 0 ? `<p><strong>Hosts auxiliares:</strong> ${escapeHtml(profile.supportHosts.map((rule) => rule.hostname).join(', '))}</p>` : ''}
+    <div class="permission-grid compact-permissions">
+      <label class="permission-option"><input type="checkbox" data-web-permission="interact" data-web-profile="${profile.id}" ${profile.permissions.interact ? 'checked' : ''}/><span><strong>Interactuar</strong><small>Clics y campos comunes no sensibles.</small></span></label>
+      <label class="permission-option"><input type="checkbox" data-web-permission="download" data-web-profile="${profile.id}" ${profile.permissions.download ? 'checked' : ''}/><span><strong>Descargar</strong><small>Documentos y medios observados hacia carpetas con escritura.</small></span></label>
+      ${profile.kind === 'site-account' ? `<label class="permission-option"><input type="checkbox" data-web-permission="humanControl" data-web-profile="${profile.id}" ${profile.permissions.humanControl ? 'checked' : ''}/><span><strong>Inicio de sesión privado</strong><small>Pausa toda observación de ChatGPT.</small></span></label>` : ''}
+    </div>
+    <div class="actions"><button type="button" class="${profile.enabled ? '' : 'primary'}" data-web-toggle="${profile.id}">${profile.enabled ? 'Deshabilitar y cerrar sesiones' : 'Habilitar acceso'}</button><button type="button" data-web-save="${profile.id}">Guardar configuración</button><button type="button" class="danger" data-web-remove="${profile.id}">Eliminar</button></div>
+  </article>`;
+}
+
+function webSectionHtml(): string {
+  const stateNotice = webProfiles.state === 'corrupt'
+    ? `<div class="empty-state error-state" role="alert"><strong>El registro web está corrupto y el acceso está bloqueado</strong><p>Ningún sitio está disponible. Restablecer elimina solo estos perfiles; no toca carpetas ni proyectos.</p>${webProfiles.sha256 === null ? '' : '<button type="button" id="reset-web-profiles" class="danger">Restablecer perfiles web</button>'}</div>`
+    : '';
+  const cards = webProfiles.document.profiles.map(webProfileCardHtml).join('');
+  const publicEnabled = webProfiles.document.profiles.some((profile) => profile.kind === 'public-research' && profile.enabled);
+  const publicProfile = webProfiles.document.profiles.find((profile) => profile.kind === 'public-research');
+  return `<div class="section-heading"><div><p class="eyebrow">Configuración</p><h2>Acceso a Internet</h2><p>Habilita la navegación aislada una vez. Las sesiones y la toma de control aparecen en Actividad. No usa tu Chrome personal ni controla aplicaciones de Windows.</p></div></div>
+    ${webProfilesError === undefined ? '' : `<div class="empty-state error-state"><strong>No se pudo cargar el acceso web</strong><p>${escapeHtml(webProfilesError)}</p></div>`}
+    ${stateNotice}
+    ${webProfiles.state !== 'corrupt' ? `<div class="surface-card quick-web-setup"><div><h3>${publicEnabled ? 'Navegación por Internet habilitada' : 'Habilitar navegación por Internet'}</h3><p>Permite investigar e interactuar con sitios HTTPS públicos en una sesión aislada. Puedes tomar el control desde Actividad.</p>${publicEnabled ? '' : `<label class="compact-check"><input type="checkbox" id="enable-web-download" ${publicProfile?.permissions.download === true ? 'checked' : ''}/> Permitir descargas de documentos y medios hacia carpetas con escritura</label>`}</div>${publicEnabled ? '<span class="state-pill state-ok">Lista</span>' : `<button type="button" id="enable-web-browsing" class="primary" ${publicProfile === undefined && webProfiles.document.profiles.length >= 20 ? 'disabled' : ''}>Habilitar</button>`}</div>` : ''}
+    <div class="surface-card trust-summary"><h3>Frontera de red</h3><p>Solo HTTPS por un proxy local que valida DNS y la IP real. Loopback, LAN, link-local, metadata, IPs literales, HTTP y puertos alternativos se bloquean.</p><p><strong>Windows:</strong> LocalBridge no requiere conexiones entrantes desde redes privadas o públicas. Si el Firewall de Windows solicita ese acceso, puedes denegarlo; el proxy escucha únicamente en 127.0.0.1.</p><p>El texto y las capturas que ChatGPT solicita viajan al cliente MCP conectado. Cookies y credenciales permanecen en la sesión efímera.</p></div>
+    <details class="advanced-panel" ${cards === '' ? 'open' : ''}><summary>Accesos guardados y opciones avanzadas</summary>
+      ${cards === '' && webProfiles.state !== 'corrupt' ? '<div class="empty-state compact-empty"><strong>Sin accesos guardados</strong><p>La configuración rápida creará el acceso público cuando lo habilites.</p></div>' : `<div class="workspace-grid">${cards}</div>`}
+      <div class="actions"><button type="button" id="add-public-web-profile" ${webProfiles.state === 'corrupt' || webProfiles.document.profiles.length >= 20 ? 'disabled' : ''}>Añadir acceso público manual</button></div>
+      <form id="create-account-web-profile" class="surface-card"><div class="card-heading"><div><h3>Sitio con cuenta</h3><p>Limita navegación a dominios elegidos. El inicio de sesión se hace con control humano privado.</p></div></div><label>Nombre<input name="name" maxlength="80" required placeholder="Portal de trabajo" /></label><label>Dominios navegables<textarea name="destinations" rows="3" required placeholder="example.com&#10;login.example.com"></textarea><small>Un dominio por línea, sin https:// ni rutas. Incluye subdominios.</small></label><label>Hosts auxiliares opcionales<textarea name="supportHosts" rows="2" placeholder="static.examplecdn.com"></textarea><small>Pueden cargar recursos, pero ChatGPT no puede navegar directamente a ellos.</small></label><button type="submit" ${webProfiles.state === 'corrupt' || webProfiles.document.profiles.length >= 20 ? 'disabled' : ''}>Crear borrador deshabilitado</button><p id="web-profile-form-error" class="error-text"></p></form>
+    </details>`;
+}
+
 function dashboardHtml(): string {
   const enabled = workspaces.filter((workspace) => workspace.enabled).length;
   const problem = tunnelStatus === 'error' ? tunnelDetail : lastProblem;
@@ -867,7 +1164,8 @@ function dashboardHtml(): string {
       <button type="button" class="metric-card" data-section-target="connection"><span>Conexión</span><strong data-tunnel-status class="status-text-${tunnelStatus}">${TUNNEL_STATUS_LABELS[tunnelStatus]}</strong><small>${tunnelStatus === 'connected' ? 'ChatGPT puede llamar las tools autorizadas.' : 'Abre Conexión para revisar o conectar.'}</small></button>
       <button type="button" class="metric-card" data-section-target="projects"><span>Proyectos activos</span><strong>${enabled}</strong><small>${workspaces.length === 0 ? 'Ninguna carpeta disponible.' : `${workspaces.length} configurado(s) en total.`}</small></button>
       <button type="button" class="metric-card" data-section-target="applications"><span>Aplicaciones</span><strong>${applications.length}</strong><small>${applications.filter((application) => application.reviewState === 'reviewed').length} lista(s) para iniciar.</small></button>
-      <button type="button" class="metric-card" data-section-target="activity"><span>Actividad de sesión</span><strong>${tunnelLogs.length}</strong><small>${tunnelLogs.length === 0 ? 'Sin eventos todavía.' : 'Eventos técnicos disponibles.'}</small></button>
+      <button type="button" class="metric-card" data-section-target="web"><span>Acceso web</span><strong>${webProfiles.document.profiles.filter((profile) => profile.enabled).length}</strong><small>${webProfiles.state === 'corrupt' ? 'Bloqueado por configuración corrupta.' : `${webActivity.filter((session) => session.state === 'running').length} sesión(es) activa(s).`}</small></button>
+      <button type="button" class="metric-card" data-section-target="activity"><span>Actividad en curso</span><strong>${developmentActivity.processes.length + developmentActivity.browsers.length + developmentActivity.applications.length + (developmentActivity.terminals?.length ?? 0) + activeAnalysisJobCount() + webActivity.filter((session) => session.state === 'running').length}</strong><small>Sesiones, navegadores, trabajos y recursos activos.</small></button>
     </div>
     <div data-pending-approvals>${pendingApprovalsHtml()}</div>
     <section class="attention-card ${problem === undefined ? 'attention-ok' : 'attention-error'}">
@@ -904,6 +1202,12 @@ const AUDIT_ACTION_LABELS: Record<string, string> = {
   'git.commit': 'Creó un commit',
   'git.push': 'Publicó commits',
   'validation.run': 'Ejecutó una validación',
+  'terminal.start': 'Inició una terminal',
+  'terminal.list': 'Consultó terminales activas',
+  'terminal.write': 'Envió entrada a una terminal; resultado pendiente de verificar',
+  'terminal.read': 'Leyó la salida de una terminal',
+  'terminal.status': 'Verificó el estado de una terminal',
+  'terminal.stop': 'Detuvo una terminal',
   'process.start': 'Inició un servidor aprobado',
   'process.list': 'Consultó procesos activos',
   'process.listeners': 'Detectó puertos verificados',
@@ -914,6 +1218,11 @@ const AUDIT_ACTION_LABELS: Record<string, string> = {
   'browser.navigate': 'Navegó en la web local',
   'browser.snapshot': 'Leyó la interfaz web',
   'browser.screenshot': 'Capturó la web local',
+  'browser.screenshot.save': 'Guardó una captura de la web local',
+  'browser.motion.inspect': 'Inspeccionó movimiento en la web local',
+  'browser.motion.capture': 'Guardó una traza de movimiento local',
+  'browser.motion.diagnostic': 'Diagnosticó una captura temporal local',
+  'browser.viewport': 'Cambió el viewport de la web local',
   'browser.events': 'Consultó eventos web',
   'browser.click': 'Hizo clic en la web local',
   'browser.fill': 'Completó un campo no sensible',
@@ -926,10 +1235,49 @@ const AUDIT_ACTION_LABELS: Record<string, string> = {
   'browser.human.expire': 'Caducó el control humano',
   'browser.human.revoke': 'Revocó el control humano',
   'browser.stop': 'Cerró una sesión web',
+  'document.read': 'Extrajo texto y clasificó páginas de un PDF',
+  'document.render': 'Renderizó páginas de un PDF para ChatGPT',
+  'image.read': 'Entregó una imagen local a ChatGPT',
+  'web.profiles': 'Consultó perfiles de Internet',
+  'web.start': 'Abrió un navegador de Internet',
+  'web.list': 'Consultó navegadores de Internet',
+  'web.stop': 'Cerró un navegador de Internet',
+  'web.tabs': 'Consultó pestañas de Internet',
+  'web.open': 'Abrió una pestaña de Internet',
+  'web.close': 'Cerró una pestaña de Internet',
+  'web.navigate': 'Navegó por Internet',
+  'web.navigate.diagnostic': 'Diagnosticó una navegación de Internet',
+  'web.back': 'Volvió en una pestaña de Internet',
+  'web.snapshot': 'Leyó controles de una página externa',
+  'web.screenshot': 'Capturó una página externa',
+  'web.screenshot.save': 'Guardó una captura externa',
+  'web.motion.inspect': 'Inspeccionó movimiento en una página externa',
+  'web.motion.capture': 'Guardó una traza de movimiento externa',
+  'web.motion.diagnostic': 'Diagnosticó una captura temporal externa',
+  'web.extract': 'Extrajo texto y fuentes web',
+  'web.assets': 'Enumeró medios y recursos web',
+  'web.viewport': 'Cambió el viewport de Internet',
+  'web.download': 'Guardó y verificó un recurso web',
+  'web.screenshot.diagnostic': 'Diagnosticó una captura web sin registrar contenido',
+  'web.screenshot.save.diagnostic': 'Diagnosticó el guardado de una captura web',
+  'web.click': 'Hizo clic en una página externa',
+  'web.fill': 'Completó un campo web común',
+  'web.select': 'Eligió una opción web',
+  'web.scroll': 'Desplazó una página externa',
+  'web.press': 'Pulsó una tecla web permitida',
+  'web.wait': 'Esperó una condición web',
+  'web.human.request': 'Solicitó control web privado',
+  'web.human.status': 'Consultó control web privado',
+  'web.human.open': 'Entregó una web al usuario',
+  'web.human.handoff': 'Devolvió una web a ChatGPT',
+  'web.human.decline': 'Canceló control web privado',
+  'web.human.expire': 'Caducó control web privado',
+  'visual.compare': 'Comparó dos capturas visuales',
+  'visual.motion.compare': 'Comparó dos trazas de movimiento',
   'project.create': 'Creó un proyecto asistido',
   'project.adopt': 'Agrupó configuración existente',
   'project.refresh': 'Actualizó el análisis del proyecto',
-  'project.remove': 'Eliminó una agrupación',
+  'project.remove': 'Eliminó un desarrollo y sus accesos',
   'project.topology.scan': 'Detectó la topología del proyecto',
   'project.state.ready': 'El proyecto quedó listo para operar',
   'project.state.review': 'El proyecto pasó a revisión local',
@@ -952,19 +1300,62 @@ const TERMINAL_STATE_LABELS: Record<NonNullable<DevelopmentActivity['terminals']
   timed_out: 'Tiempo agotado',
 };
 
-function developmentActivityHtml(): string {
-  const activeCount = developmentActivity.processes.length + developmentActivity.browsers.length + developmentActivity.applications.length + (developmentActivity.terminals?.length ?? 0);
-  if (activeCount === 0) {
-    return '<div class="empty-state compact-empty"><strong>Sin entornos activos</strong><p>Los servidores y navegadores iniciados por ChatGPT aparecerán aquí.</p></div>';
+const ANALYSIS_STATE_LABELS: Record<NonNullable<DevelopmentActivity['jobs']>[number]['state'], string> = {
+  queued: 'En cola', running: 'Analizando', waiting_resource: 'Esperando recursos', cancel_requested: 'Cancelando',
+  cancelled: 'Cancelado', completed: 'Completado', failed: 'Falló', source_changed: 'Fuente cambiada', interrupted: 'Interrumpido',
+};
+
+function formatAnalysisProgress(job: NonNullable<DevelopmentActivity['jobs']>[number]): string {
+  if (job.progress.unit === 'bytes') {
+    const completed = formatBytes(job.progress.completed);
+    return job.progress.total === undefined ? completed : `${completed} de ${formatBytes(job.progress.total)}`;
   }
+  return job.progress.total === undefined
+    ? `${job.progress.completed} ${job.progress.unit}`
+    : `${job.progress.completed} de ${job.progress.total} ${job.progress.unit}`;
+}
+
+function activeAnalysisJobCount(): number {
+  return (developmentActivity.jobs ?? []).filter((job) =>
+    ['queued', 'running', 'waiting_resource', 'cancel_requested'].includes(job.state)).length;
+}
+
+function developmentActivityHtml(kind: 'all' | 'browsers' | 'resources' = 'all', group: BrowserActivityGroup = 'all'): string {
+  const browserEntries = developmentActivity.browsers.filter((entry) => entry.state === 'running' &&
+    (group === 'all' || isInterventionControlState(entry.controlState) === (group === 'attention')));
+  const browserCount = browserEntries.length;
+  const resourceCount = developmentActivity.processes.length + developmentActivity.applications.length + (developmentActivity.terminals?.length ?? 0) + activeAnalysisJobCount();
+  const activeCount = kind === 'browsers' ? browserCount : kind === 'resources' ? resourceCount : browserCount + resourceCount;
+  const analysisUnavailable = kind !== 'browsers' && developmentActivity.analysisAvailability?.available === false;
+  const analysisNotice = analysisUnavailable
+    ? '<div class="attention-card attention-error"><div><strong>Análisis de artefactos no disponible</strong><p>El almacén durable necesita reparación. Terminal, Git, navegador y lecturas pequeñas siguen disponibles.</p></div></div>'
+    : '';
+  if (activeCount === 0 && group === 'all' && !analysisUnavailable) {
+    return `<div class="empty-state compact-empty"><strong>${kind === 'browsers' ? 'Sin navegadores locales activos' : kind === 'resources' ? 'Sin recursos de desarrollo activos' : 'Sin entornos activos'}</strong><p>Los recursos iniciados por ChatGPT aparecerán aquí.</p></div>`;
+  }
+  if (activeCount === 0) return analysisNotice;
   const terminalGroups = new Map<string, Array<NonNullable<DevelopmentActivity['terminals']>[number]>>();
   for (const terminal of developmentActivity.terminals ?? []) {
-    const group = terminalGroups.get(terminal.projectId) ?? [];
-    group.push(terminal);
-    terminalGroups.set(terminal.projectId, group);
+    const terminalGroup = terminalGroups.get(terminal.projectId) ?? [];
+    terminalGroup.push(terminal);
+    terminalGroups.set(terminal.projectId, terminalGroup);
   }
   const rows = [
-    ...[...terminalGroups.values()].map((entries) => {
+    ...(kind === 'browsers' ? [] : (developmentActivity.jobs ?? []).map((job) => {
+      const workspace = workspaces.find((candidate) => candidate.id === job.workspaceId);
+      const active = ['queued', 'running', 'waiting_resource', 'cancel_requested'].includes(job.state);
+      const stateClass = job.state === 'completed' ? 'state-ok' : job.state === 'failed' || job.state === 'source_changed' || job.state === 'interrupted' ? 'state-denied' : '';
+      const progress = formatAnalysisProgress(job);
+      const coverage = job.coverage.sourceBytes === undefined ? '' : ` · ${formatBytes(job.coverage.uniqueBytesRead)} únicos de ${formatBytes(job.coverage.sourceBytes)}`;
+      const effect = job.effectState === 'uncertain'
+        ? ' · El efecto pudo aplicarse; revísalo antes de repetir'
+        : job.effectState === 'applied' ? ' · Efecto aplicado' : '';
+      const recovery = job.state === 'interrupted' && job.resumeCapability === 'restart'
+        ? ' · Puede iniciarse otra vez con una nueva intención'
+        : '';
+      return `<li class="runtime-item analysis-job-row"><div class="runtime-heading"><div><span class="source-pill">TRABAJO</span><strong>${escapeHtml(job.operationKind)}</strong><span>${escapeHtml(workspace?.name ?? job.workspaceId)} · ${escapeHtml(job.sourcePath ?? 'recurso web')} · ${escapeHtml(job.stage)}</span><small>${escapeHtml(progress)}${escapeHtml(coverage)}${job.errorCode === undefined ? '' : ` · ${escapeHtml(job.errorCode)}`}${escapeHtml(effect)}${escapeHtml(recovery)}</small></div><div class="actions"><span class="state-pill ${stateClass}">${ANALYSIS_STATE_LABELS[job.state]}</span>${active ? `<button type="button" class="danger" data-analysis-cancel="${escapeHtml(job.jobId)}" data-workspace-id="${escapeHtml(job.workspaceId)}">Cancelar</button>` : ''}</div></div></li>`;
+    })),
+    ...(kind === 'browsers' ? [] : [...terminalGroups.values()].map((entries) => {
       const project = entries[0];
       if (project === undefined) return '';
       const terminals = entries.map((entry, index) => {
@@ -972,23 +1363,24 @@ function developmentActivityHtml(): string {
           ? '<p class="runtime-empty">Iniciada; esperando un puerto verificado.</p>'
           : `<ul class="runtime-listeners">${entry.listeners.map((listener) => {
             const safe = listener.exclusive;
-            const network = listener.bindScope === 'wildcard' ? '<span class="state-pill state-warning">Visible en red local</span>' : '';
+            const network = listener.bindScope === 'wildcard' ? '<span class="state-pill state-warning">Escucha en todas las redes</span><small class="risk-note risk-high">Usa 127.0.0.1 o ::1 si solo necesitas abrirlo en este equipo.</small>' : '';
             const conflict = safe ? '' : '<span class="state-pill state-denied">Puerto no exclusivo</span>';
             return `<li class="runtime-listener"><div><strong>Servicio HTTP · puerto ${listener.port}</strong><code>${escapeHtml(listener.browserOrigin)}</code><div class="runtime-badges"><span class="state-pill state-ok">Verificado</span>${network}${conflict}</div></div><div class="actions runtime-actions"><button type="button" data-terminal-open="${escapeHtml(entry.sessionId)}" data-project-id="${escapeHtml(entry.projectId)}" data-listener-ref="${escapeHtml(listener.listenerRef)}" ${safe ? '' : 'disabled'}>Abrir en mi navegador</button><button type="button" data-terminal-copy="${escapeHtml(entry.sessionId)}" data-project-id="${escapeHtml(entry.projectId)}" data-listener-ref="${escapeHtml(listener.listenerRef)}" ${safe ? '' : 'disabled'}>Copiar dirección</button></div></li>`;
           }).join('')}</ul>`;
         return `<section class="runtime-terminal"><div class="runtime-heading"><div><strong>Terminal ${index + 1}</strong><span>${entry.trustMode === 'full-host' ? 'Control total' : 'Agente en proyecto'} · desde ${new Date(entry.startedAt).toLocaleTimeString()}</span></div><span class="state-pill state-ok">${TERMINAL_STATE_LABELS[entry.state]}</span></div>${listenerRows}<div class="runtime-footer"><details><summary>Detalles técnicos</summary><code>${escapeHtml(entry.projectId)} · ${escapeHtml(entry.sessionId)}</code></details><button type="button" class="danger" data-terminal-stop="${escapeHtml(entry.sessionId)}" data-project-id="${escapeHtml(entry.projectId)}">Detener terminal</button></div></section>`;
       }).join('');
       return `<li class="runtime-item runtime-project"><div class="runtime-heading runtime-project-heading"><div><strong>${escapeHtml(project.projectName)}</strong><span>${entries.length} terminal(es) activa(s)</span></div><span class="state-pill state-ok">En ejecución</span></div><div class="runtime-terminal-list">${terminals}</div><p class="dependency-note">“Abrir en mi navegador” crea una ventana local fuera del control de ChatGPT. El puerto se vuelve a verificar antes de abrirla.</p></li>`;
-    }),
-    ...developmentActivity.applications.map((entry) => `<li><strong>Aplicación · ${escapeHtml(entry.applicationName)}</strong><span>${entry.services.filter((service) => service.state === 'ready').length}/${entry.services.length} servicios listos · ${escapeHtml(entry.state)}</span></li>`),
-    ...developmentActivity.processes.map((entry) => {
+    })),
+    ...(kind === 'browsers' ? [] : developmentActivity.applications.map((entry) => `<li><strong>Aplicación · ${escapeHtml(entry.applicationName)}</strong><span>${entry.services.filter((service) => service.state === 'ready').length}/${entry.services.length} servicios listos · ${escapeHtml(entry.state)}</span></li>`)),
+    ...(kind === 'browsers' ? [] : developmentActivity.processes.map((entry) => {
       const workspace = workspaces.find((candidate) => candidate.id === entry.workspaceId);
       const listeners = entry.listeners.length === 0
         ? 'sin puerto loopback detectado'
         : entry.listeners.map((listener) => `${escapeHtml(listener.origin)}${listener.bindScope === 'wildcard' ? ' · wildcard administrado' : ''}${listener.exclusive ? '' : ' · conflicto detectado'}`).join(', ');
       return `<li><strong>Servidor · ${escapeHtml(entry.profile)}</strong><span>${escapeHtml(workspace?.name ?? entry.workspaceId)} · ${listeners} · desde ${new Date(entry.startedAt).toLocaleTimeString()}</span></li>`;
-    }),
-    ...developmentActivity.browsers.map((entry) => {
+    })),
+    ...(kind === 'resources' ? [] : browserEntries.toSorted((left, right) =>
+      interventionControlPriority(left.controlState) - interventionControlPriority(right.controlState) || left.startedAt.localeCompare(right.startedAt)).map((entry) => {
       const workspace = workspaces.find((candidate) => candidate.id === entry.workspaceId);
       const agentOwns = entry.controlState === 'agent_control';
       const waitingForHuman = entry.controlState === 'waiting_for_human';
@@ -1008,13 +1400,36 @@ function developmentActivityHtml(): string {
           ? 'Tú tienes el control; ChatGPT está completamente excluido'
           : entry.postHumanExpiresAt !== undefined ? 'ChatGPT retomó el control tras tu intervención' : 'ChatGPT controla';
       const liveViewerState = liveViewerOpen ? ' · ventana en vivo abierta' : '';
-      return `<li><strong>Navegador · ${escapeHtml(entry.profile)}</strong><span>${escapeHtml(workspace?.name ?? entry.workspaceId)} · ${escapeHtml(entry.path)} · ${state}${liveViewerState}</span>${actions}</li>`;
-    }),
+      const viewportControls = agentOwns ? viewportPresetsHtml(`data-browser-viewport="${escapeHtml(entry.sessionId)}" data-workspace-id="${escapeHtml(entry.workspaceId)}"`, entry.viewport ?? { width: 1920, height: 1080, mobile: false }) : '';
+      const motion = entry.motionCapture === undefined ? '' : `<div class="motion-progress" role="status"><span>Capturando movimiento ${entry.motionCapture.completed}/${entry.motionCapture.total}</span><progress max="${entry.motionCapture.total}" value="${entry.motionCapture.completed}"></progress><button type="button" data-browser-cancel-motion="${escapeHtml(entry.sessionId)}">Cancelar captura</button></div>`;
+      const presentation = liveViewerOpen ? viewerPresentationHtml('browser', entry.sessionId, entry.viewerPresentation) : '';
+      return `<li class="browser-activity-row"><div><span class="source-pill">LOCAL</span><strong>Navegador · ${escapeHtml(entry.profile)}</strong></div><span>${escapeHtml(workspace?.name ?? entry.workspaceId)} · ${escapeHtml(entry.path)} · ${state}${liveViewerState}</span>${motion}${motionReceiptHtml(entry.lastMotionCapture)}${presentation}${viewportControls}${actions}</li>`;
+    })),
   ];
-  return `<ul class="readiness-list">${rows.join('')}</ul>`;
+  return `${analysisNotice}<ul class="readiness-list">${rows.join('')}</ul>`;
 }
 
 function bindDevelopmentHumanControlActions(): void {
+  document.querySelectorAll<HTMLButtonElement>('[data-analysis-cancel]').forEach((button) => {
+    button.addEventListener('click', () => {
+      const workspaceId = button.dataset['workspaceId'] ?? '';
+      const jobId = button.dataset['analysisCancel'] ?? '';
+      void withBusyButton(button, 'Cancelando…', () => window.desktop.cancelAnalysisJob(workspaceId, jobId))
+        .then(() => refreshDevelopmentActivity())
+        .catch((error) => showFeedback('error', `No se pudo cancelar el trabajo: ${errorMessage(error)}`));
+    });
+  });
+  document.querySelectorAll<HTMLButtonElement>('[data-browser-viewport]').forEach((button) => button.addEventListener('click', () => {
+    const workspaceId = button.dataset['workspaceId'];
+    const sessionId = button.dataset['browserViewport'];
+    const width = Number(button.dataset['viewportWidth']);
+    const height = Number(button.dataset['viewportHeight']);
+    const mobile = button.dataset['viewportMobile'] === 'true';
+    if (workspaceId === undefined || sessionId === undefined || !Number.isInteger(width) || !Number.isInteger(height)) return;
+    void withBusyButton(button, 'Aplicando…', () => window.desktop.setBrowserViewport(workspaceId, sessionId, width, height, mobile))
+      .then(() => refreshDevelopmentActivity())
+      .catch((error) => showFeedback('error', `No se pudo cambiar el viewport local: ${errorMessage(error)}`));
+  }));
   document.querySelectorAll<HTMLButtonElement>('[data-terminal-open]').forEach((button) => {
     button.addEventListener('click', () => {
       if (button.disabled) return;
@@ -1054,7 +1469,7 @@ function bindDevelopmentHumanControlActions(): void {
       button.textContent = 'Entregando control…';
       stopBrowserViewer();
       void window.desktop.takeBrowserHumanControl(button.dataset['humanTake'] ?? '')
-        .then(refreshDevelopmentActivity)
+        .then(() => refreshDevelopmentActivity())
         .catch((error) => {
           button.disabled = false;
           button.textContent = 'Tomar control';
@@ -1064,12 +1479,12 @@ function bindDevelopmentHumanControlActions(): void {
   });
   document.querySelectorAll<HTMLButtonElement>('[data-human-decline]').forEach((button) => {
     button.addEventListener('click', () => void window.desktop.declineBrowserHumanControl(button.dataset['humanDecline'] ?? '')
-      .then(refreshDevelopmentActivity)
+      .then(() => refreshDevelopmentActivity())
       .catch((error) => showFeedback('error', `No se pudo cancelar la solicitud: ${errorMessage(error)}`)));
   });
   document.querySelectorAll<HTMLButtonElement>('[data-human-revoke]').forEach((button) => {
     button.addEventListener('click', () => void window.desktop.revokeBrowserHumanControl(button.dataset['humanRevoke'] ?? '')
-      .then(refreshDevelopmentActivity)
+      .then(() => refreshDevelopmentActivity())
       .catch((error) => showFeedback('error', `No se pudo revocar la sesión: ${errorMessage(error)}`)));
   });
   document.querySelectorAll<HTMLButtonElement>('[data-view-browser]').forEach((button) => {
@@ -1083,7 +1498,7 @@ function bindDevelopmentHumanControlActions(): void {
       const displayId = document.querySelector<HTMLSelectElement>(`[data-live-display="${sessionId}"]`)?.value ?? selectedLiveViewerDisplayId(sessionId);
       if (displayId !== undefined) rememberLiveViewerDisplayId(displayId);
       stopBrowserViewer();
-      void window.desktop.showBrowserLiveViewer(sessionId, displayId)
+      void window.desktop.showBrowserLiveViewer(sessionId, displayId, rememberedViewerPresentationMode())
         .then(async () => {
           await refreshDevelopmentActivity();
           if (activeSection === 'activity') render();
@@ -1119,12 +1534,30 @@ function bindDevelopmentHumanControlActions(): void {
       if (developmentActivity.liveViewerSessionId !== sessionId) return;
       select.disabled = true;
       void window.desktop.moveBrowserLiveViewer(sessionId, displayId)
-        .then(refreshDevelopmentActivity)
+        .then(() => refreshDevelopmentActivity())
         .catch((error) => {
           select.disabled = false;
           showFeedback('error', `No se pudo mover la ventana en vivo: ${errorMessage(error)}`);
         });
     });
+  });
+  document.querySelectorAll<HTMLButtonElement>('[data-viewer-presentation="browser"]').forEach((button) => {
+    button.addEventListener('click', () => {
+      const sessionId = button.dataset['sessionId'];
+      const mode = button.dataset['mode'];
+      const panX = Number(button.dataset['panX']);
+      const panY = Number(button.dataset['panY']);
+      if (sessionId === undefined || (mode !== 'fit' && mode !== 'actual') || !Number.isInteger(panX) || !Number.isInteger(panY)) return;
+      rememberViewerPresentationMode(mode);
+      void withBusyButton(button, 'Aplicando…', () => window.desktop.setBrowserLiveViewerPresentation(sessionId, mode, panX, panY))
+        .then(() => refreshDevelopmentActivity())
+        .catch((error) => showFeedback('error', `No se pudo ajustar el visor: ${errorMessage(error)}`));
+    });
+  });
+  document.querySelectorAll<HTMLButtonElement>('[data-browser-cancel-motion]').forEach((button) => {
+    button.addEventListener('click', () => void withBusyButton(button, 'Cancelando…', () => window.desktop.cancelBrowserMotion(button.dataset['browserCancelMotion'] ?? ''))
+      .then(() => refreshDevelopmentActivity())
+      .catch((error) => showFeedback('error', `No se pudo cancelar la captura: ${errorMessage(error)}`)));
   });
 }
 
@@ -1213,20 +1646,136 @@ function pendingApprovalsHtml(): string {
       return `<li><strong>${action}</strong><span>${escapeHtml(workspace?.name ?? approval.workspaceId)} · vence ${new Date(approval.expiresAt).toLocaleTimeString()}</span></li>`;
     })
     .join('');
-  return `<section class="approval-waiting" role="status" aria-live="polite"><div class="approval-waiting-icon" aria-hidden="true">…</div><div><p class="eyebrow">Git protegido</p><h3>Esperando aprobación en ChatGPT</h3><p>LocalBridge recibió la solicitud, pero no ejecutará commit ni push hasta recibir una confirmación MCP válida.</p><ul>${items}</ul></div></section>`;
+  return `<section class="approval-waiting" role="status" aria-live="polite"><div class="approval-waiting-icon" aria-hidden="true">…</div><div><p class="eyebrow">Git protegido</p><h3>Esperando confirmación del cliente MCP</h3><p>La conexión efectiva usa MRTR. Confirma en la interfaz del cliente que originó la llamada; si no ofrece ese paso, selecciona el modo nativo compatible y vuelve a conectar.</p><ul>${items}</ul></div></section>`;
 }
 
 function auditEventsHtml(): string {
   if (auditLoading) return '<div class="empty-state compact-empty" aria-busy="true"><strong>Cargando auditoría…</strong></div>';
   if (auditEvents.length === 0) return '<div class="empty-state compact-empty"><strong>Sin eventos para estos filtros</strong><p>La auditoría aparecerá cuando un cliente use las tools.</p></div>';
-  const visible = auditEvents.slice(0, auditVisibleCount);
-  const remaining = Math.max(auditEvents.length - visible.length, 0);
-  return `<div class="audit-list">${visible
+  const diagnosticFilter = auditFilters.action?.endsWith('.diagnostic') === true;
+  const diagnostics = new Map<string, AuditEvent[]>();
+  if (!diagnosticFilter) {
+    for (const event of auditEvents) {
+      if (!event.action.endsWith('.diagnostic') || event.operationId === undefined) continue;
+      const key = `${event.operationId}:${event.action.slice(0, -'.diagnostic'.length)}`;
+      diagnostics.set(key, [...(diagnostics.get(key) ?? []), event]);
+    }
+  }
+  const operations = auditEvents.filter((event) => {
+    if (diagnosticFilter || !event.action.endsWith('.diagnostic')) return true;
+    if (event.outcome === 'success') return false;
+    if (event.operationId === undefined) return true;
+    return !auditEvents.some((candidate) => candidate.operationId === event.operationId &&
+      candidate.action === event.action.slice(0, -'.diagnostic'.length));
+  });
+  const recoveryFor = (event: AuditEvent): boolean => event.outcome === 'success' && event.operationId !== undefined &&
+    (diagnostics.get(`${event.operationId}:${event.action}`) ?? []).some((diagnostic) =>
+      diagnostic.outcome === 'success' && diagnostic.resource?.endsWith(':recovered') === true);
+  const failedOperations = operations.filter((event) => event.outcome === 'error').length;
+  const recoveredOperations = operations.filter(recoveryFor).length;
+  const diagnosticCount = auditEvents.filter((event) => event.action.endsWith('.diagnostic')).length;
+  const visible = operations.slice(0, auditVisibleCount);
+  const remaining = Math.max(operations.length - visible.length, 0);
+  const summary = `<div class="audit-summary" aria-label="Resumen de auditoría"><span><strong>${operations.length}</strong> operaciones</span><span><strong>${failedOperations}</strong> fallos reales</span><span><strong>${recoveredOperations}</strong> recuperadas</span><span><strong>${diagnosticCount}</strong> detalles</span></div>`;
+  return `${summary}<div class="audit-list">${visible
     .map((event) => {
       const workspace = workspaces.find((candidate) => candidate.id === event.workspaceId);
-      return `<article class="audit-row"><span class="audit-icon audit-${event.outcome}">${event.outcome === 'success' ? '✓' : '×'}</span><div><strong>${escapeHtml(AUDIT_ACTION_LABELS[event.action] ?? event.action)}</strong><p>${escapeHtml(workspace?.name ?? event.workspaceId ?? 'Sistema')} · ${new Date(event.timestamp).toLocaleString()}${event.resource === undefined ? '' : ` · ${escapeHtml(event.resource)}`}</p></div><span class="state-pill ${event.decision === 'deny' ? 'state-denied' : ''}">${event.decision === 'deny' ? 'Denegado' : event.outcome === 'success' ? 'Permitido' : 'Falló'}</span></article>`;
+      const related = event.operationId === undefined ? [] : diagnostics.get(`${event.operationId}:${event.action}`) ?? [];
+      const recovered = recoveryFor(event);
+      const detail = related.length === 0 ? '' : `<details class="audit-diagnostics"><summary>${related.length} detalle(s) técnico(s)</summary>${related.map((diagnostic) => `<p>${escapeHtml(AUDIT_ACTION_LABELS[diagnostic.action] ?? diagnostic.action)}${diagnostic.errorCode === undefined ? '' : ` · ${escapeHtml(diagnostic.errorCode)}`}${diagnostic.resource === undefined ? '' : ` · ${escapeHtml(diagnostic.resource)}`}</p>`).join('')}</details>`;
+      const status = event.decision === 'deny' ? 'Denegado' : recovered ? 'Recuperado' : event.outcome === 'success' ? 'Permitido' : 'Falló';
+      return `<article class="audit-row"><span class="audit-icon audit-${event.outcome}">${event.outcome === 'success' ? '✓' : '×'}</span><div><strong>${escapeHtml(AUDIT_ACTION_LABELS[event.action] ?? event.action)}</strong><p>${escapeHtml(workspace?.name ?? event.workspaceId ?? 'Sistema')} · ${new Date(event.timestamp).toLocaleString()}${event.resource === undefined ? '' : ` · ${escapeHtml(event.resource)}`}${event.errorCode === undefined ? '' : ` · ${escapeHtml(event.errorCode)}`}</p>${detail}</div><span class="state-pill ${event.decision === 'deny' ? 'state-denied' : ''}">${status}</span></article>`;
     })
     .join('')}</div>${remaining === 0 ? '' : `<button type="button" id="audit-show-more">Ver ${Math.min(20, remaining)} eventos más</button>`}`;
+}
+
+function documentCoverageHtml(): string {
+  const relevant = documentAuditEvents.filter((event) =>
+    event.action === 'web.download' || event.action === 'document.read' || event.action === 'document.render' || event.action === 'image.read');
+  if (relevant.length === 0) {
+    return '<div class="empty-state compact-empty"><strong>Sin documentos procesados todavía</strong><p>Cuando ChatGPT lea PDF o imágenes, aquí verás la cobertura real sin mostrar su contenido.</p></div>';
+  }
+  const files = new Map<string, {
+    workspaceId?: string;
+    path: string;
+    downloaded: boolean;
+    text: boolean;
+    image: boolean;
+    pages: Set<number>;
+    textPages: Set<number>;
+    totalPages?: number;
+    sha256Prefix?: string;
+    mode?: 'text' | 'mixed' | 'visual';
+    warnings: Set<string>;
+    failures: number;
+  }>();
+  for (const event of relevant) {
+    if (event.resource === undefined) continue;
+    const rawPath = event.action === 'web.download'
+      ? event.resource.split(':').slice(2, -2).join(':')
+      : event.resource;
+    const metadataSeparator = rawPath.lastIndexOf('#');
+    const metadataCandidate = metadataSeparator < 0 ? '' : rawPath.slice(metadataSeparator + 1);
+    const hasCoverageMetadata = /^(?:textPages|pages|image)=/.test(metadataCandidate);
+    const path = hasCoverageMetadata ? rawPath.slice(0, metadataSeparator) : rawPath;
+    const metadataText = hasCoverageMetadata ? metadataCandidate : '';
+    const metadata = new Map(metadataText.split(';').flatMap((part) => {
+      const separator = part.indexOf('=');
+      return separator < 1 ? [] : [[part.slice(0, separator), part.slice(separator + 1)] as const];
+    }));
+    const key = `${event.workspaceId ?? ''}:${path}`;
+    const current = files.get(key) ?? {
+      ...(event.workspaceId === undefined ? {} : { workspaceId: event.workspaceId }),
+      path, downloaded: false, text: false, image: false, pages: new Set<number>(), textPages: new Set<number>(),
+      warnings: new Set<string>(), failures: 0,
+    };
+    if (event.outcome === 'error') current.failures += 1;
+    else if (event.action === 'web.download') current.downloaded = true;
+    else if (event.action === 'document.read') {
+      current.text = true;
+      for (const page of metadata.get('textPages')?.split(',') ?? []) {
+        const parsed = Number(page);
+        if (Number.isInteger(parsed) && parsed > 0) current.textPages.add(parsed);
+      }
+      const mode = metadata.get('mode');
+      if (mode === 'text' || mode === 'mixed' || mode === 'visual') current.mode = mode;
+    } else if (event.action === 'image.read') current.image = true;
+    else {
+      for (const page of metadata.get('pages')?.split(',') ?? []) {
+        const parsed = Number(page);
+        if (Number.isInteger(parsed) && parsed > 0) current.pages.add(parsed);
+      }
+    }
+    const totalPages = Number(metadata.get('total'));
+    if (Number.isInteger(totalPages) && totalPages > 0) current.totalPages = totalPages;
+    const sha256Prefix = metadata.get('sha');
+    if (sha256Prefix !== undefined && /^[a-f0-9]{12}$/.test(sha256Prefix)) current.sha256Prefix = sha256Prefix;
+    for (const warning of metadata.get('warnings')?.split(',') ?? []) {
+      if (warning !== '' && warning !== 'none') current.warnings.add(warning);
+    }
+    files.set(key, current);
+  }
+  const entries = [...files.values()];
+  const textFiles = entries.filter((entry) => entry.text).length;
+  const downloadedFiles = entries.filter((entry) => entry.downloaded).length;
+  const visualFiles = entries.filter((entry) => entry.image || entry.pages.size > 0).length;
+  const renderedPages = entries.reduce((total, entry) => total + entry.pages.size, 0);
+  const failures = entries.reduce((total, entry) => total + entry.failures, 0);
+  const summary = `<div class="document-summary" aria-label="Cobertura documental"><span><strong>${entries.length}</strong> archivo(s)</span><span><strong>${downloadedFiles}</strong> descargado(s)</span><span><strong>${textFiles}</strong> con texto</span><span><strong>${visualFiles}</strong> visual(es)</span><span><strong>${renderedPages}</strong> página(s) preparadas</span><span><strong>${failures}</strong> fallo(s)</span></div>`;
+  const rows = entries.slice(0, 30).map((entry) => {
+    const workspace = workspaces.find((candidate) => candidate.id === entry.workspaceId);
+    const stages = [
+      entry.downloaded ? 'descargado' : '',
+      entry.text ? `${entry.textPages.size || ''}${entry.textPages.size > 0 ? ' página(s) con ' : ''}texto extraído` : '',
+      entry.pages.size > 0 ? `${entry.pages.size}${entry.totalPages === undefined ? '' : `/${entry.totalPages}`} página(s) renderizada(s)` : '',
+      entry.image ? 'imagen preparada para ChatGPT' : '',
+      entry.mode === undefined ? '' : `modo ${entry.mode}`,
+      entry.sha256Prefix === undefined ? '' : `SHA-256 ${entry.sha256Prefix}…`,
+      entry.warnings.size === 0 ? '' : `${entry.warnings.size} aviso(s)`,
+    ].filter(Boolean).join(' · ');
+    return `<article class="document-coverage-row"><span class="audit-icon ${entry.failures > 0 ? 'audit-error' : 'audit-success'}">${entry.failures > 0 ? '×' : '✓'}</span><div><strong>${escapeHtml(entry.path)}</strong><p>${escapeHtml(workspace?.name ?? entry.workspaceId ?? 'Proyecto')} · ${escapeHtml(stages || 'sin etapa completada')}${entry.failures === 0 ? '' : ` · ${entry.failures} fallo(s)`}</p></div><span class="state-pill ${entry.failures > 0 ? 'state-denied' : ''}">${entry.failures > 0 ? 'Revisar' : 'Preparado'}</span></article>`;
+  }).join('');
+  return `${summary}<div class="audit-list document-coverage-list">${rows}</div>`;
 }
 
 function bindAuditListActions(): void {
@@ -1241,18 +1790,42 @@ function bindAuditListActions(): void {
   });
 }
 
+function activityRuntimeHtml(): string {
+  const browserCount = developmentActivity.browsers.filter((entry) => entry.state === 'running').length +
+    webActivity.filter((entry) => entry.state === 'running').length;
+  const attentionCount = developmentActivity.browsers.filter((entry) => entry.state === 'running' &&
+    ['waiting_for_human', 'human_control', 'returning_to_agent'].includes(entry.controlState)).length +
+    webActivity.filter((entry) => entry.state === 'running' &&
+      ['waiting_for_human', 'human_control', 'returning_to_agent'].includes(entry.controlState)).length;
+  const attention = attentionCount === 0 ? '' : `<div class="attention-card attention-error"><div><strong>${attentionCount} navegador(es) requieren tu intervención</strong><p>ChatGPT está pausado en esas sesiones.</p></div>${activityFilter === 'resources' ? '<button type="button" data-activity-filter="browsers">Mostrar navegadores</button>' : ''}</div>`;
+  const browserContent = browserCount === 0
+    ? `<div class="empty-state compact-empty"><strong>Sin navegadores activos</strong><p>Los navegadores iniciados por ChatGPT aparecerán aquí.</p></div>${webActivityHtml('regular', false)}`
+    : `${developmentActivityHtml('browsers', 'attention')}${webActivityHtml('attention', false)}${developmentActivityHtml('browsers', 'regular')}${webActivityHtml('regular', false)}`;
+  if (activityFilter === 'browsers') return `${attention}${browserContent}`;
+  if (activityFilter === 'resources') return `${attention}${developmentActivityHtml('resources')}`;
+  return `${attention}<div class="activity-group"><h3>Navegadores</h3>${browserContent}</div><div class="activity-group"><h3>Recursos de desarrollo</h3>${developmentActivityHtml('resources')}</div>`;
+}
+
 function activitySectionHtml(): string {
+  const resourceCount = developmentActivity.processes.length + developmentActivity.applications.length + (developmentActivity.terminals?.length ?? 0) + (developmentActivity.jobs?.length ?? 0);
+  const browserCount = developmentActivity.browsers.filter((entry) => entry.state === 'running').length + webActivity.filter((entry) => entry.state === 'running').length;
+  const activeCount = resourceCount + browserCount;
   return `
-    <div class="section-heading"><div><p class="eyebrow">Actividad</p><h2>Diagnóstico de esta sesión</h2><p>El estado importante aparece arriba; el detalle técnico queda plegado.</p></div><span class="state-pill">${tunnelLogs.length} eventos</span></div>
+    <div class="section-heading"><div><p class="eyebrow">Actividad</p><h2>Actividad en curso</h2><p>Observa y controla navegadores locales o de Internet sin cambiar de sección.</p></div><span class="state-pill">${activeCount} activo(s)</span></div>
     <div data-pending-approvals>${pendingApprovalsHtml()}</div>
     <div class="surface-card">
-      <div class="card-heading"><div><h3>Entornos de desarrollo activos</h3><p>Terminales, aplicaciones, procesos y navegadores bajo control de LocalBridge.</p></div><div class="actions"><button type="button" id="refresh-development">Actualizar</button><button type="button" id="stop-all-development" class="danger" ${developmentActivity.processes.length + developmentActivity.browsers.length + developmentActivity.applications.length + (developmentActivity.terminals?.length ?? 0) === 0 ? 'disabled' : ''}>Detener todo</button></div></div>
-      <div id="development-activity">${developmentActivityHtml()}</div>
+      <div class="card-heading"><div><h3>Sesiones y recursos</h3><p>La etiqueta LOCAL o INTERNET identifica el aislamiento de cada navegador.</p></div><div class="actions"><button type="button" id="refresh-development">Actualizar</button><button type="button" id="stop-all-development" class="danger" ${resourceCount + developmentActivity.browsers.length === 0 ? 'disabled' : ''} title="Cierra terminales, procesos, aplicaciones y navegadores locales; las sesiones de Internet se cierran individualmente">Detener entorno de desarrollo</button></div></div>
+      <div class="activity-filters" role="group" aria-label="Filtrar actividad"><button type="button" id="activity-filter-all" data-activity-filter="all" ${activityFilter === 'all' ? 'aria-pressed="true" class="primary"' : 'aria-pressed="false"'}>Todo</button><button type="button" id="activity-filter-browsers" data-activity-filter="browsers" ${activityFilter === 'browsers' ? 'aria-pressed="true" class="primary"' : 'aria-pressed="false"'}>Navegadores</button><button type="button" id="activity-filter-resources" data-activity-filter="resources" ${activityFilter === 'resources' ? 'aria-pressed="true" class="primary"' : 'aria-pressed="false"'}>Recursos</button></div>
+      <div id="development-activity">${activityRuntimeHtml()}</div>
     </div>
     <div class="surface-card">
       <label>Buscar en la actividad<input type="search" id="log-search" value="${escapeHtml(logFilter)}" placeholder="error, conexión, perfil…" /></label>
       <div class="actions"><button type="button" id="copy-diagnostic">Copiar diagnóstico</button><button type="button" id="export-diagnostic">Exportar .txt</button><button type="button" id="clear-logs" ${tunnelLogs.length === 0 ? 'disabled' : ''}>Limpiar vista</button></div>
       <details class="advanced-panel" ${logFilter === '' ? '' : 'open'}><summary>Log técnico filtrado</summary><div id="activity-log-container">${activityLogHtml()}</div></details>
+    </div>
+    <div class="surface-card audit-card">
+      <div class="card-heading"><div><h3>Cobertura documental</h3><p>Archivos y páginas preparados para ChatGPT. LocalBridge muestra la entrega técnica y no interpreta el contenido.</p></div></div>
+      <div id="document-coverage">${documentCoverageHtml()}</div>
     </div>
     <div class="surface-card audit-card">
       <div class="card-heading"><div><h3>Auditoría local</h3><p>Operaciones permitidas, denegadas o fallidas, sin contenido de archivos.</p></div><button type="button" id="refresh-audit">Actualizar</button></div>
@@ -1296,6 +1869,7 @@ function settingsSectionHtml(): string {
     </div>
     <form id="behavior-settings-form" class="surface-card">
       <label class="permission-option"><input type="checkbox" name="minimizeToTray" ${settingsDraft.minimizeToTray ? 'checked' : ''}/><span><strong>Mantener en la bandeja</strong><small>Minimizar o cerrar la ventana mantiene el túnel activo. “Salir” cierra todo explícitamente.</small></span></label>
+      <label>Artefactos grandes en proyectos nuevos<select name="largeArtifactPreference"><option value="standard" ${settingsDraft.largeArtifactPreference.mode === 'standard' ? 'selected' : ''}>Estándar</option><option value="adaptive" ${settingsDraft.largeArtifactPreference.mode === 'adaptive' ? 'selected' : ''}>Adaptativo — sin límite fijo</option></select><small>Esta preferencia se copia al crear proyectos futuros. Los proyectos existentes no cambian.</small></label>
       <button type="submit">Guardar comportamiento</button>
     </form>
     <div class="surface-card"><h3>Configuración inicial</h3><p>Repite el asistente sin borrar proyectos, claves ni perfiles.</p><button type="button" id="restart-onboarding">Repetir configuración inicial</button></div>
@@ -1424,6 +1998,8 @@ export function legacyOnboardingHtml(): string {
 
 function render(): void {
   if (app === null) return;
+  const focusedId = document.activeElement instanceof HTMLElement ? document.activeElement.id : '';
+  const previousScrollTop = document.scrollingElement?.scrollTop ?? 0;
   if (isInitializing) {
     app.innerHTML = '<main class="loading-shell" aria-busy="true"><div class="loading-mark"></div><h1>LocalBridge MCP</h1><p>Preparando tu espacio seguro…</p></main>';
     return;
@@ -1465,7 +2041,7 @@ function render(): void {
           <span class="nav-group-label">Uso diario</span>
           ${([['home', 'Inicio'], ['assisted', 'Desarrollo'], ['activity', 'Actividad']] as Array<[AppSection, string]>).map(([section, label]) => `<button type="button" id="nav-${section}" data-section="${section}" ${activeSection === section ? 'aria-current="page"' : ''}>${label}</button>`).join('')}
           <span class="nav-group-label">Configuración</span>
-          ${([['projects', 'Carpetas'], ['applications', 'Aplicaciones'], ['connection', 'Conexión'], ['settings', 'Ajustes']] as Array<[AppSection, string]>).map(([section, label]) => `<button type="button" id="nav-${section}" data-section="${section}" ${activeSection === section ? 'aria-current="page"' : ''}>${label}</button>`).join('')}
+          ${([['projects', 'Carpetas'], ['applications', 'Aplicaciones'], ['web', 'Acceso a Internet'], ['connection', 'Conexión'], ['settings', 'Ajustes']] as Array<[AppSection, string]>).map(([section, label]) => `<button type="button" id="nav-${section}" data-section="${section}" ${activeSection === section ? 'aria-current="page"' : ''}>${label}</button>`).join('')}
         </nav>
         <div class="sidebar-footer"><span class="status-dot status-dot-${tunnelStatus}"></span><span>${TUNNEL_STATUS_LABELS[tunnelStatus]}</span></div>
       </aside>
@@ -1479,6 +2055,7 @@ function render(): void {
         }
         <main id="main-content" tabindex="-1">
           <section data-view="home" ${activeSection === 'home' ? '' : 'hidden'}>${dashboardHtml()}</section>
+          <section data-view="web" ${activeSection === 'web' ? '' : 'hidden'}>${webSectionHtml()}</section>
           <section data-view="assisted" ${activeSection === 'assisted' ? '' : 'hidden'}>${assistedProjectsSectionHtml()}</section>
           <section data-view="projects" ${activeSection === 'projects' ? '' : 'hidden'}>${workspacesSectionHtml()}</section>
           <section data-view="applications" ${activeSection === 'applications' ? '' : 'hidden'}>${applicationsSectionHtml()}</section>
@@ -1490,6 +2067,8 @@ function render(): void {
     </div>
   `;
   attachHandlers();
+  if (focusedId !== '') document.getElementById(focusedId)?.focus();
+  if (document.scrollingElement !== null) document.scrollingElement.scrollTop = previousScrollTop;
 }
 
 function readPermissionsFromForm(form: HTMLFormElement): WorkspacePermissions {
@@ -1508,6 +2087,20 @@ function readPermissionsFromForm(form: HTMLFormElement): WorkspacePermissions {
   };
 }
 
+function readLargeArtifactPolicy(data: FormData, current: LargeArtifactPolicy): LargeArtifactPolicy {
+  const gib = 1024 * 1024 * 1024;
+  const modeValue = String(data.get('largeArtifactMode') ?? current.mode);
+  const mode = modeValue === 'adaptive' || modeValue === 'custom' ? modeValue : 'standard';
+  const minimumFreeBytes = Math.round(Number(data.get('largeArtifactReserveGiB') ?? current.reserve.minimumFreeBytes / gib) * gib);
+  const minimumFreePercent = Number(data.get('largeArtifactReservePercent') ?? current.reserve.minimumFreePercent);
+  const concurrentValue = Number(data.get('largeArtifactConcurrentJobs') ?? current.maxConcurrentJobs);
+  const maxConcurrentJobs = concurrentValue === 2 ? 2 as const : 1 as const;
+  const common = { reserve: { minimumFreeBytes, minimumFreePercent }, maxConcurrentJobs };
+  if (mode !== 'custom') return { mode, ...common };
+  const fallback = current.mode === 'custom' ? current.customSourceBytes / gib : 1;
+  return { mode, customSourceBytes: Math.round(Number(data.get('largeArtifactCustomGiB') ?? fallback) * gib), ...common };
+}
+
 function syncWorkspaceDraftFromForm(form: HTMLFormElement): void {
   const data = new FormData(form);
   workspaceFormDraft = {
@@ -1515,6 +2108,8 @@ function syncWorkspaceDraftFromForm(form: HTMLFormElement): void {
     rootPath: String(data.get('rootPath') ?? ''),
     enabled: editingWorkspace === undefined || data.get('enabled') !== null,
     permissions: readPermissionsFromForm(form),
+    maxFileBytes: Number(data.get('maxFileBytes') ?? workspaceFormDraft?.maxFileBytes ?? 1_048_576),
+    largeArtifacts: readLargeArtifactPolicy(data, workspaceFormDraft?.largeArtifacts ?? settingsDraft.largeArtifactPreference),
     validationProfilesText: String(data.get('validationProfiles') ?? '{}'),
     processProfilesText: String(data.get('processProfiles') ?? '{}'),
     browserProfilesText: String(data.get('browserProfiles') ?? '{}'),
@@ -1531,6 +2126,7 @@ function syncSettingsDraftFromForm(form: HTMLFormElement): void {
     onboardingStep: settingsDraft.onboardingStep,
     onboardingCompleted: settingsDraft.onboardingCompleted,
     minimizeToTray: settingsDraft.minimizeToTray,
+    largeArtifactPreference: settingsDraft.largeArtifactPreference,
     gitApprovalMode,
     activeConnectionProfileId: settingsDraft.activeConnectionProfileId,
     connectionProfiles: settingsDraft.connectionProfiles.map((profile) =>
@@ -1798,25 +2394,32 @@ async function refreshAudit(): Promise<void> {
   const container = document.querySelector<HTMLDivElement>('#audit-events');
   if (container !== null) container.innerHTML = auditEventsHtml();
   try {
-    auditEvents = await window.desktop.listAuditEvents({ ...auditFilters, limit: 100 });
+    [auditEvents, documentAuditEvents] = await Promise.all([
+      window.desktop.listAuditEvents({ ...auditFilters, limit: 100 }),
+      window.desktop.listAuditEvents({ limit: 500 }).then((events) => events.filter((event) =>
+        event.action === 'web.download' || event.action === 'document.read' || event.action === 'document.render' || event.action === 'image.read')),
+    ]);
   } catch (error) {
     lastProblem = `No se pudo leer la auditoría: ${errorMessage(error)}`;
     auditEvents = [];
+    documentAuditEvents = [];
   } finally {
     auditLoading = false;
     const current = document.querySelector<HTMLDivElement>('#audit-events');
     if (current !== null) current.innerHTML = auditEventsHtml();
+    const documentCoverage = document.querySelector<HTMLDivElement>('#document-coverage');
+    if (documentCoverage !== null) documentCoverage.innerHTML = documentCoverageHtml();
     bindAuditListActions();
   }
 }
 
-async function refreshDevelopmentActivity(): Promise<void> {
+async function refreshDevelopmentActivity(shouldRender = true): Promise<void> {
   try {
     developmentActivity = await window.desktop.listDevelopmentActivity();
     if (developmentActivity.liveViewerDisplayId !== undefined) rememberLiveViewerDisplayId(developmentActivity.liveViewerDisplayId);
   } catch (error) {
     lastProblem = `No se pudo leer la actividad de desarrollo: ${errorMessage(error)}`;
-    developmentActivity = { processes: [], browsers: [], applications: [], terminals: [] };
+    developmentActivity = { processes: [], browsers: [], applications: [], terminals: [], jobs: [] };
   }
   if (browserViewerSessionId !== undefined && !developmentActivity.browsers.some((entry) =>
     entry.sessionId === browserViewerSessionId && entry.state === 'running')) {
@@ -1826,8 +2429,12 @@ async function refreshDevelopmentActivity(): Promise<void> {
       return;
     }
   }
+  if (activeSection === 'activity' && shouldRender) {
+    render();
+    return;
+  }
   const container = document.querySelector<HTMLDivElement>('#development-activity');
-  if (container !== null) container.innerHTML = developmentActivityHtml();
+  if (container !== null) container.innerHTML = activityRuntimeHtml();
   bindDevelopmentHumanControlActions();
   bindAuditListActions();
   const stopButton = document.querySelector<HTMLButtonElement>('#stop-all-development');
@@ -1962,7 +2569,7 @@ async function saveApplicationWizard(verify: boolean): Promise<void> {
         description: draft.description,
         primaryServiceAlias: draft.aliases[draft.primary] ?? '',
         services,
-        viewport: { width: 1280, height: 800 },
+        viewport: { width: 1920, height: 1080 },
       });
     } else {
       const previous = applications.find((application) => application.id === draft.editingId);
@@ -2326,13 +2933,21 @@ function attachHandlers(): void {
   document.querySelectorAll<HTMLButtonElement>('[data-assisted-remove]').forEach((button) => button.addEventListener('click', () => {
     const projectId = button.dataset['assistedRemove'];
     if (projectId === undefined) return;
-    // eslint-disable-next-line no-alert -- confirmación local; solo elimina la agrupación.
-    if (!window.confirm('¿Eliminar esta agrupación? No se borrarán carpetas, permisos, perfiles ni aplicaciones.')) return;
-    void window.desktop.removeDevelopmentProject(projectId).then(async () => {
-      feedback = { kind: 'success', message: 'Ficha eliminada. No se borraron carpetas, repositorios ni workspaces.' };
-      await Promise.all([refreshAssistedProjects(false), refreshV1Projects(false)]);
+    assistedBusyProjectId = projectId;
+    render();
+    void window.desktop.removeDevelopmentProject(projectId).then(async (result) => {
+      assistedBusyProjectId = undefined;
+      if (!result.removed) { render(); return; }
+      const shared = result.sharedWorkspacesKept + result.sharedApplicationsKept;
+      feedback = {
+        kind: 'success',
+        message: `Desarrollo eliminado de LocalBridge: ${result.workspacesRemoved} carpeta(s) autorizada(s) y ${result.applicationsRemoved} aplicación(es) retiradas.${shared > 0 ? ` ${shared} configuración(es) compartida(s) se conservaron.` : ''} Los archivos reales permanecen en el disco.`,
+      };
+      await Promise.all([
+        refreshAssistedProjects(false), refreshV1Projects(false), refreshWorkspaces(false), refreshApplications(false),
+      ]);
       render();
-    }).catch((error) => showFeedback('error', errorMessage(error)));
+    }).catch((error) => { assistedBusyProjectId = undefined; showFeedback('error', errorMessage(error)); });
   }));
 
   document.querySelector('#show-adopt-project')?.addEventListener('click', () => { showAdoptProject = true; assistedWizard = undefined; render(); });
@@ -2353,17 +2968,207 @@ function attachHandlers(): void {
     }).catch((error) => { if (target !== null) target.textContent = errorMessage(error); });
   });
 
+  document.querySelector('#add-public-web-profile')?.addEventListener('click', () => {
+    void window.desktop.createWebProfile({ kind: 'public-research', name: 'Investigación pública' }).then((snapshot) => {
+      webProfiles = snapshot;
+      feedback = { kind: 'success', message: 'Perfil creado y deshabilitado. Revisa su alcance y pulsa Habilitar acceso.' };
+      render();
+    }).catch((error) => showFeedback('error', `No se pudo crear el perfil web: ${errorMessage(error)}`));
+  });
+  document.querySelector<HTMLButtonElement>('#enable-web-browsing')?.addEventListener('click', (event) => {
+    const button = event.currentTarget as HTMLButtonElement;
+    const download = document.querySelector<HTMLInputElement>('#enable-web-download')?.checked === true;
+    void withBusyButton(button, 'Habilitando…', () => window.desktop.enableWebBrowsing(webProfiles.sha256, download)).then((snapshot) => {
+      webProfiles = snapshot;
+      feedback = { kind: 'success', message: 'Navegación por Internet habilitada. ChatGPT ya puede iniciar sesiones aisladas.' };
+      render();
+    }).catch((error) => showFeedback('error', `No se pudo habilitar Internet: ${errorMessage(error)}`));
+  });
+  document.querySelector<HTMLFormElement>('#create-account-web-profile')?.addEventListener('submit', (event) => {
+    event.preventDefault();
+    const form = event.currentTarget as HTMLFormElement;
+    const data = new FormData(form);
+    const lines = (name: string): string[] => String(data.get(name) ?? '').split(/\r?\n/).map((value) => value.trim()).filter(Boolean);
+    const errorTarget = form.querySelector<HTMLElement>('#web-profile-form-error');
+    void window.desktop.createWebProfile({
+      kind: 'site-account',
+      name: String(data.get('name') ?? ''),
+      destinations: lines('destinations'),
+      supportHosts: lines('supportHosts'),
+    }).then((snapshot) => {
+      webProfiles = snapshot;
+      feedback = { kind: 'success', message: 'Perfil con cuenta creado y deshabilitado. Habilítalo cuando termines de revisar los dominios.' };
+      render();
+    }).catch((error) => {
+      if (errorTarget !== null) errorTarget.textContent = errorMessage(error);
+    });
+  });
+  document.querySelector('#reset-web-profiles')?.addEventListener('click', () => {
+    if (webProfiles.sha256 === null) return;
+    void window.desktop.resetWebProfiles(webProfiles.sha256).then((snapshot) => {
+      webProfiles = snapshot;
+      webActivity = [];
+      feedback = { kind: 'success', message: 'Perfiles web restablecidos. Internet volvió a quedar deshabilitado.' };
+      render();
+    }).catch((error) => showFeedback('error', `No se pudo restablecer el registro web: ${errorMessage(error)}`));
+  });
+  document.querySelectorAll<HTMLButtonElement>('[data-web-toggle]').forEach((button) => button.addEventListener('click', () => {
+    const id = button.dataset['webToggle'];
+    const profile = webProfiles.document.profiles.find((candidate) => candidate.id === id);
+    if (profile === undefined) return;
+    void window.desktop.updateWebProfile(webProfiles.sha256, { ...profile, enabled: !profile.enabled }).then(async (snapshot) => {
+      webProfiles = snapshot;
+      await refreshWebState(false);
+      feedback = { kind: 'success', message: profile.enabled ? 'Perfil deshabilitado y sesiones cerradas.' : 'Acceso web habilitado para este perfil.' };
+      render();
+    }).catch((error) => showFeedback('error', `No se pudo cambiar el perfil web: ${errorMessage(error)}`));
+  }));
+  document.querySelectorAll<HTMLSelectElement>('[data-web-transfer-policy]').forEach((select) => select.addEventListener('change', () => {
+    const id = select.dataset['webProfile'];
+    if (id === undefined) return;
+    const adaptive = select.value === 'adaptive';
+    document.querySelectorAll<HTMLSelectElement>(`select[data-web-profile="${id}"][data-web-limit]`)
+      .forEach((limit) => { limit.disabled = adaptive; });
+  }));
+  document.querySelectorAll<HTMLButtonElement>('[data-web-save]').forEach((button) => button.addEventListener('click', () => {
+    const id = button.dataset['webSave'];
+    const profile = webProfiles.document.profiles.find((candidate) => candidate.id === id);
+    if (profile === undefined) return;
+    const checked = (permission: string): boolean => document.querySelector<HTMLInputElement>(`input[data-web-profile="${id}"][data-web-permission="${permission}"]`)?.checked === true;
+    const permissions = {
+      read: true,
+      interact: checked('interact'),
+      download: checked('download'),
+      humanControl: profile.kind === 'site-account' && checked('humanControl'),
+    };
+    const limit = (name: string, fallback: number): number => Number(
+      document.querySelector<HTMLSelectElement>(`select[data-web-profile="${id}"][data-web-limit="${name}"]`)?.value ?? fallback,
+    );
+    const limits = {
+      ...profile.limits,
+      maxDownloadBytes: limit('maxDownloadBytes', profile.limits.maxDownloadBytes),
+      maxTotalDownloadBytes: limit('maxTotalDownloadBytes', profile.limits.maxTotalDownloadBytes),
+      transferPolicy: {
+        mode: document.querySelector<HTMLSelectElement>(`select[data-web-profile="${id}"][data-web-transfer-policy]`)?.value === 'adaptive'
+          ? 'adaptive' as const
+          : 'fixed' as const,
+      },
+    };
+    void window.desktop.updateWebProfile(webProfiles.sha256, { ...profile, permissions, limits }).then(async (snapshot) => {
+      webProfiles = snapshot;
+      await refreshWebState(false);
+      feedback = { kind: 'success', message: 'Configuración web guardada. Las sesiones continúan si no cambió su autoridad.' };
+      render();
+    }).catch((error) => showFeedback('error', `No se pudieron guardar los permisos web: ${errorMessage(error)}`));
+  }));
+  document.querySelectorAll<HTMLButtonElement>('[data-web-remove]').forEach((button) => button.addEventListener('click', () => {
+    const id = button.dataset['webRemove'];
+    if (id === undefined) return;
+    void window.desktop.removeWebProfile(webProfiles.sha256, id).then(async (snapshot) => {
+      webProfiles = snapshot;
+      await refreshWebState(false);
+      feedback = { kind: 'success', message: 'Perfil web eliminado y sus sesiones cerradas.' };
+      render();
+    }).catch((error) => showFeedback('error', `No se pudo eliminar el perfil web: ${errorMessage(error)}`));
+  }));
+  document.querySelector('#refresh-web-activity')?.addEventListener('click', () => { void refreshWebState(); });
+  document.querySelectorAll<HTMLButtonElement>('[data-web-viewport]').forEach((button) => button.addEventListener('click', () => {
+    const sessionId = button.dataset['webViewport'];
+    const tabId = button.dataset['webTabId'];
+    const width = Number(button.dataset['viewportWidth']);
+    const height = Number(button.dataset['viewportHeight']);
+    const mobile = button.dataset['viewportMobile'] === 'true';
+    if (sessionId === undefined || tabId === undefined || !Number.isInteger(width) || !Number.isInteger(height)) return;
+    void withBusyButton(button, 'Aplicando…', () => window.desktop.setWebViewport(sessionId, tabId, width, height, mobile))
+      .then(() => refreshWebState())
+      .catch((error) => showFeedback('error', `No se pudo cambiar el viewport web: ${errorMessage(error)}`));
+  }));
+  document.querySelectorAll<HTMLButtonElement>('[data-web-take]').forEach((button) => button.addEventListener('click', () => {
+    const id = button.dataset['webTake'];
+    const tabId = button.dataset['webTabId'];
+    if (id === undefined || button.disabled) return;
+    button.disabled = true;
+    button.textContent = 'Entregando control…';
+    void window.desktop.takeWebHumanControl(id, tabId).then(() => refreshWebState()).catch((error) => showFeedback('error', errorMessage(error)));
+  }));
+  document.querySelectorAll<HTMLButtonElement>('[data-web-cycle]').forEach((button) => button.addEventListener('click', () => {
+    const sessionId = button.dataset['webSessionId'];
+    const direction = button.dataset['webCycle'];
+    if (sessionId === undefined || (direction !== 'previous' && direction !== 'next')) return;
+    void window.desktop.cycleWebHumanTab(sessionId, direction).then(() => refreshWebState()).catch((error) => showFeedback('error', errorMessage(error)));
+  }));
+  document.querySelectorAll<HTMLButtonElement>('[data-web-return]').forEach((button) => button.addEventListener('click', () => {
+    const id = button.dataset['webReturn'];
+    if (id !== undefined) void window.desktop.returnWebHumanControl(id).then(() => refreshWebState()).catch((error) => showFeedback('error', errorMessage(error)));
+  }));
+  document.querySelectorAll<HTMLButtonElement>('[data-web-decline]').forEach((button) => button.addEventListener('click', () => {
+    const id = button.dataset['webDecline'];
+    if (id !== undefined) void window.desktop.declineWebHumanControl(id).then(() => refreshWebState()).catch((error) => showFeedback('error', errorMessage(error)));
+  }));
+  document.querySelectorAll<HTMLButtonElement>('[data-web-stop]').forEach((button) => button.addEventListener('click', () => {
+    const id = button.dataset['webStop'];
+    if (id !== undefined) void window.desktop.stopWebSession(id).then(() => refreshWebState()).catch((error) => showFeedback('error', errorMessage(error)));
+  }));
+  document.querySelectorAll<HTMLButtonElement>('[data-web-view-follow]').forEach((button) => button.addEventListener('click', () => {
+    const sessionId = button.dataset['webViewFollow'];
+    if (sessionId === undefined) return;
+    const displayId = selectedWebLiveViewerDisplayId(sessionId);
+    void window.desktop.showWebLiveViewer(sessionId, 'follow', displayId, undefined, rememberedViewerPresentationMode()).then(() => refreshWebState()).catch((error) => showFeedback('error', errorMessage(error)));
+  }));
+  document.querySelectorAll<HTMLButtonElement>('[data-web-view-pinned]').forEach((button) => button.addEventListener('click', () => {
+    const sessionId = button.dataset['webViewPinned'];
+    const tabId = button.dataset['webTabId'];
+    if (sessionId === undefined || tabId === undefined) return;
+    const displayId = selectedWebLiveViewerDisplayId(sessionId);
+    void window.desktop.showWebLiveViewer(sessionId, 'pinned', displayId, tabId, rememberedViewerPresentationMode()).then(() => refreshWebState()).catch((error) => showFeedback('error', errorMessage(error)));
+  }));
+  document.querySelectorAll<HTMLButtonElement>('[data-web-hide-viewer]').forEach((button) => button.addEventListener('click', () => {
+    const sessionId = button.dataset['webHideViewer'];
+    if (sessionId !== undefined) void window.desktop.hideWebLiveViewer(sessionId).then(() => refreshWebState()).catch((error) => showFeedback('error', errorMessage(error)));
+  }));
+  document.querySelectorAll<HTMLSelectElement>('[data-web-live-display]').forEach((select) => select.addEventListener('change', () => {
+    const sessionId = select.dataset['webLiveDisplay'];
+    if (sessionId === undefined || select.value === '') return;
+    rememberLiveViewerDisplayId(select.value);
+    if (webLiveViewer.visible && webLiveViewer.sessionId === sessionId) {
+      void window.desktop.moveWebLiveViewer(sessionId, select.value).then(() => refreshWebState()).catch((error) => showFeedback('error', errorMessage(error)));
+    }
+  }));
+  document.querySelectorAll<HTMLButtonElement>('[data-viewer-presentation="web"]').forEach((button) => button.addEventListener('click', () => {
+    const sessionId = button.dataset['sessionId'];
+    const mode = button.dataset['mode'];
+    const panX = Number(button.dataset['panX']);
+    const panY = Number(button.dataset['panY']);
+    if (sessionId === undefined || (mode !== 'fit' && mode !== 'actual') || !Number.isInteger(panX) || !Number.isInteger(panY)) return;
+    rememberViewerPresentationMode(mode);
+    void withBusyButton(button, 'Aplicando…', () => window.desktop.setWebLiveViewerPresentation(sessionId, mode, panX, panY))
+      .then(() => refreshWebState())
+      .catch((error) => showFeedback('error', `No se pudo ajustar el visor web: ${errorMessage(error)}`));
+  }));
+  document.querySelectorAll<HTMLButtonElement>('[data-web-cancel-motion]').forEach((button) => button.addEventListener('click', () => {
+    const sessionId = button.dataset['webCancelMotion'];
+    const tabId = button.dataset['webTabId'];
+    if (sessionId === undefined || tabId === undefined) return;
+    void withBusyButton(button, 'Cancelando…', () => window.desktop.cancelWebMotion(sessionId, tabId))
+      .then(() => refreshWebState())
+      .catch((error) => showFeedback('error', `No se pudo cancelar la captura: ${errorMessage(error)}`));
+  }));
+
   document.querySelectorAll<HTMLButtonElement>('[data-section], [data-section-target]').forEach((button) => {
     button.addEventListener('click', () => {
       const section = button.dataset['section'] ?? button.dataset['sectionTarget'];
-      if (section !== 'home' && section !== 'assisted' && section !== 'projects' && section !== 'applications' && section !== 'connection' && section !== 'activity' && section !== 'settings') return;
+      if (section !== 'home' && section !== 'web' && section !== 'assisted' && section !== 'projects' && section !== 'applications' && section !== 'connection' && section !== 'activity' && section !== 'settings') return;
       if (section !== 'activity') stopBrowserViewer();
       activeSection = section;
       sidebarOpen = false;
       feedback = undefined;
       render();
       document.querySelector<HTMLElement>('#main-content')?.focus({ preventScroll: true });
-      if (section === 'activity') void Promise.all([refreshAudit(), refreshDevelopmentActivity()]);
+      if (section === 'activity') void Promise.all([refreshDevelopmentActivity(false), refreshWebState(false)]).then(async () => {
+        render();
+        await refreshAudit();
+      });
+      if (section === 'web') void refreshWebState();
     });
   });
 
@@ -2408,9 +3213,18 @@ function attachHandlers(): void {
   });
   document.querySelector<HTMLButtonElement>('#refresh-development')?.addEventListener('click', (event) => {
     const button = event.currentTarget as HTMLButtonElement;
-    void withBusyButton(button, 'Actualizando…', refreshDevelopmentActivity)
+    void withBusyButton(button, 'Actualizando…', async () => {
+      await Promise.all([refreshDevelopmentActivity(false), refreshWebState(false)]);
+      render();
+    })
       .catch((error) => showFeedback('error', `No se pudo actualizar la actividad: ${errorMessage(error)}`));
   });
+  document.querySelectorAll<HTMLButtonElement>('[data-activity-filter]').forEach((button) => button.addEventListener('click', () => {
+    const filter = button.dataset['activityFilter'];
+    if (filter !== 'all' && filter !== 'browsers' && filter !== 'resources') return;
+    activityFilter = filter;
+    render();
+  }));
   document.querySelector<HTMLButtonElement>('#stop-all-development')?.addEventListener('click', (event) => {
     const button = event.currentTarget as HTMLButtonElement;
     stopBrowserViewer();
@@ -2452,6 +3266,11 @@ function attachHandlers(): void {
   const workspaceForm = document.querySelector<HTMLFormElement>('#workspace-form');
   workspaceForm?.addEventListener('input', () => syncWorkspaceDraftFromForm(workspaceForm));
   workspaceForm?.addEventListener('change', () => syncWorkspaceDraftFromForm(workspaceForm));
+  workspaceForm?.querySelector<HTMLSelectElement>('#large-artifact-mode')?.addEventListener('change', () => {
+    syncWorkspaceDraftFromForm(workspaceForm);
+    render();
+    document.querySelector<HTMLSelectElement>('#large-artifact-mode')?.focus();
+  });
   workspaceForm?.querySelector<HTMLInputElement>('input[name="perm-browserHumanControl"]')?.addEventListener('change', (event) => {
     if (!(event.currentTarget as HTMLInputElement).checked) return;
     const read = workspaceForm.querySelector<HTMLInputElement>('input[name="perm-browserRead"]');
@@ -2955,6 +3774,11 @@ function attachHandlers(): void {
             rootPath: String(data.get('rootPath')),
             enabled: data.get('enabled') !== null,
             permissions: readPermissionsFromForm(form),
+            limits: {
+              ...editingWorkspace.limits,
+              maxFileBytes: Number(data.get('maxFileBytes')),
+              largeArtifacts: readLargeArtifactPolicy(data, editingWorkspace.limits.largeArtifacts),
+            },
             validationProfiles,
             processProfiles,
             browserProfiles,
@@ -2964,6 +3788,8 @@ function attachHandlers(): void {
           await window.desktop.createWorkspace({
             name: String(data.get('name')),
             rootPath: String(data.get('rootPath')),
+            maxFileBytes: Number(data.get('maxFileBytes')),
+            largeArtifacts: readLargeArtifactPolicy(data, workspaceFormDraft?.largeArtifacts ?? settingsDraft.largeArtifactPreference),
             permissions: readPermissionsFromForm(form),
             validationProfiles,
             processProfiles,
@@ -3038,7 +3864,10 @@ function attachHandlers(): void {
         const modeChanged = settings.gitApprovalMode !== settingsDraft.gitApprovalMode;
         await window.desktop.saveSettings(settingsDraft);
         settings = { ...settingsDraft };
-        showFeedback('success', modeChanged ? 'Configuración guardada. Desconecta y conecta de nuevo para aplicar el modo de aprobación.' : 'Configuración guardada.');
+        const reconnectRequired = effectiveGitApprovalMode !== undefined && effectiveGitApprovalMode !== settings.gitApprovalMode;
+        showFeedback('success', reconnectRequired
+          ? 'Configuración guardada. Desconecta y conecta de nuevo para aplicar el modo de aprobación.'
+          : modeChanged ? 'Configuración guardada. El modo se aplicará en la próxima conexión.' : 'Configuración guardada.');
       } catch (error) {
         showFeedback('error', safeTunnelErrorMessage(error, 'guardar el ID'));
       }
@@ -3067,6 +3896,9 @@ function attachHandlers(): void {
         settingsDraft = {
           ...settingsDraft,
           minimizeToTray: form.querySelector<HTMLInputElement>('input[name="minimizeToTray"]')?.checked === true,
+          largeArtifactPreference: form.querySelector<HTMLSelectElement>('select[name="largeArtifactPreference"]')?.value === 'adaptive'
+            ? { mode: 'adaptive', reserve: settingsDraft.largeArtifactPreference.reserve, maxConcurrentJobs: settingsDraft.largeArtifactPreference.maxConcurrentJobs }
+            : { mode: 'standard', reserve: settingsDraft.largeArtifactPreference.reserve, maxConcurrentJobs: settingsDraft.largeArtifactPreference.maxConcurrentJobs },
         };
         await window.desktop.saveSettings(settingsDraft);
         settings = { ...settingsDraft };
@@ -3148,6 +3980,7 @@ function attachHandlers(): void {
         await window.desktop.saveSettings(settingsDraft);
         settings = { ...settingsDraft };
         await window.desktop.connectTunnel(apiKeyDraft);
+        effectiveGitApprovalMode = settingsDraft.gitApprovalMode;
         showFeedback(
           'success',
           apiKeyDraft === storedApiKey
@@ -3201,6 +4034,7 @@ function attachHandlers(): void {
 
 window.desktop.onTunnelStatusChange((status, detail) => {
   tunnelStatus = status;
+  if (status === 'disconnected' || status === 'error') effectiveGitApprovalMode = undefined;
   tunnelDetail = detail;
   if (status === 'error' && detail !== undefined) lastProblem = detail;
   updateTunnelRuntimeUi();
@@ -3216,13 +4050,15 @@ window.desktop.onTunnelLog((line, stream) => {
 
 window.desktop.onDevelopmentActivityChange(() => { void refreshDevelopmentActivity(); });
 window.desktop.onAssistedProjectsChange(() => { void Promise.all([refreshAssistedProjects(false), refreshV1Projects(false)]).then(() => render()); });
+window.desktop.onWebActivityChange(() => { void refreshWebState(); });
 
 render();
 
 void (async () => {
   try {
-    const [initialStatus, initialRuntime, initialSettings, initialOnboarding, initialWorkspaceResult, initialApplicationResult, initialAssistedResult, initialV1Result, initialApprovalResult, initialDevelopmentResult, savedKey] = await Promise.all([
+    const [initialStatus, initialEffectiveGitApprovalMode, initialRuntime, initialSettings, initialOnboarding, initialWorkspaceResult, initialApplicationResult, initialAssistedResult, initialV1Result, initialApprovalResult, initialDevelopmentResult, initialWebProfilesResult, initialWebActivityResult, savedKey] = await Promise.all([
       window.desktop.getTunnelStatus(),
+      window.desktop.getEffectiveGitApprovalMode(),
       window.desktop.getRuntimeInfo(),
       window.desktop.getSettings(),
       window.desktop.getOnboardingSnapshot(),
@@ -3250,9 +4086,18 @@ void (async () => {
         .listDevelopmentActivity()
         .then((value) => ({ value }))
         .catch((error: unknown) => ({ error })),
+      window.desktop
+        .getWebProfiles()
+        .then((value) => ({ value }))
+        .catch((error: unknown) => ({ error })),
+      window.desktop
+        .listWebActivity()
+        .then((value) => ({ value }))
+        .catch((error: unknown) => ({ error })),
       window.desktop.getSavedTunnelKey(),
     ]);
     tunnelStatus = initialStatus;
+    effectiveGitApprovalMode = initialEffectiveGitApprovalMode;
     runtimeInfo = initialRuntime;
     settings = initialSettings;
     settingsDraft = { ...initialSettings };
@@ -3288,6 +4133,9 @@ void (async () => {
       lastProblem = `No se pudo leer el estado de aprobaciones: ${errorMessage(initialApprovalResult.error)}`;
     }
     if ('value' in initialDevelopmentResult) developmentActivity = initialDevelopmentResult.value;
+    if ('value' in initialWebProfilesResult) webProfiles = initialWebProfilesResult.value;
+    else webProfilesError = errorMessage(initialWebProfilesResult.error);
+    if ('value' in initialWebActivityResult) webActivity = initialWebActivityResult.value;
     if (savedKey !== undefined) {
       apiKeyDraft = savedKey;
       storedApiKey = savedKey;

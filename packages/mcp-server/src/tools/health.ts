@@ -13,7 +13,7 @@ import type { ToolContext } from '../tool-context.js';
  * que su salida es lo mínimo necesario para saber que el servidor responde.
  */
 
-const inputSchema = z.object({});
+const inputSchema = z.object({}).strict();
 
 const outputSchema = z.object({
   status: z.literal('ready'),

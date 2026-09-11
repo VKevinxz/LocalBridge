@@ -22,6 +22,7 @@ export const ERROR_CODES = [
   'FILE_NOT_FOUND',
   'FILE_ALREADY_EXISTS',
   'FILE_TOO_LARGE',
+  'INSUFFICIENT_DISK_SPACE',
   'NOT_A_FILE',
   'HASH_MISMATCH',
   'GIT_NOT_REPOSITORY',
@@ -33,6 +34,7 @@ export const ERROR_CODES = [
   'APPROVAL_DECLINED',
   'APPROVAL_INVALID',
   'GIT_PUSH_REJECTED',
+  'GIT_PUSH_UNCERTAIN',
   'FEATURE_UNAVAILABLE',
   'PROFILE_NOT_FOUND',
   'PROFILE_SOURCE_MISSING',
@@ -76,6 +78,8 @@ export const ERROR_CODES = [
   'LISTENER_NOT_FOUND',
   'SESSION_NOT_FOUND',
   'STALE_SNAPSHOT',
+  'ELEMENT_NOT_INTERACTABLE',
+  'ASSERTION_FAILED',
   'ORIGIN_BLOCKED',
   'SENSITIVE_INPUT_BLOCKED',
   'HUMAN_CONTROL_NOT_ALLOWED',
@@ -84,6 +88,37 @@ export const ERROR_CODES = [
   'HUMAN_CONTROL_EXPIRED',
   'HUMAN_CONTROL_DECLINED',
   'HUMAN_CONTROL_BUSY',
+  'WEB_SESSION_NOT_FOUND',
+  'WEB_TAB_NOT_FOUND',
+  'WEB_DESTINATION_BLOCKED',
+  'WEB_NAVIGATION_FAILED',
+  'WEB_CAPTURE_FAILED',
+  'WEB_CAPTURE_TOO_LARGE',
+  'WEB_EFFECT_UNCERTAIN',
+  'MOTION_CAPTURE_UNAVAILABLE',
+  'MOTION_CAPTURE_INTERRUPTED',
+  'MOTION_EFFECT_UNCERTAIN',
+  'MOTION_LIMIT_EXCEEDED',
+  'MOTION_BUNDLE_INVALID',
+  'MOTION_BUNDLES_INCOMPATIBLE',
+  'WEB_RESOURCE_NOT_FOUND',
+  'WEB_DOWNLOAD_BLOCKED',
+  'WEB_DOWNLOAD_QUOTA_EXCEEDED',
+  'WEB_MEDIA_TYPE_UNSUPPORTED',
+  'WEB_MEDIA_TYPE_MISMATCH',
+  'WEB_DOWNLOAD_EMPTY',
+  'HUMAN_ACTION_REQUIRED',
+  'DOCUMENT_UNSUPPORTED',
+  'DOCUMENT_NO_TEXT',
+  'DOCUMENT_RENDER_FAILED',
+  'DOCUMENT_RENDER_TOO_LARGE',
+  'IMAGE_UNSUPPORTED',
+  'IMAGE_TOO_LARGE',
+  'ANALYSIS_JOB_NOT_FOUND',
+  'ANALYSIS_QUEUE_FULL',
+  'ANALYSIS_CANCELLED',
+  'ANALYSIS_INTERRUPTED',
+  'ANALYSIS_FAILED',
   'INTERNAL_ERROR',
 ] as const;
 
@@ -140,6 +175,10 @@ const ERROR_DEFINITIONS: Readonly<Record<ErrorCode, ErrorDefinition>> = {
     message: 'The file exceeds the size limit of this workspace. Read it in bounded chunks with maxBytes.',
     recoverable: true,
   },
+  INSUFFICIENT_DISK_SPACE: {
+    message: 'The workspace disk does not have enough free space for this download and its safety reserve. Free space or choose another authorized workspace.',
+    recoverable: true,
+  },
   NOT_A_FILE: {
     message: 'The path is not a regular file.',
     recoverable: true,
@@ -182,6 +221,10 @@ const ERROR_DEFINITIONS: Readonly<Record<ErrorCode, ErrorDefinition>> = {
   },
   GIT_PUSH_REJECTED: {
     message: 'The remote rejected the push (for example, it is not a fast-forward). Pull or rebase, then retry — this tool never force-pushes.',
+    recoverable: true,
+  },
+  GIT_PUSH_UNCERTAIN: {
+    message: 'The push outcome could not be verified after the connection or process was interrupted. Inspect the remote branch before retrying.',
     recoverable: true,
   },
   FEATURE_UNAVAILABLE: {
@@ -356,6 +399,14 @@ const ERROR_DEFINITIONS: Readonly<Record<ErrorCode, ErrorDefinition>> = {
     message: 'The page changed after the snapshot. Take a new browser snapshot before interacting.',
     recoverable: true,
   },
+  ELEMENT_NOT_INTERACTABLE: {
+    message: 'The referenced element is hidden, disabled, covered or otherwise cannot receive the requested interaction.',
+    recoverable: true,
+  },
+  ASSERTION_FAILED: {
+    message: 'The browser condition was not satisfied. Take a fresh snapshot or inspect browser events before retrying.',
+    recoverable: true,
+  },
   ORIGIN_BLOCKED: {
     message: 'The requested browser destination is outside the approved loopback origins.',
     recoverable: false,
@@ -388,6 +439,130 @@ const ERROR_DEFINITIONS: Readonly<Record<ErrorCode, ErrorDefinition>> = {
     message: 'Another isolated browser is already under human control. Wait for it to finish or ask the user to cancel it.',
     recoverable: true,
   },
+  WEB_SESSION_NOT_FOUND: {
+    message: 'The web session does not exist or lost its local authorization. Call web.list or start a new enabled profile.',
+    recoverable: true,
+  },
+  WEB_TAB_NOT_FOUND: {
+    message: 'The web tab does not exist in that session. Call web.tabs to refresh the available tabs.',
+    recoverable: true,
+  },
+  WEB_DESTINATION_BLOCKED: {
+    message: 'The destination is outside the enabled web profile or is not a public HTTPS host.',
+    recoverable: false,
+  },
+  WEB_NAVIGATION_FAILED: {
+    message: 'The isolated web tab could not prove that navigation completed. Inspect the current tab before deciding whether to retry.',
+    recoverable: true,
+  },
+  WEB_CAPTURE_FAILED: {
+    message: 'The isolated web tab could not produce a valid screenshot. Observe the tab state before retrying once.',
+    recoverable: true,
+  },
+  WEB_CAPTURE_TOO_LARGE: {
+    message: 'The web screenshot exceeded the safe transport budget even after bounded fallback compression. Use a smaller viewport and retry.',
+    recoverable: true,
+  },
+  WEB_EFFECT_UNCERTAIN: {
+    message: 'The web action may have taken effect before the connection failed. Observe the current page and do not repeat it automatically.',
+    recoverable: true,
+  },
+  MOTION_CAPTURE_UNAVAILABLE: {
+    message: 'The requested temporal capture backend is unavailable in this browser session. Use auto or stepped capture.',
+    recoverable: true,
+  },
+  MOTION_CAPTURE_INTERRUPTED: {
+    message: 'The page, session or authority changed during temporal capture. Inspect the current state before starting a new operation.',
+    recoverable: true,
+  },
+  MOTION_EFFECT_UNCERTAIN: {
+    message: 'Temporal capture started moving the page before it failed. Inspect the page and use a new operationId only when a new capture is intended.',
+    recoverable: true,
+  },
+  MOTION_LIMIT_EXCEEDED: {
+    message: 'Another temporal capture is active or the motion artifact exceeded its bounded limits. Wait or reduce the capture size.',
+    recoverable: true,
+  },
+  MOTION_BUNDLE_INVALID: {
+    message: 'The motion bundle is malformed, incomplete, or does not match its declared hashes. Capture it again to a new destination.',
+    recoverable: true,
+  },
+  MOTION_BUNDLES_INCOMPATIBLE: {
+    message: 'The motion bundles have different viewport, progress, direction, format, or frame dimensions and cannot be compared.',
+    recoverable: true,
+  },
+  WEB_RESOURCE_NOT_FOUND: {
+    message: 'The observed web resource reference is stale or does not belong to this tab. Extract the page again to obtain current references.',
+    recoverable: true,
+  },
+  WEB_DOWNLOAD_BLOCKED: {
+    message: 'The web profile, resource type, size or destination does not allow this download.',
+    recoverable: false,
+  },
+  WEB_DOWNLOAD_QUOTA_EXCEEDED: {
+    message: 'The download exceeds the locally configured asset or session quota. Reduce the asset set or change the web profile limit locally before retrying.',
+    recoverable: true,
+  },
+  WEB_MEDIA_TYPE_UNSUPPORTED: {
+    message: 'The observed resource is not a supported passive document or media format. Re-enumerate assets and choose a supported resource.',
+    recoverable: true,
+  },
+  WEB_MEDIA_TYPE_MISMATCH: {
+    message: 'The resource MIME, extension and file signature do not identify the same passive format. Re-enumerate assets or use the normalized path returned by LocalBridge.',
+    recoverable: true,
+  },
+  WEB_DOWNLOAD_EMPTY: {
+    message: 'The server returned an empty download. Re-enumerate the page assets and retry only if the resource changed.',
+    recoverable: true,
+  },
+  HUMAN_ACTION_REQUIRED: {
+    message: 'This web action requires private local human control. Request or take control, complete the step, and explicitly return control.',
+    recoverable: true,
+  },
+  DOCUMENT_UNSUPPORTED: {
+    message: 'The PDF is encrypted, malformed, or otherwise outside the supported passive document contract.',
+    recoverable: false,
+  },
+  DOCUMENT_NO_TEXT: {
+    message: 'No useful text was found in the requested PDF pages. Use document.render to inspect them visually.',
+    recoverable: true,
+  },
+  DOCUMENT_RENDER_FAILED: {
+    message: 'The PDF page could not be rendered safely. Reduce the page batch and retry once; report the page if it still fails.',
+    recoverable: true,
+  },
+  DOCUMENT_RENDER_TOO_LARGE: {
+    message: 'The rendered PDF page exceeded the visual transport budget. Retry with standard detail or a smaller page batch.',
+    recoverable: true,
+  },
+  IMAGE_UNSUPPORTED: {
+    message: 'The file is not a supported passive PNG, JPEG, or WebP image, or its signature does not match its format.',
+    recoverable: false,
+  },
+  IMAGE_TOO_LARGE: {
+    message: 'The image exceeds the safe source, pixel, memory, or visual transport budget.',
+    recoverable: false,
+  },
+  ANALYSIS_JOB_NOT_FOUND: {
+    message: 'The analysis job does not exist in this workspace or its retention period expired. Call analysis.list to discover available jobs.',
+    recoverable: true,
+  },
+  ANALYSIS_QUEUE_FULL: {
+    message: 'The managed analysis queue is full. No job or effect was started; wait for an existing job to finish and retry later.',
+    recoverable: true,
+  },
+  ANALYSIS_CANCELLED: {
+    message: 'The managed analysis was cancelled and will not deliver further content.',
+    recoverable: false,
+  },
+  ANALYSIS_INTERRUPTED: {
+    message: 'The managed analysis was interrupted before a terminal receipt was recorded. Inspect its status before starting a new attempt.',
+    recoverable: true,
+  },
+  ANALYSIS_FAILED: {
+    message: 'The managed analysis failed. Inspect analysis.status for its stage and coverage before choosing another supported method.',
+    recoverable: true,
+  },
   INTERNAL_ERROR: {
     message: 'The operation failed for an internal reason.',
     recoverable: false,
@@ -401,6 +576,7 @@ export interface ErrorPayload {
     readonly code: ErrorCode;
     readonly message: string;
     readonly recoverable: boolean;
+    readonly causeCode?: ErrorCode;
   };
 }
 
@@ -437,6 +613,10 @@ export function isLocalBridgeError(value: unknown): value is LocalBridgeError {
 export function toErrorPayload(value: unknown): ErrorPayload {
   const code: ErrorCode = isLocalBridgeError(value) ? value.code : 'INTERNAL_ERROR';
   const definition = ERROR_DEFINITIONS[code];
+  const rawCause = isLocalBridgeError(value) ? value.details?.['causeCode'] : undefined;
+  const causeCode = typeof rawCause === 'string' && (ERROR_CODES as readonly string[]).includes(rawCause)
+    ? rawCause as ErrorCode
+    : undefined;
 
   return {
     ok: false,
@@ -444,6 +624,7 @@ export function toErrorPayload(value: unknown): ErrorPayload {
       code,
       message: definition.message,
       recoverable: definition.recoverable,
+      ...(causeCode === undefined ? {} : { causeCode }),
     },
   };
 }
