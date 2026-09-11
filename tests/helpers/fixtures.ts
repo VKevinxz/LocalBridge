@@ -7,7 +7,7 @@
  */
 
 import { randomUUID } from 'node:crypto';
-import { mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, open, rm, symlink, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -24,6 +24,24 @@ export async function createTempWorkspaceDir(): Promise<TempWorkspace> {
     root,
     cleanup: () => rm(root, { recursive: true, force: true }),
   };
+}
+
+/** Crea una fuente grande sin reservar físicamente sus regiones vacías en NTFS. */
+export async function createSparseFile(filePath: string, size: number, prefix?: Buffer): Promise<void> {
+  await writeFile(filePath, prefix ?? Buffer.alloc(0), { flag: 'wx' });
+  if (process.platform === 'win32') {
+    const { execFile } = await import('node:child_process');
+    const { promisify } = await import('node:util');
+    // truncate por sí solo no marca el archivo como sparse en Windows.
+    // Si falla setflag, no intentamos reservar cientos de GiB como fallback.
+    await promisify(execFile)('fsutil.exe', ['sparse', 'setflag', filePath], { windowsHide: true });
+  }
+  const handle = await open(filePath, 'r+');
+  try {
+    await handle.truncate(size);
+  } finally {
+    await handle.close();
+  }
 }
 
 /** Rellena un workspace temporal con una estructura representativa para los tests. */

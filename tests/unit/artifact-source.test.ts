@@ -1,10 +1,10 @@
-import { open, writeFile } from 'node:fs/promises';
+import { writeFile } from 'node:fs/promises';
 import path from 'node:path';
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { openWorkspaceArtifactSource } from '@localbridge/filesystem';
-import { buildWorkspace, createTempWorkspaceDir, type TempWorkspace } from '../helpers/fixtures.js';
+import { buildWorkspace, createSparseFile, createTempWorkspaceDir, type TempWorkspace } from '../helpers/fixtures.js';
 
 let temporary: TempWorkspace;
 
@@ -23,9 +23,7 @@ function policy(mode: 'standard' | 'adaptive' | 'custom', customSourceBytes?: nu
 describe('gateway de artefactos grandes', () => {
   it('abre una fuente sparse/virtual de 200 GiB en adaptive y solo lee el rango solicitado', async () => {
     const filePath = path.join(temporary.root, 'huge.bin');
-    const handle = await open(filePath, 'w');
-    await handle.truncate(200 * 1024 * 1024 * 1024);
-    await handle.close();
+    await createSparseFile(filePath, 200 * 1024 * 1024 * 1024);
     const checkAuthority = vi.fn(async () => undefined);
     const workspace = buildWorkspace({
       rootPath: temporary.root,

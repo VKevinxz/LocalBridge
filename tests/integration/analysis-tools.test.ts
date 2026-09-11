@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { mkdir, open, rm, writeFile } from 'node:fs/promises';
+import { mkdir, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -14,7 +14,7 @@ import {
 } from '@localbridge/development';
 import { createLogger, TARGET_PROTOCOL_REVISION } from '@localbridge/shared';
 import { ArtifactAnalysisRuntime } from '../../apps/desktop/src/main/artifact-analysis-runtime.js';
-import { buildWorkspace, createTempWorkspaceDir, writeRegistryFile, type TempWorkspace } from '../helpers/fixtures.js';
+import { buildWorkspace, createSparseFile, createTempWorkspaceDir, writeRegistryFile, type TempWorkspace } from '../helpers/fixtures.js';
 import { createHarness, type Harness } from '../helpers/harness.js';
 import { buildPdfFixture } from '../helpers/pdf-fixture.js';
 
@@ -181,10 +181,11 @@ describe('jobs de artefactos grandes vía MCP y broker', () => {
   });
 
   it('pagina texto desde una fuente sparse de 10 GiB con lectura acotada', async () => {
-    const handle = await open(path.join(workspace.root, 'huge-text.txt'), 'w');
-    await handle.write(Buffer.from('LocalBridge texto grande '.repeat(4_000), 'utf8'), 0);
-    await handle.truncate(10 * 1024 * 1024 * 1024);
-    await handle.close();
+    await createSparseFile(
+      path.join(workspace.root, 'huge-text.txt'),
+      10 * 1024 * 1024 * 1024,
+      Buffer.from('LocalBridge texto grande '.repeat(4_000), 'utf8'),
+    );
     await configure();
 
     const status = await completed(await start('artifact.text.read', {
