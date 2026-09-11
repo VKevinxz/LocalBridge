@@ -16,7 +16,8 @@ $knownSyntheticFixtureBlobs = @{
   'tests/helpers/fixtures.ts' = @(
     '4e380c0f33e886aab6565340aa2714caebfe1cc7',
     '954e7af24d02cc8f37a884b0bca7e1642fede8ce',
-    'f9e72c79bdcaa9a12f47e54971d4b06b62c49dc4'
+    'f9e72c79bdcaa9a12f47e54971d4b06b62c49dc4',
+    'd3bc4af0a94eade0e4478fcd3f15cf8670040d02'
   )
 }
 $findings = [Collections.Generic.List[string]]::new()
