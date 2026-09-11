@@ -32,6 +32,7 @@ import {
 
 import {
   DEFAULT_CONNECTION_PROFILE,
+  analysisJobTargetInputSchema,
   FolderSelectionVault,
   TunnelSupervisor,
   absolutePathSchema,
@@ -44,6 +45,10 @@ import {
   buildNewWorkspace,
   buildNewApplication,
   buildNewDevelopmentProject,
+  buildPublicResearchProfile,
+  enablePublicInternetAccess,
+  buildSiteAccountProfile,
+  rememberExactSiteAccess,
   buildSetupPlan,
   buildPortableConfig,
   clearEncryptedKey,
@@ -52,6 +57,7 @@ import {
   buildOnboardingSnapshot,
   completeOnboarding,
   defaultDesktopSettingsPath,
+  defaultWebProfileStorePath,
   defaultOnboardingStatePath,
   defaultTunnelKeyPath,
   desktopSettingsSchema,
@@ -87,9 +93,12 @@ import {
   onboardingPermissionPreset,
   readOnboardingState,
   readDesktopSettings,
+  readWebProfileStore,
+  replaceWebProfileStore,
   readPortableConfigFile,
   removeWorkspace,
   removeApplication,
+  removeRegistryEntriesIfPresent,
   replaceRegistry,
   replaceDevelopmentProjects,
   replaceProjectTrust,
@@ -105,9 +114,30 @@ import {
   upsertWorkspace,
   upsertApplication,
   workspaceIdInputSchema,
+  webHumanSessionInputSchema,
+  webHumanTakeInputSchema,
+  webHumanCycleInputSchema,
+  webLiveViewerHideInputSchema,
+  webLiveViewerMoveInputSchema,
+  webLiveViewerPresentationInputSchema,
+  webLiveViewerShowInputSchema,
+  webMotionCancelInputSchema,
+  webTabsInputSchema,
+  webViewerStateInputSchema,
+  webViewportInputSchema,
+  webProfileCreateInputSchema,
+  webProfileEnableInternetInputSchema,
+  webProfileRemoveInputSchema,
+  webProfileResetInputSchema,
+  webProfileUpdateInputSchema,
+  requireCurrentWebProfileAuthority,
+  withAuthorizedWebProfileEffect,
   applicationIdInputSchema,
   browserSessionIdInputSchema,
+  browserMotionCancelInputSchema,
+  browserViewportInputSchema,
   liveViewerMoveInputSchema,
+  liveViewerPresentationInputSchema,
   liveViewerTargetInputSchema,
   terminalListenerTargetInputSchema,
   terminalSessionTargetInputSchema,
@@ -117,13 +147,17 @@ import {
   finalizeSetupPlan,
   interruptProjectSetupSessions,
   removeDevelopmentProject,
+  removeDevelopmentProjectIfPresent,
+  removeProjectSetupSessions,
   removeProjectCatalogRecord,
   removeProjectScanRecord,
+  removeProjectTrustRecord,
   loadProjectScanStore,
   upsertProjectScanRecord,
   DEFAULT_TOPOLOGY_LIMITS,
   replaceProjectCatalog,
   revokeProjectTrust,
+  planDevelopmentProjectRemoval,
   resolveSetupToolchains,
   setupReviewInputSchema,
   setupPolicyInputSchema,
@@ -147,8 +181,22 @@ import {
   type OnboardingState,
 } from "@localbridge/desktop-core";
 import { buildAuditEvent, recordAuditEvent } from "@localbridge/audit";
-import { defaultAuditDbPath, defaultWorkspaceConfigPath } from "@localbridge/shared";
 import {
+  cleanupWorkspaceArtifactStaging,
+  createWorkspaceArtifactDirectory,
+  createWorkspaceBinaryFile,
+  createWorkspaceBinaryFileFromChunks,
+} from "@localbridge/filesystem";
+import {
+  requireAuthorizedWorkspace,
+  requireCurrentWorkspaceAuthority,
+  withAuthorizedWorkspaceCapabilitiesEffect,
+  withAuthorizedWorkspaceEffect,
+  withCurrentWorkspaceAuthorityEffect,
+} from "@localbridge/permissions";
+import { createLogger, defaultAuditDbPath, defaultWorkspaceConfigPath, LocalBridgeError } from "@localbridge/shared";
+import {
+  AnalysisJobSupervisor,
   ApplicationSupervisor,
   DevelopmentBrokerError,
   ProcessSupervisor,
@@ -173,11 +221,17 @@ import {
 } from "@localbridge/workspace";
 import { assertTrustedIpcSender } from "./ipc-security.js";
 import { BrowserController } from "./browser-controller.js";
+import { WebController } from "./web-controller.js";
+import { LiveViewerCoordinator } from "./live-viewer-coordinator.js";
 import { resolveDisplay, sortDisplays, summarizeDisplays } from "./live-viewer-displays.js";
+import { HumanControlCoordinator } from "./human-control-coordinator.js";
+import { ArtifactAnalysisRuntime } from "./artifact-analysis-runtime.js";
 
 const registryPath = defaultWorkspaceConfigPath();
 const auditDbPath = defaultAuditDbPath();
+const desktopSecurityLogger = createLogger({ level: "info", base: { service: "localbridge-desktop" } });
 const settingsPath = defaultDesktopSettingsPath();
+const webProfileStorePath = defaultWebProfileStorePath();
 const onboardingStatePath = defaultOnboardingStatePath();
 const moduleDirectory = dirname(fileURLToPath(import.meta.url));
 const EXTERNAL_URLS = {
@@ -202,10 +256,15 @@ let backgroundNoticeShown = false;
 let developmentBroker: RunningDevelopmentBroker | undefined;
 let processSupervisor: ProcessSupervisor | undefined;
 let browserController: BrowserController | undefined;
+let webController: WebController | undefined;
+let liveViewerCoordinator: LiveViewerCoordinator | undefined;
 let applicationSupervisor: ApplicationSupervisor | undefined;
 let setupSupervisor: SetupSupervisor | undefined;
 let terminalSupervisor: TerminalSupervisor | undefined;
+let analysisSupervisor: AnalysisJobSupervisor | undefined;
+let analysisUnavailableReason: 'journal-unavailable' | undefined;
 let deviceBinding = "";
+const humanControlCoordinator = new HumanControlCoordinator();
 const projectRescanTimers = new Map<string, NodeJS.Timeout>();
 let liveViewerDisplayId: string | undefined;
 let displayMonitoringInstalled = false;
@@ -213,6 +272,24 @@ const portableImportSessions = new Map<
   string,
   { readonly config: PortableConfig; readonly mappings: Map<string, string> }
 >();
+
+function reconcileLiveViewerCoordinatorState(): void {
+  const current = liveViewerCoordinator?.current();
+  if (current === undefined) return;
+  const webState = current.kind === "web" ? webController?.getLocalLiveViewerState() : undefined;
+  const stillVisible = current.kind === "development"
+    ? browserController?.getLocalLiveViewerSessionId() === current.sessionId
+    : webState?.visible === true && webState.sessionId === current.sessionId;
+  if (!stillVisible) liveViewerCoordinator?.release(current);
+}
+
+function reserveHumanControlOrFail(kind: "development" | "web", sessionId: string): void {
+  try {
+    humanControlCoordinator.reserve({ kind, sessionId });
+  } catch {
+    throw new DevelopmentBrokerError("HUMAN_CONTROL_BUSY", "Ya existe otra intervención humana activa.");
+  }
+}
 
 interface OnboardingFolderSummary {
   readonly selectionId: string;
@@ -627,8 +704,9 @@ async function finalizeOnboarding(ownerId: string, input: unknown): Promise<Onbo
         ? buildNewWorkspace({
             name: parsed.name,
             rootPath: inspected.rootPath,
-            permissions,
-            processProfiles: profiles.processProfiles,
+             permissions,
+             largeArtifacts: previousSettings.largeArtifactPreference,
+             processProfiles: profiles.processProfiles,
             validationProfiles: profiles.validationProfiles,
           })
         : {
@@ -806,37 +884,62 @@ function liveViewerDisplaySummaries() {
 }
 
 async function rehomeLiveViewerIfNeeded(removedDisplayId?: string): Promise<void> {
-  const sessionId = browserController?.getLocalLiveViewerSessionId();
-  if (sessionId === undefined) return;
+  const developmentSessionId = browserController?.getLocalLiveViewerSessionId();
+  const webViewer = webController?.getLocalLiveViewerState();
+  if (developmentSessionId === undefined && webViewer?.visible !== true) return;
   const available = sortedDisplays();
   const selectedStillExists = liveViewerDisplayId !== undefined &&
     available.some((display) => String(display.id) === liveViewerDisplayId);
   if (removedDisplayId === undefined && selectedStillExists) {
     const target = resolveLiveViewerDisplay(liveViewerDisplayId);
-    await browserController?.moveLiveViewerLocally(sessionId, target.workArea);
+    if (developmentSessionId !== undefined) await browserController?.moveLiveViewerLocally(developmentSessionId, target.workArea);
+    else if (webViewer?.sessionId !== undefined) await webController?.moveLiveViewerLocally(webViewer.sessionId, target.workArea);
     return;
   }
   if (removedDisplayId !== undefined && liveViewerDisplayId !== removedDisplayId && selectedStillExists) return;
   const fallback = resolveLiveViewerDisplay();
-  await browserController?.moveLiveViewerLocally(sessionId, fallback.workArea);
+  if (developmentSessionId !== undefined) await browserController?.moveLiveViewerLocally(developmentSessionId, fallback.workArea);
+  else if (webViewer?.sessionId !== undefined) await webController?.moveLiveViewerLocally(webViewer.sessionId, fallback.workArea);
   liveViewerDisplayId = String(fallback.id);
   sendToRenderer('development:changed');
+  sendToRenderer('web:changed');
 }
 
 function installDisplayMonitoring(): void {
   if (displayMonitoringInstalled) return;
   displayMonitoringInstalled = true;
-  screen.on('display-added', () => sendToRenderer('development:changed'));
+  screen.on('display-added', () => {
+    sendToRenderer('development:changed');
+    sendToRenderer('web:changed');
+  });
   screen.on('display-removed', (_event, display) => {
-    void rehomeLiveViewerIfNeeded(String(display.id)).catch(() => sendToRenderer('development:changed'));
+    void rehomeLiveViewerIfNeeded(String(display.id)).catch(() => {
+      sendToRenderer('development:changed');
+      sendToRenderer('web:changed');
+    });
   });
   screen.on('display-metrics-changed', (_event, display) => {
     if (String(display.id) !== liveViewerDisplayId) {
       sendToRenderer('development:changed');
+      sendToRenderer('web:changed');
       return;
     }
-    void rehomeLiveViewerIfNeeded().catch(() => sendToRenderer('development:changed'));
+    void rehomeLiveViewerIfNeeded().catch(() => {
+      sendToRenderer('development:changed');
+      sendToRenderer('web:changed');
+    });
   });
+}
+
+async function recoverAbandonedArtifactStaging(): Promise<void> {
+  const registry = await loadRegistryDocument(registryPath);
+  await Promise.all(registry.workspaces
+    .filter((workspace) => workspace.enabled && workspace.permissions.write)
+    .map((workspace) => cleanupWorkspaceArtifactStaging(workspace, {
+      withAuthorizedEffect: (effect) => withAuthorizedWorkspaceEffect(
+        registryPath, desktopSecurityLogger, workspace, 'write', effect,
+      ),
+    }).catch(() => undefined)));
 }
 
 function quitApplication(): void {
@@ -871,7 +974,10 @@ async function startDevelopmentRuntime(): Promise<void> {
   applicationSupervisor = new ApplicationSupervisor({
     processes: processSupervisor,
     loadRegistry: () => loadRegistryDocument(registryPath),
-    onActivityChange: () => sendToRenderer('development:changed'),
+    onActivityChange: () => {
+      reconcileLiveViewerCoordinatorState();
+      sendToRenderer('development:changed');
+    },
   });
   setupSupervisor = new SetupSupervisor({
     helperPath,
@@ -907,6 +1013,16 @@ async function startDevelopmentRuntime(): Promise<void> {
     },
     resolveTerminalListener: (projectId, terminalSessionId, listenerRef, workspaceId) =>
       terminalSupervisor!.resolveListener(projectId, terminalSessionId, listenerRef, workspaceId),
+    beforeHumanControlRequest: async () => liveViewerCoordinator?.hide(),
+    reserveHumanControl: (sessionId) => reserveHumanControlOrFail("development", sessionId),
+    releaseHumanControl: (sessionId) => humanControlCoordinator.release({ kind: "development", sessionId }),
+    restoreLiveViewerAfterHuman: async (sessionId, workArea) => {
+      if (browserController === undefined || liveViewerCoordinator === undefined) return;
+      await liveViewerCoordinator.show(
+        { kind: "development", sessionId },
+        () => browserController!.showLiveViewerLocally(sessionId, workArea),
+      );
+    },
     onHumanControlRequest: (_session) => {
       sendToRenderer('development:changed');
       mainWindow?.flashFrame(true);
@@ -920,7 +1036,10 @@ async function startDevelopmentRuntime(): Promise<void> {
         notification.show();
       }
     },
-    onActivityChange: () => sendToRenderer('development:changed'),
+    onActivityChange: () => {
+      reconcileLiveViewerCoordinatorState();
+      sendToRenderer('development:changed');
+    },
     onHumanControlTransition: (event) => {
       recordAuditEvent(auditDbPath, buildAuditEvent({
         workspaceId: event.workspaceId,
@@ -937,6 +1056,43 @@ async function startDevelopmentRuntime(): Promise<void> {
       sendToRenderer('tunnel:log', `[browser-security] ${message}`, 'stderr');
       sendToRenderer('development:changed');
     },
+    onMotionDiagnostic: (diagnostic) => {
+      recordAuditEvent(auditDbPath, buildAuditEvent({
+        workspaceId: diagnostic.workspaceId,
+        action: 'browser.motion.diagnostic',
+        resource: diagnostic.sessionId,
+        riskLevel: 'R2',
+        decision: 'allow',
+        outcome: 'error',
+        errorCode: diagnostic.causeCode ?? 'MOTION_EFFECT_UNCERTAIN',
+        operationId: diagnostic.operationId,
+        durationMs: 0,
+      }));
+    },
+    saveScreenshot: async (input) => {
+      if (input.expectedWorkspace.id !== input.workspaceId) throw new LocalBridgeError("APPROVAL_INVALID");
+      return withAuthorizedWorkspaceCapabilitiesEffect(
+        registryPath,
+        desktopSecurityLogger,
+        input.expectedWorkspace,
+        ["browserRead", "write"],
+        () => createWorkspaceBinaryFile(input.expectedWorkspace, input.path, input.bytes),
+      );
+    },
+    saveMotionBundle: async (input) => {
+      if (input.expectedWorkspace.id !== input.workspaceId) throw new LocalBridgeError("APPROVAL_INVALID");
+      return withAuthorizedWorkspaceCapabilitiesEffect(
+        registryPath,
+        desktopSecurityLogger,
+        input.expectedWorkspace,
+        ["browserRead", "write"],
+        () => createWorkspaceArtifactDirectory(input.expectedWorkspace, input.path, input.produce, {
+          maxFileBytes: 256 * 1024 * 1024,
+          maxTotalBytes: 1024 * 1024 * 1024,
+          reserveFreeBytes: 512 * 1024 * 1024,
+        }),
+      );
+    },
     confirmHumanControlHandoff: async (workspaceName) => {
       const result = await dialog.showMessageBox({
         type: 'question',
@@ -950,6 +1106,271 @@ async function startDevelopmentRuntime(): Promise<void> {
       return result.response === 0;
     },
   });
+  webController = new WebController({
+    loadProfile: async (webProfileId) => {
+      const snapshot = await readWebProfileStore(webProfileStorePath);
+      if (snapshot.state !== "ready") return undefined;
+      return snapshot.document.profiles.find((profile) => profile.id === webProfileId);
+    },
+    listProfiles: async () => {
+      const snapshot = await readWebProfileStore(webProfileStorePath);
+      return snapshot.state === "ready" ? snapshot.document.profiles : [];
+    },
+    onActivityChange: () => {
+      reconcileLiveViewerCoordinatorState();
+      sendToRenderer("web:changed");
+    },
+    onLiveViewerChange: () => {
+      reconcileLiveViewerCoordinatorState();
+      sendToRenderer("web:changed");
+    },
+    beforeHumanControlRequest: async () => liveViewerCoordinator?.hide(),
+    reserveHumanControl: (sessionId) => reserveHumanControlOrFail("web", sessionId),
+    releaseHumanControl: (sessionId) => humanControlCoordinator.release({ kind: "web", sessionId }),
+    confirmHumanControlHandoff: async ({ profileKind, profileName, hostname }) => {
+      if (profileKind === "site-account") {
+        const result = await dialog.showMessageBox({
+          type: "question",
+          buttons: ["Devolver a ChatGPT", "Seguir con el control"],
+          defaultId: 1,
+          cancelId: 1,
+          title: "Devolver control a ChatGPT",
+          message: `¿Terminaste tu intervención en ${profileName}?`,
+          detail: `ChatGPT continuará en ${hostname}. Las credenciales y el intervalo privado permanecen fuera del canal de control.`,
+        });
+        return result.response === 0 ? "share-once" : "continue-human";
+      }
+      const result = await dialog.showMessageBox({
+        type: "question",
+        buttons: ["Continuar una vez", "Continuar y recordar sitio", "Seguir con el control"],
+        defaultId: 2,
+        cancelId: 2,
+        title: "Continuar navegación con ChatGPT",
+        message: `¿Permites que ChatGPT continúe en ${hostname}?`,
+        detail: "La concesión se limita a este hostname durante 15 minutos. LocalBridge cortará conexiones y recargará la URL actual; un formulario sin guardar puede perderse. No envía contraseñas ni el historial privado al chat y conserva el inicio de sesión del sitio.",
+      });
+      if (result.response === 0) return "share-once";
+      if (result.response === 1) return "share-and-remember";
+      return "continue-human";
+    },
+    rememberSiteAccess: async (hostname) => {
+      const snapshot = await readWebProfileStore(webProfileStorePath);
+      if (snapshot.state === "corrupt") throw new Error("El registro web está corrupto; no se pudo recordar el sitio.");
+      const next = rememberExactSiteAccess(snapshot.document, hostname);
+      if (next === snapshot.document) return;
+      await replaceWebProfileStore(webProfileStorePath, next, snapshot.sha256);
+      sendToRenderer("web:changed");
+    },
+    onHumanControlRequest: () => {
+      sendToRenderer("web:changed");
+      mainWindow?.flashFrame(true);
+      if (Notification.isSupported()) {
+        const notification = new Notification({
+          title: "ChatGPT necesita tu intervención web",
+          body: "Abre LocalBridge para tomar el control de la sesión aislada.",
+          icon: appIcon(),
+        });
+        notification.on("click", showMainWindow);
+        notification.show();
+      }
+    },
+    onHumanControlTransition: (transition) => {
+      recordAuditEvent(auditDbPath, buildAuditEvent({
+        action: transition.action,
+        resource: `${transition.sessionId}${transition.reason === undefined ? "" : `:${transition.reason}`}`,
+        riskLevel: "R5",
+        decision: "allow",
+        outcome: "success",
+        durationMs: 0,
+      }));
+    },
+    onCaptureDiagnostic: (diagnostic) => {
+      recordAuditEvent(auditDbPath, buildAuditEvent({
+        action: diagnostic.operationId === undefined ? "web.screenshot.diagnostic" : "web.screenshot.save.diagnostic",
+        resource: `${diagnostic.sessionId}:${diagnostic.tabId}:${diagnostic.stage}:${diagnostic.outcome}:${diagnostic.width ?? 0}x${diagnostic.height ?? 0}:${diagnostic.encodedBytes ?? 0}`,
+        riskLevel: "R2",
+        decision: "allow",
+        outcome: diagnostic.outcome === "failed" ? "error" : "success",
+        ...(diagnostic.code === undefined ? {} : { errorCode: diagnostic.code }),
+        ...(diagnostic.operationId === undefined ? {} : { operationId: diagnostic.operationId }),
+        durationMs: 0,
+      }));
+    },
+    onDownloadDiagnostic: (diagnostic) => {
+      recordAuditEvent(auditDbPath, buildAuditEvent({
+        action: "web.download.diagnostic",
+        resource: `${diagnostic.sessionId}:${diagnostic.tabId}:${diagnostic.stage}:${diagnostic.outcome}:${diagnostic.hostname}:${diagnostic.status ?? 0}:${diagnostic.size ?? 0}`,
+        riskLevel: "R2",
+        decision: "allow",
+        outcome: diagnostic.outcome === "failed" ? "error" : "success",
+        ...(diagnostic.code === undefined ? {} : { errorCode: diagnostic.code }),
+        operationId: diagnostic.operationId,
+        durationMs: 0,
+      }));
+    },
+    onMotionDiagnostic: (diagnostic) => {
+      recordAuditEvent(auditDbPath, buildAuditEvent({
+        action: 'web.motion.diagnostic',
+        resource: `${diagnostic.sessionId}:${diagnostic.tabId}`,
+        riskLevel: 'R2',
+        decision: 'allow',
+        outcome: 'error',
+        errorCode: diagnostic.causeCode ?? 'MOTION_EFFECT_UNCERTAIN',
+        operationId: diagnostic.operationId,
+        durationMs: 0,
+      }));
+    },
+    onNavigationDiagnostic: (diagnostic) => {
+      recordAuditEvent(auditDbPath, buildAuditEvent({
+        action: 'web.navigate.diagnostic',
+        resource: `${diagnostic.sessionId}:${diagnostic.tabId}:${diagnostic.outcome}`,
+        riskLevel: 'R2',
+        decision: 'allow',
+        outcome: diagnostic.outcome === 'recovered' ? 'success' : 'error',
+        errorCode: diagnostic.causeCode,
+        ...(diagnostic.operationId === undefined ? {} : { operationId: diagnostic.operationId }),
+        durationMs: 0,
+      }));
+    },
+    saveDownload: (input) => withAuthorizedWebProfileEffect(
+      webProfileStorePath,
+      input.webProfileId,
+      input.profileRevision,
+      "download",
+      async () => {
+        const workspace = await requireAuthorizedWorkspace(registryPath, desktopSecurityLogger, input.workspaceId, "write");
+        return createWorkspaceBinaryFile(workspace, input.path, input.bytes, {
+          maximumBytes: input.maximumBytes,
+          reserveFreeBytes: 512 * 1024 * 1024,
+          withAuthorizedEffect: (effect) => withAuthorizedWorkspaceEffect(
+            registryPath,
+            desktopSecurityLogger,
+            workspace,
+            "write",
+            effect,
+          ),
+        });
+      },
+    ),
+    saveDownloadStream: async (input) => {
+      await requireCurrentWebProfileAuthority(
+        webProfileStorePath,
+        input.webProfileId,
+        input.profileRevision,
+        "download",
+      );
+      const workspace = await requireAuthorizedWorkspace(registryPath, desktopSecurityLogger, input.workspaceId, "read");
+      await requireCurrentWorkspaceAuthority(
+        registryPath,
+        desktopSecurityLogger,
+        workspace,
+        ["read", "write"],
+      );
+      const checkAuthority = async (): Promise<void> => {
+        await requireCurrentWebProfileAuthority(
+          webProfileStorePath,
+          input.webProfileId,
+          input.profileRevision,
+          "download",
+        );
+        await requireCurrentWorkspaceAuthority(
+          registryPath,
+          desktopSecurityLogger,
+          workspace,
+          ["read", "write"],
+        );
+      };
+      const workspaceMaximum = workspace.limits.largeArtifacts.mode === 'adaptive'
+        ? undefined
+        : workspace.limits.largeArtifacts.mode === 'custom'
+          ? workspace.limits.largeArtifacts.customSourceBytes
+          : 1024 * 1024 * 1024;
+      const profileMaximum = input.adaptive ? undefined : input.maximumBytes;
+      const effectiveMaximum = profileMaximum === undefined
+        ? workspaceMaximum
+        : workspaceMaximum === undefined ? profileMaximum : Math.min(profileMaximum, workspaceMaximum);
+      return createWorkspaceBinaryFileFromChunks(workspace, input.path, input.produce, {
+        ...(effectiveMaximum === undefined ? { adaptive: true } : { maximumBytes: effectiveMaximum }),
+        reserveFreeBytes: workspace.limits.largeArtifacts.reserve.minimumFreeBytes,
+        reserveFreePercent: workspace.limits.largeArtifacts.reserve.minimumFreePercent,
+        checkAuthority,
+        withAuthorizedEffect: (effect) => withAuthorizedWebProfileEffect(
+          webProfileStorePath,
+          input.webProfileId,
+          input.profileRevision,
+          "download",
+          () => withCurrentWorkspaceAuthorityEffect(
+            registryPath,
+            desktopSecurityLogger,
+            workspace,
+            ["read", "write"],
+            effect,
+          ),
+        ),
+      });
+    },
+    saveMotionBundle: (input) => withAuthorizedWebProfileEffect(
+      webProfileStorePath,
+      input.webProfileId,
+      input.profileRevision,
+      "download",
+      async () => {
+        const workspace = await requireAuthorizedWorkspace(registryPath, desktopSecurityLogger, input.workspaceId, "write");
+        return createWorkspaceArtifactDirectory(workspace, input.path, input.produce, {
+          maxFileBytes: 256 * 1024 * 1024,
+          maxTotalBytes: 1024 * 1024 * 1024,
+          reserveFreeBytes: 512 * 1024 * 1024,
+          withAuthorizedEffect: (effect) => withAuthorizedWorkspaceEffect(
+            registryPath,
+            desktopSecurityLogger,
+            workspace,
+            "write",
+            effect,
+          ),
+        });
+      },
+    ),
+  });
+  liveViewerCoordinator = new LiveViewerCoordinator({
+    hideDevelopment: async (sessionId) => browserController?.hideLiveViewerLocally(sessionId),
+    hideWeb: async (sessionId) => webController?.hideLiveViewerLocally(sessionId),
+    hasHumanControl: () => humanControlCoordinator.current() !== undefined,
+    onChange: () => {
+      sendToRenderer("development:changed");
+      sendToRenderer("web:changed");
+    },
+  });
+  analysisSupervisor = undefined;
+  analysisUnavailableReason = undefined;
+  try {
+    const artifactAnalysisRuntime = new ArtifactAnalysisRuntime({
+      workspaceConfigPath: registryPath,
+      logger: desktopSecurityLogger,
+      cursorSigningKey: Buffer.from(deviceBinding, 'utf8'),
+      documentWorkerPath: join(dirname(runtimePaths.serverBundlePath), "document-worker.cjs"),
+      webDownload: (sessionId, tabId, resourceRef, workspaceId, path, operationId, signal) => {
+        if (webController === undefined) throw new LocalBridgeError("FEATURE_UNAVAILABLE");
+        return webController.download(sessionId, tabId, resourceRef, workspaceId, path, operationId, signal);
+      },
+    });
+    analysisSupervisor = new AnalysisJobSupervisor({
+      journalPath: join(dirname(auditDbPath), "analysis-jobs.sqlite"),
+      execute: artifactAnalysisRuntime.execute,
+      concurrencyForWorkspace: async (workspaceId) => {
+        const workspace = await requireAuthorizedWorkspace(registryPath, desktopSecurityLogger, workspaceId, "read");
+        return workspace.limits.largeArtifacts.maxConcurrentJobs;
+      },
+      onChange: () => sendToRenderer("development:changed"),
+    });
+  } catch (error) {
+    // El journal nuevo es una capacidad aislada. Su caída impide admitir jobs
+    // sin durabilidad, pero no derriba terminal, Git, navegador ni lecturas
+    // síncronas existentes.
+    analysisUnavailableReason = 'journal-unavailable';
+    desktopSecurityLogger.error('analysis runtime unavailable', {
+      errorName: error instanceof Error ? error.name : 'UnknownError',
+    });
+  }
   developmentBroker = await startDevelopmentBroker({
     handler: createDevelopmentRuntimeHandler({
       processes: processSupervisor,
@@ -963,7 +1384,9 @@ async function startDevelopmentRuntime(): Promise<void> {
           return projectStatusForBroker(projectId);
         },
       },
+      ...(analysisSupervisor === undefined ? {} : { analysis: analysisSupervisor }),
       browser: browserController,
+      web: webController,
     }),
   });
 }
@@ -976,21 +1399,40 @@ async function listProjectsForBroker() {
   // (ADR-0040) para que pueda explicar una estructura parcial o una revisión
   // pendiente en vez de encontrarse una denegación sin causa visible. No se
   // exponen recuentos, rutas ni nombres de carpeta.
-  const [catalog, scans] = await Promise.all([
+  const [catalog, scans, trustStore] = await Promise.all([
     loadProjectCatalog(projectCatalogPath()).catch(() => ({ schemaVersion: 1 as const, projects: [] })),
     loadProjectScanStore(projectScanPath()).catch(() => ({ schemaVersion: 1 as const, scans: [] })),
+    loadProjectTrustStore(projectTrustPath()).catch(() => ({ schemaVersion: 1 as const, decisions: [] })),
   ]);
   return {
-    projects: projects.filter((project) => project.workspaceIds.every((workspaceId) => enabled.has(workspaceId))).map((project) => ({
-      projectId: project.id,
-      name: project.name,
-      description: project.description,
-      workspaceIds: project.workspaceIds,
-      ...(project.applicationId === undefined ? {} : { applicationId: project.applicationId }),
-      setupStatus: project.setupStatus,
-      state: catalog.projects.find((record) => record.id === project.id)?.state ?? "unavailable",
-      scanCoverage: scans.scans.find((scan) => scan.projectId === project.id)?.coverage ?? "unknown",
-    })),
+    projects: projects.filter((project) => project.workspaceIds.every((workspaceId) => enabled.has(workspaceId))).map((project) => {
+      const record = catalog.projects.find((candidate) => candidate.id === project.id);
+      const trust = trustStore.decisions.find((decision) => decision.projectId === project.id);
+      const terminalAvailable = record?.state === "ready" && trust?.status === "active" &&
+        trust.deviceBinding === deviceBinding && trust.mode === "full-host";
+      const blockedReason = terminalAvailable
+        ? undefined
+        : record?.state !== "ready" ? "project-not-ready" as const
+          : trust?.status !== "active" ? "trust-inactive" as const
+            : trust.deviceBinding !== deviceBinding ? "device-mismatch" as const
+              : trust.mode === "guided" ? "guided-mode" as const
+                : "sandbox-unavailable" as const;
+      return {
+        projectId: project.id,
+        name: project.name,
+        description: project.description,
+        workspaceIds: project.workspaceIds,
+        ...(project.applicationId === undefined ? {} : { applicationId: project.applicationId }),
+        setupStatus: project.setupStatus,
+        state: record?.state ?? "unavailable",
+        scanCoverage: scans.scans.find((scan) => scan.projectId === project.id)?.coverage ?? "unknown",
+        execution: {
+          trustMode: trust?.mode ?? "guided",
+          terminalAvailable,
+          ...(blockedReason === undefined ? {} : { blockedReason }),
+        },
+      };
+    }),
   };
 }
 
@@ -1517,7 +1959,10 @@ function registerIpcHandlers(): void {
       });
       if (confirmation.response !== 1) throw new Error("No se habilitó Control total del equipo.");
     }
-    const previousRegistry = await loadRegistryDocument(registryPath);
+    const [previousRegistry, projectSettings] = await Promise.all([
+      loadRegistryDocument(registryPath),
+      readDesktopSettings(settingsPath),
+    ]);
     const existing = previousRegistry.workspaces.find((workspace) => workspace.rootPath.toLocaleLowerCase("en-US") === rootPath.toLocaleLowerCase("en-US"));
     const fullPermissions = {
       read: true, write: true, overwrite: true, gitRead: true, gitWrite: true, validations: true,
@@ -1526,6 +1971,7 @@ function registerIpcHandlers(): void {
     const workspace = existing === undefined ? buildNewWorkspace({
       name,
       rootPath,
+      largeArtifacts: projectSettings.largeArtifactPreference,
       permissions: trustMode === "full-host" ? fullPermissions : {
         read: true, write: false, overwrite: false, gitRead: true, gitWrite: false, validations: false,
         processes: false, browserRead: false, browserInteract: false, browserHumanControl: false,
@@ -1662,7 +2108,10 @@ function registerIpcHandlers(): void {
     if (parsed.initializeGit && !parsed.permissions.gitWrite) {
       throw new Error("Inicializar Git requiere el permiso Git de escritura explícito.");
     }
-    const previous = await loadRegistryDocument(registryPath);
+    const [previous, projectSettings] = await Promise.all([
+      loadRegistryDocument(registryPath),
+      readDesktopSettings(settingsPath),
+    ]);
     const normalizedRoot = parsed.rootPath.toLocaleLowerCase("en-US");
     if (previous.workspaces.some((workspace) => workspace.rootPath.toLocaleLowerCase("en-US") === normalizedRoot)) {
       throw new Error("La carpeta ya está autorizada. Usa “Agrupar configuración existente” para no duplicarla.");
@@ -1670,6 +2119,7 @@ function registerIpcHandlers(): void {
     const workspace = buildNewWorkspace({
       name: parsed.name,
       rootPath: parsed.rootPath,
+      largeArtifacts: projectSettings.largeArtifactPreference,
       permissions: parsed.permissions,
       validationProfiles: {},
       processProfiles: {},
@@ -1744,13 +2194,114 @@ function registerIpcHandlers(): void {
   ipcMain.handle("projects:remove", async (event, input: unknown) => {
     assertTrustedSender(event);
     const projectId = developmentProjectIdInputSchema.parse(input);
+    const registry = await loadRegistryDocument(registryPath);
+    const [developmentProjects, catalog, setupSessions] = await Promise.all([
+      listDevelopmentProjects(projectStorePath(), registry),
+      loadProjectCatalog(projectCatalogPath()),
+      listProjectSetupSessions(projectSetupStorePath()),
+    ]);
+    let removal = planDevelopmentProjectRemoval({
+      projectId,
+      registry,
+      developmentProjects,
+      catalogProjects: catalog.projects,
+      setupSessions,
+    });
+    const sharedDetail = removal.sharedWorkspaceIds.length + removal.sharedApplicationIds.length > 0
+      ? ` ${removal.sharedWorkspaceIds.length} carpeta(s) y ${removal.sharedApplicationIds.length} aplicación(es) compartidas con otros desarrollos se conservarán.`
+      : "";
+    const confirmation = await dialog.showMessageBox({
+      type: "warning",
+      title: "Eliminar desarrollo de LocalBridge",
+      message: `Eliminar ${removal.displayName} y sus accesos`,
+      detail: `Se detendrán sus procesos y se eliminarán de LocalBridge la ficha, el historial de preparación, los permisos y ${removal.removableWorkspaceIds.length} carpeta(s) autorizada(s) y ${removal.removableApplicationIds.length} aplicación(es) exclusivas.${sharedDetail} Los archivos y repositorios reales permanecerán en el disco.`,
+      buttons: ["Cancelar", "Eliminar de LocalBridge"],
+      defaultId: 0,
+      cancelId: 0,
+      noLink: true,
+    });
+    if (confirmation.response !== 1) {
+      return {
+        removed: false,
+        workspacesRemoved: 0,
+        applicationsRemoved: 0,
+        sharedWorkspacesKept: removal.sharedWorkspaceIds.length,
+        sharedApplicationsKept: removal.sharedApplicationIds.length,
+        filesDeleted: false,
+      };
+    }
+
+    const refreshedRegistry = await loadRegistryDocument(registryPath);
+    const [refreshedDevelopmentProjects, refreshedCatalog, refreshedSetupSessions] = await Promise.all([
+      listDevelopmentProjects(projectStorePath(), refreshedRegistry),
+      loadProjectCatalog(projectCatalogPath()),
+      listProjectSetupSessions(projectSetupStorePath()),
+    ]);
+    const refreshedRemoval = planDevelopmentProjectRemoval({
+      projectId,
+      registry: refreshedRegistry,
+      developmentProjects: refreshedDevelopmentProjects,
+      catalogProjects: refreshedCatalog.projects,
+      setupSessions: refreshedSetupSessions,
+    });
+    const scopeChanged = JSON.stringify({
+      workspaces: refreshedRemoval.removableWorkspaceIds,
+      applications: refreshedRemoval.removableApplicationIds,
+      sharedWorkspaces: refreshedRemoval.sharedWorkspaceIds,
+      sharedApplications: refreshedRemoval.sharedApplicationIds,
+    }) !== JSON.stringify({
+      workspaces: removal.removableWorkspaceIds,
+      applications: removal.removableApplicationIds,
+      sharedWorkspaces: removal.sharedWorkspaceIds,
+      sharedApplications: removal.sharedApplicationIds,
+    });
+    if (scopeChanged) throw new Error("El desarrollo cambió mientras confirmabas. Revisa el alcance y vuelve a intentarlo.");
+    removal = refreshedRemoval;
+
     await setupSupervisor?.cancel(projectId);
     await terminalSupervisor?.stopProject(projectId);
-    await removeDevelopmentProject(projectStorePath(), projectId);
-    await removeProjectCatalogRecord(projectCatalogPath(), projectId).catch(() => undefined);
+    const currentApplicationSupervisor = applicationSupervisor;
+    await Promise.all((currentApplicationSupervisor?.listAll().filter((entry) =>
+      removal.removableApplicationIds.includes(entry.applicationId) && ["starting", "ready", "stopping"].includes(entry.state)) ?? [])
+      .map((run) => currentApplicationSupervisor!.stop(run.runId)));
+    const currentAnalysisSupervisor = analysisSupervisor;
+    const currentProcessSupervisor = processSupervisor;
+    const currentBrowserController = browserController;
+    await Promise.all(removal.removableWorkspaceIds.map(async (workspaceId) => {
+      await currentAnalysisSupervisor?.cancelWorkspace(workspaceId);
+      await Promise.all([
+        ...(currentProcessSupervisor?.listAll().filter((entry) =>
+          entry.workspaceId === workspaceId && entry.state === "running") ?? [])
+          .map((entry) => currentProcessSupervisor!.stop(workspaceId, entry.processId)),
+        ...(currentBrowserController?.listAll().filter((entry) =>
+          entry.workspaceId === workspaceId && entry.state === "running") ?? [])
+          .map((entry) => currentBrowserController!.stop(workspaceId, entry.sessionId)),
+      ]);
+    }));
+
+    await removeProjectTrustRecord(projectTrustPath(), projectId);
+    const removedRegistryEntries = await removeRegistryEntriesIfPresent(registryPath, {
+      workspaceIds: removal.removableWorkspaceIds,
+      applicationIds: removal.removableApplicationIds,
+    });
+    await applicationSupervisor?.reconcile();
+    await removeProjectSetupSessions(projectSetupStorePath(), projectId);
+    await removeDevelopmentProjectIfPresent(projectStorePath(), projectId);
+    if (catalog.projects.some((project) => project.id === projectId)) {
+      await removeProjectCatalogRecord(projectCatalogPath(), projectId);
+    }
     await removeProjectScanRecord(projectScanPath(), projectId).catch(() => undefined);
-    await revokeProjectTrust(projectTrustPath(), projectId).catch(() => undefined);
-    recordProjectAudit("project.remove", projectId, undefined);
+    recordProjectAudit("project.remove", projectId, removal.workspaceIds[0]);
+    sendToRenderer("projects:changed");
+    sendToRenderer("development:changed");
+    return {
+      removed: true,
+      workspacesRemoved: removedRegistryEntries.workspaceIds.length,
+      applicationsRemoved: removedRegistryEntries.applicationIds.length,
+      sharedWorkspacesKept: removal.sharedWorkspaceIds.length,
+      sharedApplicationsKept: removal.sharedApplicationIds.length,
+      filesDeleted: false,
+    };
   });
 
   ipcMain.handle("projects:cancel", async (event, input: unknown) => {
@@ -1905,10 +2456,13 @@ function registerIpcHandlers(): void {
     async (event, input: unknown) => {
       assertTrustedSender(event);
       const parsed = newWorkspaceInputSchema.parse(input);
+      const projectSettings = await readDesktopSettings(settingsPath);
       const workspace = buildNewWorkspace({
         name: parsed.name,
         rootPath: parsed.rootPath,
         permissions: parsed.permissions,
+        largeArtifacts: parsed.largeArtifacts ?? projectSettings.largeArtifactPreference,
+        ...(parsed.maxFileBytes === undefined ? {} : { maxFileBytes: parsed.maxFileBytes }),
         ...(parsed.validationProfiles === undefined ? {} : { validationProfiles: parsed.validationProfiles }),
         ...(parsed.processProfiles === undefined ? {} : { processProfiles: parsed.processProfiles }),
         ...(parsed.browserProfiles === undefined ? {} : { browserProfiles: parsed.browserProfiles }),
@@ -1978,6 +2532,10 @@ function registerIpcHandlers(): void {
       browsers: (browserController?.listAll() ?? []).filter((entry) => entry.state === "running"),
       applications: (applicationSupervisor?.listAll() ?? []).filter((entry) => entry.state === "starting" || entry.state === "ready" || entry.state === "stopping"),
       terminals,
+      jobs: analysisSupervisor?.listAll(50) ?? [],
+      analysisAvailability: analysisSupervisor === undefined
+        ? { available: false as const, reason: analysisUnavailableReason ?? 'journal-unavailable' as const }
+        : { available: true as const },
       displays: displaySummaries,
       recommendedDisplayId: String(recommendedDisplay().id),
       ...(activeLiveViewerSessionId === undefined ? {} : {
@@ -1997,6 +2555,11 @@ function registerIpcHandlers(): void {
     if (origin.protocol !== "http:" && origin.protocol !== "https:") throw new Error("El servicio no usa un origen web permitido.");
     await shell.openExternal(origin.href);
     recordProjectAudit("terminal.local.open", target.projectId, undefined);
+  });
+  ipcMain.handle("development:cancelAnalysis", (event, input: unknown) => {
+    assertTrustedSender(event);
+    const target = analysisJobTargetInputSchema.parse(input);
+    return analysisSupervisor?.cancel(target.workspaceId, target.jobId);
   });
   ipcMain.handle("development:copyTerminalListener", async (event, input: unknown) => {
     assertTrustedSender(event);
@@ -2020,6 +2583,179 @@ function registerIpcHandlers(): void {
     await applicationSupervisor?.stopAll();
     await processSupervisor?.stopAll();
     await terminalSupervisor?.close();
+  });
+
+  ipcMain.handle("webProfiles:get", async (event) => {
+    assertTrustedSender(event);
+    return readWebProfileStore(webProfileStorePath);
+  });
+  ipcMain.handle("webProfiles:enableInternet", async (event, input: unknown) => {
+    assertTrustedSender(event);
+    const parsed = webProfileEnableInternetInputSchema.parse(input);
+    const snapshot = await readWebProfileStore(webProfileStorePath);
+    if (snapshot.state === "corrupt") throw new Error("El registro web está corrupto. Restablécelo antes de activar Internet.");
+    return replaceWebProfileStore(webProfileStorePath,
+      enablePublicInternetAccess(snapshot.document, parsed.download), parsed.expectedSha256);
+  });
+  ipcMain.handle("webProfiles:create", async (event, input: unknown) => {
+    assertTrustedSender(event);
+    const parsed = webProfileCreateInputSchema.parse(input);
+    const snapshot = await readWebProfileStore(webProfileStorePath);
+    if (snapshot.state === "corrupt") throw new Error("El registro web está corrupto. Restablécelo localmente antes de crear perfiles.");
+    if (snapshot.document.profiles.length >= 20) throw new Error("Se alcanzó el límite de 20 perfiles web.");
+    const profile = parsed.kind === "public-research"
+      ? buildPublicResearchProfile(new Date(), parsed.name)
+      : buildSiteAccountProfile(parsed);
+    return replaceWebProfileStore(webProfileStorePath, {
+      ...snapshot.document,
+      profiles: [...snapshot.document.profiles, profile],
+    }, snapshot.sha256);
+  });
+  ipcMain.handle("webProfiles:update", async (event, input: unknown) => {
+    assertTrustedSender(event);
+    const parsed = webProfileUpdateInputSchema.parse(input);
+    const snapshot = await readWebProfileStore(webProfileStorePath);
+    if (snapshot.state !== "ready") throw new Error("Vuelve a cargar el registro web antes de editarlo.");
+    const previous = snapshot.document.profiles.find((profile) => profile.id === parsed.profile.id);
+    if (previous === undefined) throw new Error("El perfil web ya no existe.");
+    await webController?.stopProfile(previous.id);
+    return replaceWebProfileStore(webProfileStorePath, {
+      ...snapshot.document,
+      profiles: snapshot.document.profiles.map((profile) => profile.id === parsed.profile.id
+        ? { ...parsed.profile, createdAt: previous.createdAt, updatedAt: new Date().toISOString() }
+        : profile),
+    }, parsed.expectedSha256);
+  });
+  ipcMain.handle("webProfiles:remove", async (event, input: unknown) => {
+    assertTrustedSender(event);
+    const parsed = webProfileRemoveInputSchema.parse(input);
+    const snapshot = await readWebProfileStore(webProfileStorePath);
+    if (snapshot.state !== "ready" || !snapshot.document.profiles.some((profile) => profile.id === parsed.webProfileId)) {
+      throw new Error("El perfil web ya no existe.");
+    }
+    await webController?.stopProfile(parsed.webProfileId);
+    return replaceWebProfileStore(webProfileStorePath, {
+      ...snapshot.document,
+      profiles: snapshot.document.profiles.filter((profile) => profile.id !== parsed.webProfileId),
+    }, parsed.expectedSha256);
+  });
+  ipcMain.handle("webProfiles:reset", async (event, input: unknown) => {
+    assertTrustedSender(event);
+    const parsed = webProfileResetInputSchema.parse(input);
+    const snapshot = await readWebProfileStore(webProfileStorePath);
+    if (snapshot.state !== "corrupt" || snapshot.sha256 !== parsed.expectedSha256) {
+      throw new Error("El registro web cambió; vuelve a cargarlo antes de restablecer.");
+    }
+    await webController?.stopAll();
+    return replaceWebProfileStore(webProfileStorePath, { schemaVersion: 1, profiles: [] }, parsed.expectedSha256);
+  });
+  ipcMain.handle("webActivity:list", async (event) => {
+    assertTrustedSender(event);
+    return webController?.listAll() ?? [];
+  });
+  ipcMain.handle("webActivity:viewerState", async (event, input: unknown) => {
+    assertTrustedSender(event);
+    webViewerStateInputSchema.parse(input);
+    const state = webController?.getLocalLiveViewerState() ?? { visible: false as const };
+    const displays = liveViewerDisplaySummaries();
+    return {
+      ...state,
+      displays,
+      recommendedDisplayId: String(recommendedDisplay().id),
+      ...(state.visible ? {
+        displayId: displays.some((display) => display.id === liveViewerDisplayId)
+          ? liveViewerDisplayId
+          : String(screen.getDisplayMatching(webController?.getLocalLiveViewerWindowBounds() ?? recommendedDisplay().workArea).id),
+      } : {}),
+    };
+  });
+  ipcMain.handle("webActivity:tabs", async (event, input: unknown) => {
+    assertTrustedSender(event);
+    const parsed = webTabsInputSchema.parse(input);
+    return webController?.listTabsLocally(parsed.sessionId) ?? [];
+  });
+  ipcMain.handle("webActivity:setViewport", async (event, input: unknown) => {
+    assertTrustedSender(event);
+    if (webController === undefined) throw new Error("El navegador web no está disponible.");
+    const parsed = webViewportInputSchema.parse(input);
+    await webController.setViewport(parsed.sessionId, parsed.tabId, parsed.width, parsed.height, parsed.mobile);
+    sendToRenderer("web:changed");
+  });
+  ipcMain.handle("webActivity:showLiveViewer", async (event, input: unknown) => {
+    assertTrustedSender(event);
+    if (webController === undefined || liveViewerCoordinator === undefined) throw new Error("El visor web no está disponible.");
+    const parsed = webLiveViewerShowInputSchema.parse(input);
+    const display = resolveLiveViewerDisplay(parsed.displayId);
+    const shown = await liveViewerCoordinator.show(
+      { kind: "web", sessionId: parsed.sessionId },
+      () => webController!.showLiveViewerLocally(
+        parsed.sessionId,
+        parsed.mode,
+        display.workArea,
+        parsed.mode === "pinned" ? parsed.tabId : undefined,
+        parsed.presentationMode,
+      ),
+    );
+    if (!shown) return;
+    liveViewerDisplayId = String(display.id);
+    sendToRenderer("web:changed");
+  });
+  ipcMain.handle("webActivity:hideLiveViewer", async (event, input: unknown) => {
+    assertTrustedSender(event);
+    const parsed = webLiveViewerHideInputSchema.parse(input);
+    if (liveViewerCoordinator !== undefined) await liveViewerCoordinator.hide({ kind: "web", sessionId: parsed.sessionId });
+    else await webController?.hideLiveViewerLocally(parsed.sessionId);
+    sendToRenderer("web:changed");
+  });
+  ipcMain.handle("webActivity:moveLiveViewer", async (event, input: unknown) => {
+    assertTrustedSender(event);
+    if (webController === undefined) throw new Error("El visor web no está disponible.");
+    const parsed = webLiveViewerMoveInputSchema.parse(input);
+    const display = resolveLiveViewerDisplay(parsed.displayId);
+    if (String(display.id) !== parsed.displayId) throw new Error("La pantalla seleccionada ya no está disponible.");
+    await webController.moveLiveViewerLocally(parsed.sessionId, display.workArea);
+    liveViewerDisplayId = String(display.id);
+    sendToRenderer("web:changed");
+  });
+  ipcMain.handle("webActivity:setLiveViewerPresentation", async (event, input: unknown) => {
+    assertTrustedSender(event);
+    if (webController === undefined) throw new Error("El visor web no está disponible.");
+    const parsed = webLiveViewerPresentationInputSchema.parse(input);
+    await webController.setLiveViewerPresentationLocally(parsed.sessionId, parsed.mode, parsed.panX, parsed.panY);
+    sendToRenderer("web:changed");
+  });
+  ipcMain.handle("webActivity:cancelMotion", (event, input: unknown) => {
+    assertTrustedSender(event);
+    const parsed = webMotionCancelInputSchema.parse(input);
+    webController?.cancelMotionLocally(parsed.sessionId, parsed.tabId);
+    sendToRenderer("web:changed");
+  });
+  ipcMain.handle("webActivity:takeHumanControl", async (event, input: unknown) => {
+    assertTrustedSender(event);
+    const parsed = webHumanTakeInputSchema.parse(input);
+    await webController?.takeHumanControlLocally(parsed.sessionId, parsed.tabId);
+    sendToRenderer("web:changed");
+  });
+  ipcMain.handle("webActivity:cycleHumanTab", async (event, input: unknown) => {
+    assertTrustedSender(event);
+    const parsed = webHumanCycleInputSchema.parse(input);
+    await webController?.cycleHumanTabLocally(parsed.sessionId, parsed.direction);
+    sendToRenderer("web:changed");
+  });
+  ipcMain.handle("webActivity:returnHumanControl", async (event, input: unknown) => {
+    assertTrustedSender(event);
+    await webController?.completeHumanControlLocally(webHumanSessionInputSchema.parse(input));
+    sendToRenderer("web:changed");
+  });
+  ipcMain.handle("webActivity:declineHumanControl", async (event, input: unknown) => {
+    assertTrustedSender(event);
+    await webController?.declineHumanControlLocally(webHumanSessionInputSchema.parse(input));
+    sendToRenderer("web:changed");
+  });
+  ipcMain.handle("webActivity:stop", async (event, input: unknown) => {
+    assertTrustedSender(event);
+    await webController?.stopLocally(webHumanSessionInputSchema.parse(input));
+    sendToRenderer("web:changed");
   });
 
   ipcMain.handle("applications:list", (event) => {
@@ -2110,12 +2846,24 @@ function registerIpcHandlers(): void {
     if (browserController === undefined) throw new Error('El navegador local no está disponible.');
     return browserController.captureForLocalViewer(parseBrowserSessionId(input));
   });
+  ipcMain.handle('development:setViewport', async (event, input: unknown) => {
+    assertTrustedSender(event);
+    if (browserController === undefined) throw new Error('El navegador local no está disponible.');
+    const parsed = browserViewportInputSchema.parse(input);
+    await browserController.setViewport(parsed.workspaceId, parsed.sessionId, parsed.width, parsed.height, parsed.mobile);
+    sendToRenderer('development:changed');
+  });
   ipcMain.handle('development:showLiveViewer', async (event, input: unknown) => {
     assertTrustedSender(event);
     if (browserController === undefined) throw new Error('El navegador local no está disponible.');
     const parsed = liveViewerTargetInputSchema.parse(input);
     const target = resolveLiveViewerDisplay(parsed.displayId);
-    await browserController.showLiveViewerLocally(parsed.sessionId, target.workArea);
+    if (liveViewerCoordinator === undefined) throw new Error('El coordinador de vistas no está disponible.');
+    const shown = await liveViewerCoordinator.show(
+      { kind: 'development', sessionId: parsed.sessionId },
+      () => browserController!.showLiveViewerLocally(parsed.sessionId, target.workArea, parsed.presentationMode),
+    );
+    if (!shown) return;
     liveViewerDisplayId = String(target.id);
     sendToRenderer('development:changed');
   });
@@ -2129,10 +2877,25 @@ function registerIpcHandlers(): void {
     liveViewerDisplayId = String(target.id);
     sendToRenderer('development:changed');
   });
+  ipcMain.handle('development:setLiveViewerPresentation', async (event, input: unknown) => {
+    assertTrustedSender(event);
+    if (browserController === undefined) throw new Error('El navegador local no está disponible.');
+    const parsed = liveViewerPresentationInputSchema.parse(input);
+    await browserController.setLiveViewerPresentationLocally(parsed.sessionId, parsed.mode, parsed.panX, parsed.panY);
+    sendToRenderer('development:changed');
+  });
+  ipcMain.handle('development:cancelMotion', (event, input: unknown) => {
+    assertTrustedSender(event);
+    const parsed = browserMotionCancelInputSchema.parse(input);
+    browserController?.cancelMotionLocally(parsed.sessionId);
+    sendToRenderer('development:changed');
+  });
   ipcMain.handle('development:hideLiveViewer', async (event, input: unknown) => {
     assertTrustedSender(event);
     if (browserController === undefined) return;
-    await browserController.hideLiveViewerLocally(parseBrowserSessionId(input));
+    const sessionId = parseBrowserSessionId(input);
+    if (liveViewerCoordinator !== undefined) await liveViewerCoordinator.hide({ kind: 'development', sessionId });
+    else await browserController.hideLiveViewerLocally(sessionId);
     sendToRenderer('development:changed');
   });
 
@@ -2371,6 +3134,7 @@ function registerIpcHandlers(): void {
     await withTunnelSetupLock(async () => {
       const { settings, connection } = await activeConnectionContext();
       const provision = bundledProvisionOptions(connection);
+      const runtimePaths = desktopBundledRuntimePaths();
       await initializeTunnelProfile(provision);
       tunnel.connect({
         binaryPath: provision.binaryPath,
@@ -2379,6 +3143,7 @@ function registerIpcHandlers(): void {
         cwd: dirname(provision.binaryPath),
         apiKey,
         gitApprovalMode: settings.gitApprovalMode,
+        documentWorkerPath: join(dirname(runtimePaths.serverBundlePath), "document-worker.cjs"),
         ...(developmentBroker === undefined
           ? {}
           : {
@@ -2416,6 +3181,10 @@ function registerIpcHandlers(): void {
     assertTrustedSender(event);
     return tunnel.getStatus();
   });
+  ipcMain.handle("tunnel:effectiveGitApprovalMode", (event) => {
+    assertTrustedSender(event);
+    return tunnel.getEffectiveGitApprovalMode();
+  });
 
   // Persistencia opcional y cifrada de la clave — nunca en texto plano, ver secure-key-store.ts.
   ipcMain.handle("tunnel:getSavedKey", async (event) => {
@@ -2435,15 +3204,22 @@ function registerIpcHandlers(): void {
   });
 }
 
+// Las sesiones web salen por proxy TCP. Impedir UDP WebRTC no mediado evita
+// una segunda vía de red fuera de esa política (ADR-0047).
+app.commandLine.appendSwitch("force-webrtc-ip-handling-policy", "disable_non_proxied_udp");
+app.commandLine.appendSwitch("disable-quic");
 app.enableSandbox();
 app.setName("LocalBridge MCP");
 
 if (!app.requestSingleInstanceLock()) {
-  app.quit();
+  // No se inicializó ningún runtime en esta rama. Salir inmediatamente evita que una
+  // segunda invocación quede viva esperando el ciclo de vida normal de Electron.
+  app.exit(0);
 } else {
   app.on("second-instance", showMainWindow);
 
   void app.whenReady().then(async () => {
+    await recoverAbandonedArtifactStaging();
     await startDevelopmentRuntime();
     registerIpcHandlers();
     installApplicationMenu();
@@ -2468,9 +3244,11 @@ app.on("before-quit", () => {
   projectRescanTimers.clear();
   tunnel.disconnect();
   void browserController?.close();
+  void webController?.close();
   void applicationSupervisor?.close();
   void setupSupervisor?.stopAll();
   void processSupervisor?.close();
   void terminalSupervisor?.close();
+  void analysisSupervisor?.close();
   void developmentBroker?.close();
 });

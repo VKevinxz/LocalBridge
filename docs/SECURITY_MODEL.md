@@ -17,7 +17,11 @@ manifiestos y la red pueden contener entradas hostiles.
 6. **Procesos:** listeners y árboles se validan mediante autoridad local del sistema.
 7. **Navegador:** orígenes locales quedan ligados a listeners vigentes y particiones
    efímeras.
-8. **Auditoría:** acciones sensibles dejan metadatos sin contenido de archivos.
+8. **Internet:** perfiles web locales, proxy HTTPS, validación DNS/IP y sesiones efímeras
+   forman una autoridad separada del navegador local.
+9. **Documentos:** el parser recibe bytes dentro de un worker limitado, nunca una ruta.
+10. **Auditoría:** acciones sensibles dejan metadatos sin contenido de archivos,
+    formularios ni documentos.
 
 ## Amenazas consideradas
 
@@ -31,11 +35,21 @@ manifiestos y la red pueden contener entradas hostiles.
 - fuga de claves, rutas, entorno o contenido;
 - migraciones que activen permisos por accidente;
 - reintentos que dupliquen commits, procesos o mutaciones.
+- SSRF, DNS rebinding, redirects y subrecursos hacia loopback, LAN o metadata;
+- cruce de referencias entre pestañas o entre `browser.*` y `web.*`;
+- contenido web o documental que intente conceder permisos o extraer datos locales;
+- descargas con traversal, tipo falseado, exceso de cuota o sobrescritura;
+- observación del agente durante autenticación humana y repetición de efectos web inciertos.
 
 ## Límites explícitos
 
 - Control total ejecuta con la autoridad de la cuenta Windows.
 - La exclusión del agente durante una intervención no vuelve confiable a la página abierta.
+- La navegación pública transmite consultas y contenido de formularios al sitio visitado;
+  LocalBridge no garantiza la política de privacidad de terceros.
+- El navegador web 1.4 no reutiliza Chrome/Edge personal, no sube archivos y no controla
+  aplicaciones de Windows.
+- La lectura PDF no incluye OCR ni edición y rechaza documentos sin texto útil.
 - Git y los servicios pueden usar credenciales administradas fuera de LocalBridge.
 - La auditoría local ayuda a investigar, pero no sustituye respaldos o controles del
   proveedor Git.

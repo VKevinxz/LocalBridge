@@ -11,7 +11,7 @@ import { mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
-import type { AuthorizedWorkspace, LocalApplication } from '@localbridge/workspace';
+import type { AuthorizedWorkspace, LargeArtifactPolicy, LocalApplication, WorkspaceLimits } from '@localbridge/workspace';
 
 export interface TempWorkspace {
   root: string;
@@ -41,9 +41,23 @@ export async function populateSampleProject(root: string): Promise<void> {
   await writeFile(path.join(root, 'id_rsa'), '-----BEGIN OPENSSH PRIVATE KEY-----\n');
 }
 
-const DEFAULT_LIMITS = { maxFileBytes: 1_048_576, maxTreeEntries: 300, maxTreeDepth: 3 };
+const DEFAULT_LIMITS = {
+  maxFileBytes: 1_048_576,
+  maxTreeEntries: 300,
+  maxTreeDepth: 3,
+  largeArtifacts: {
+    mode: 'standard' as const,
+    reserve: { minimumFreeBytes: 1024 * 1024 * 1024, minimumFreePercent: 10 },
+    maxConcurrentJobs: 1 as const,
+  },
+};
 
-export function buildWorkspace(overrides: Partial<AuthorizedWorkspace> & { rootPath: string }): AuthorizedWorkspace {
+type WorkspaceOverrides = Omit<Partial<AuthorizedWorkspace>, 'limits'> & {
+  readonly rootPath: string;
+  readonly limits?: Omit<WorkspaceLimits, 'largeArtifacts'> & { readonly largeArtifacts?: LargeArtifactPolicy };
+};
+
+export function buildWorkspace(overrides: WorkspaceOverrides): AuthorizedWorkspace {
   return {
     id: overrides.id ?? `ws_${randomUUID().slice(0, 8)}`,
     name: overrides.name ?? 'test-workspace',
@@ -58,7 +72,9 @@ export function buildWorkspace(overrides: Partial<AuthorizedWorkspace> & { rootP
       validations: false,
       gitWrite: false,
     },
-    limits: overrides.limits ?? DEFAULT_LIMITS,
+    limits: overrides.limits === undefined
+      ? DEFAULT_LIMITS
+      : { ...overrides.limits, largeArtifacts: overrides.limits.largeArtifacts ?? DEFAULT_LIMITS.largeArtifacts },
     denyPatterns: overrides.denyPatterns ?? [
       '.env',
       '.env.*',
@@ -81,7 +97,7 @@ export function buildWorkspace(overrides: Partial<AuthorizedWorkspace> & { rootP
 /** Escribe un registro de workspaces real en disco, para tests de extremo a extremo. */
 export async function writeRegistryFile(configPath: string, workspaces: readonly AuthorizedWorkspace[], applications: readonly LocalApplication[] = []): Promise<void> {
   await mkdir(path.dirname(configPath), { recursive: true });
-  await writeFile(configPath, JSON.stringify({ schemaVersion: 4, workspaces, applications }, null, 2));
+  await writeFile(configPath, JSON.stringify({ schemaVersion: 5, workspaces, applications }, null, 2));
 }
 
 /**

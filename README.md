@@ -3,10 +3,10 @@
 Aplicación de escritorio para conectar ChatGPT con proyectos locales de Windows de forma
 explícita, auditable y revocable.
 
-**Versión actual:** `v1.2.1` · **Plataforma:** Windows x64 · **Estado:** preview ·
+**Versión del árbol:** `v1.7.0` · **Plataforma:** Windows x64 · **Estado:** preview de evaluación ·
 **Licencia:** `UNLICENSED`
 
-[Descargar la preview](https://github.com/VKevinxz/LocalBridge/releases/tag/preview-v1.2.1.2) ·
+[Preview v1.7.0.1](https://github.com/VKevinxz/LocalBridge/releases/tag/preview-v1.7.0.1) ·
 [Repositorio oficial](https://github.com/VKevinxz/LocalBridge) ·
 [Instalación](docs/GETTING_STARTED.md) ·
 [Avisos de Windows](docs/WINDOWS_INSTALLATION.md) ·
@@ -32,8 +32,14 @@ Entre sus capacidades se encuentran:
 - ejecutar validaciones y servicios aprobados, consultar logs y detener procesos;
 - detectar puertos pertenecientes a procesos administrados;
 - navegar e inspeccionar aplicaciones web locales;
+- investigar y actuar en páginas públicas mediante un navegador de Internet aislado;
+- leer texto y páginas visuales de PDF, inspeccionar PNG/JPEG/WebP y guardar documentos,
+  imágenes, vídeo, fuentes y CSS web observados;
+- inspeccionar animaciones, guardar trazas de scroll y comparar movimiento entre una referencia y localhost;
 - permitir intervención humana temporal para login, archivos y otros pasos privados;
 - registrar operaciones sensibles en una auditoría local sin guardar contenido;
+- procesar artefactos grandes con trabajos observables y cancelables;
+- eliminar un desarrollo y sus accesos de LocalBridge, conservando archivos del disco y referencias compartidas;
 - conectar con ChatGPT mediante Secure MCP Tunnel.
 
 ## Experiencia project-first
@@ -60,6 +66,52 @@ proyectos existentes.
 
 `git.commit` y `git.push` conservan aprobación protegida. El navegador y los procesos se
 vinculan a referencias opacas y listeners cuya propiedad vuelve a comprobar LocalBridge.
+
+## Uso cotidiano en v1.7.0
+
+**Acceso a Internet** permite habilitar con una sola acción local la investigación pública
+aislada. Los perfiles y sitios concretos existentes siguen disponibles bajo opciones
+avanzadas. Al habilitarlos, ChatGPT puede usar `web.*` para navegar por HTTPS, comparar
+pestañas, extraer fuentes e interactuar con controles comunes.
+
+Este navegador usa una partición efímera distinta de tu Chrome o Edge personal. Bloquea
+red local, loopback, metadata, permisos web, descargas iniciadas por la página y tráfico no
+mediado. Para guardar un documento o medio necesita también una carpeta autorizada con
+escritura. Los perfiles nuevos proponen una cuota propia de 1 GiB por asset y 10 GiB por
+sesión; los perfiles existentes conservan su elección. Los bytes llegan por chunks a
+staging y solo aparecen tras validar tipo, firma y hash.
+La versión admite PDF, JSON, CSV, TXT, Markdown, imágenes estáticas —incluido AVIF—,
+MP4/WebM/MOV,
+fuentes y CSS; las subidas, OCR, DOCX/XLSX y el control
+de aplicaciones nativas de Windows permanecen fuera de esta entrega.
+
+Al descargar un PDF, ChatGPT puede extraer su capa textual y representar páginas como
+imágenes para revisar escaneos, tablas, diagramas y composición. PNG, JPEG y WebP locales
+también pueden entregarse visualmente. El flujo funciona con rutas relativas autorizadas,
+por lotes de hasta cuatro páginas y con PDF de hasta 250 MiB demostrados por rangos. AVIF
+puede descargarse, pero su lectura visual estructurada aún no forma parte de `image.read`.
+
+Los navegadores administrados usan 1920×1080 como resolución lógica inicial de prueba. Si
+lo pides, ChatGPT puede cambiarla a otro tamaño válido para revisar responsive. La ventana
+visible ofrece **Encajar** y **1:1**, e informa por separado el render, el área visible y la
+escala. Encajar muestra los cuatro bordes sin deformar; 1:1 permite desplazar la vista local.
+Ningún modo altera la resolución, el scroll o la captura que usa ChatGPT.
+
+Para estudiar efectos de scroll, ChatGPT puede inventariar animaciones CSS/WAAPI, guardar
+una traza `.lbmotion` de 3–24 muestras y compararla con la misma trayectoria en localhost.
+Actividad muestra el progreso, permite cancelar y conserva un recibo con ruta, frames,
+tamaño, modo y advertencias. La evidencia temporal ayuda al ciclo de implementación y QA;
+no convierte automáticamente una animación observada en código equivalente.
+
+En **Actividad** aparecen juntos los navegadores LOCAL de desarrollo y los de INTERNET.
+**Ver y seguir** muestra la misma pestaña que usa ChatGPT en una ventana nativa pasiva.
+**Tomar control** pausa al agente y permite continuar manualmente incluso desde una sesión
+pública. Al devolverla, confirmas el hostname exacto que ChatGPT podrá continuar durante 15
+minutos; las demás pestañas, conexiones y referencias se descartan y la URL actual se
+recarga bajo esa frontera. El inicio de sesión se conserva, pero un formulario no guardado
+puede perderse. Ocultar el visor o
+cerrarlo desde Windows conserva la sesión. Si pides mantener abierto un entorno o una
+investigación, el agente debe redescubrirlo y reutilizarlo antes de crear otro.
 
 ## Vista previa
 
@@ -106,6 +158,7 @@ LocalBridge aplica estas reglas por construcción:
 - las operaciones sensibles dejan evidencia de auditoría;
 - claves y rutas locales no se incluyen en exportaciones portables;
 - revocar un proyecto detiene terminales, procesos y navegadores relacionados.
+- revocar un perfil web cierra sus pestañas y conexiones sin detener recursos de desarrollo.
 
 Lee el [modelo público de seguridad](docs/SECURITY_MODEL.md), la
 [política de privacidad](docs/PRIVACY_AND_TRUST.md) y el
@@ -131,7 +184,7 @@ Lee el [modelo público de seguridad](docs/SECURITY_MODEL.md), la
 
 ## Desarrollo
 
-Requisitos: Node.js 22, pnpm 9.12 y Windows x64 para probar o empaquetar el escritorio.
+Requisitos: Node.js 22.13 o superior, pnpm 9.12 y Windows x64 para probar o empaquetar el escritorio.
 
 ```powershell
 pnpm install --frozen-lockfile

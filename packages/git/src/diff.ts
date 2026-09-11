@@ -32,10 +32,14 @@ export async function getGitDiff(
   filePath: string | undefined,
   staged: boolean,
   maxBytes: number | undefined,
+  displayPrefix?: string,
 ): Promise<GitDiffResult> {
   const context = await resolveGitContext(workspace);
 
   const args: string[] = ["diff", ...SAFE_DIFF_FLAGS];
+  if (displayPrefix !== undefined) {
+    args.push(`--src-prefix=a/${displayPrefix}`, `--dst-prefix=b/${displayPrefix}`);
+  }
   if (staged) args.push("--cached");
   args.push("--");
 

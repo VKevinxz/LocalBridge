@@ -56,7 +56,11 @@ function recordSafely(audit: ToolAuditContext, logger: Logger, outcome: AuditOut
  */
 export function toolError(error: unknown, logger: Logger, context: Record<string, unknown>, audit?: ToolAuditContext) {
   const payload = toErrorPayload(error);
-  logger.warn("tool call failed", { ...context, code: payload.error.code });
+  logger.warn("tool call failed", {
+    ...context,
+    code: payload.error.code,
+    ...(payload.error.causeCode === undefined ? {} : { causeCode: payload.error.causeCode }),
+  });
 
   if (audit !== undefined) {
     const errorCode: ErrorCode | undefined = isLocalBridgeError(error) ? error.code : payload.error.code;

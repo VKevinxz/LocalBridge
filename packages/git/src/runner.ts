@@ -15,10 +15,11 @@
 
 import { spawn } from "node:child_process";
 
-import { LocalBridgeError, buildFilteredEnv } from "@localbridge/shared";
+import { LocalBridgeError, buildFilteredEnv, killProcessTreeAndWait } from "@localbridge/shared";
 
 /** Cota dura por operación: un repositorio patológico no puede colgar el servidor. */
 const GIT_TIMEOUT_MS = 10_000;
+const MAX_GIT_TIMEOUT_MS = 5 * 60_000;
 
 /** Techo de salida por operación; el llamante puede pedir menos, nunca más. */
 const MAX_OUTPUT_BYTES = 1_048_576;
@@ -34,6 +35,8 @@ export interface RunGitOptions {
   cwd: string;
   /** Techo de bytes de stdout. Se acota al máximo del módulo. */
   maxBytes?: number;
+  /** Presupuesto interno por clase de operación; nunca procede de una tool MCP. */
+  timeoutMs?: number;
 }
 
 /**
@@ -52,6 +55,7 @@ function buildGitEnv(): NodeJS.ProcessEnv {
 
 export async function runGit(args: readonly string[], options: RunGitOptions): Promise<GitRunResult> {
   const maxBytes = Math.min(options.maxBytes ?? MAX_OUTPUT_BYTES, MAX_OUTPUT_BYTES);
+  const timeoutMs = Math.max(1, Math.min(options.timeoutMs ?? GIT_TIMEOUT_MS, MAX_GIT_TIMEOUT_MS));
   // `core.fsmonitor` puede apuntar a un hook/programa definido en la config
   // local del repositorio. Ninguna operación de LocalBridge necesita ese
   // acelerador, así que se desactiva para todos los subcomandos.
@@ -63,6 +67,7 @@ export async function runGit(args: readonly string[], options: RunGitOptions): P
       shell: false, // ver comentario de cabecera: no negociable
       env: buildGitEnv(),
       windowsHide: true,
+      detached: process.platform !== "win32",
     });
 
     const stdoutChunks: Buffer[] = [];
@@ -71,13 +76,14 @@ export async function runGit(args: readonly string[], options: RunGitOptions): P
     let stderrBytes = 0;
     let truncated = false;
     let settled = false;
+    let timedOut = false;
+    let terminationPromise: Promise<void> | undefined;
 
     const timer = setTimeout(() => {
       if (settled) return;
-      settled = true;
-      child.kill("SIGKILL");
-      reject(new LocalBridgeError("TIMEOUT"));
-    }, GIT_TIMEOUT_MS);
+      timedOut = true;
+      terminationPromise = killProcessTreeAndWait(child);
+    }, timeoutMs);
 
     child.stdout.on("data", (chunk: Buffer) => {
       if (stdoutBytes >= maxBytes) {
@@ -99,17 +105,24 @@ export async function runGit(args: readonly string[], options: RunGitOptions): P
       stderrChunks.push(chunk);
     });
 
-    child.on("error", (error) => {
+    child.on("error", async (error) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      reject(isEnoent(error) ? new LocalBridgeError("COMMAND_NOT_ALLOWED") : new LocalBridgeError("INTERNAL_ERROR"));
+      if (timedOut) await terminationPromise;
+      reject(timedOut ? new LocalBridgeError("TIMEOUT") : isEnoent(error) ? new LocalBridgeError("COMMAND_NOT_ALLOWED") : new LocalBridgeError("INTERNAL_ERROR"));
     });
 
-    child.on("close", (code) => {
+    child.on("close", async (code) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+
+      if (timedOut) {
+        await terminationPromise;
+        reject(new LocalBridgeError("TIMEOUT"));
+        return;
+      }
 
       resolve({
         stdout: Buffer.concat(stdoutChunks).subarray(0, maxBytes).toString("utf8"),

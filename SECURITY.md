@@ -37,4 +37,6 @@ corrección o mitigación razonable.
 - migraciones que amplíen autoridad;
 - artefactos de release sin integridad o procedencia.
 
-El diseño general se resume en [docs/SECURITY_MODEL.md](docs/SECURITY_MODEL.md).
+El diseño general se resume en [docs/SECURITY_MODEL.md](docs/SECURITY_MODEL.md). El contrato
+técnico completo, incluidas las cuotas web y el staging por chunks de v1.6.1, está en
+[docs/SECURITY.md](docs/SECURITY.md).

@@ -34,6 +34,8 @@ import type {
   TunnelDoctorResult,
   TunnelStatus,
   OnboardingSnapshot,
+  WebProfile,
+  WebProfileStoreSnapshot,
 } from "@localbridge/desktop-core";
 
 export type {
@@ -50,6 +52,8 @@ export type {
   PendingApproval,
   TunnelDoctorResult,
   TunnelStatus,
+  WebProfile,
+  WebProfileStoreSnapshot,
 };
 
 export interface DesktopApi {
@@ -74,7 +78,7 @@ export interface DesktopApi {
   setAssistedProjectPolicy(projectId: string, policy: SetupPolicy): Promise<ProjectSetupSession>;
   approveAssistedProject(projectId: string, planSha256: string): Promise<{ project: DevelopmentProject; session: ProjectSetupSession; run: SetupRunSummary }>;
   cancelAssistedProject(projectId: string): Promise<ProjectSetupSession | undefined>;
-  removeDevelopmentProject(projectId: string): Promise<void>;
+  removeDevelopmentProject(projectId: string): Promise<DevelopmentProjectRemovalResult>;
   onAssistedProjectsChange(callback: () => void): () => void;
   listWorkspaces(): Promise<AuthorizedWorkspace[]>;
   pickFolder(): Promise<string | undefined>;
@@ -93,6 +97,7 @@ export interface DesktopApi {
   /** Solo lee manifiestos conocidos (package.json/composer.json/Makefile) — nunca ejecuta nada. */
   detectProjectCommands(rootPath: string): Promise<DetectedCommand[]>;
   listDevelopmentActivity(): Promise<DevelopmentActivity>;
+  cancelAnalysisJob(workspaceId: string, jobId: string): Promise<void>;
   stopAllDevelopmentActivity(): Promise<void>;
   openTerminalListener(projectId: string, terminalSessionId: string, listenerRef: string): Promise<void>;
   copyTerminalListener(projectId: string, terminalSessionId: string, listenerRef: string): Promise<void>;
@@ -101,10 +106,34 @@ export interface DesktopApi {
   declineBrowserHumanControl(sessionId: string): Promise<void>;
   revokeBrowserHumanControl(sessionId: string): Promise<void>;
   captureBrowserViewer(sessionId: string): Promise<BrowserViewerFrame>;
-  showBrowserLiveViewer(sessionId: string, displayId?: string): Promise<void>;
+  showBrowserLiveViewer(sessionId: string, displayId?: string, presentationMode?: ViewerPresentationMode): Promise<void>;
   moveBrowserLiveViewer(sessionId: string, displayId: string): Promise<void>;
   hideBrowserLiveViewer(sessionId: string): Promise<void>;
+  setBrowserLiveViewerPresentation(sessionId: string, mode: ViewerPresentationMode, panX?: number, panY?: number): Promise<void>;
+  cancelBrowserMotion(sessionId: string): Promise<void>;
+  setBrowserViewport(workspaceId: string, sessionId: string, width: number, height: number, mobile: boolean): Promise<void>;
   onDevelopmentActivityChange(callback: () => void): () => void;
+  getWebProfiles(): Promise<WebProfileStoreSnapshot>;
+  enableWebBrowsing(expectedSha256: string | null, download?: boolean): Promise<WebProfileStoreSnapshot>;
+  createWebProfile(input: WebProfileCreateDraft): Promise<WebProfileStoreSnapshot>;
+  updateWebProfile(expectedSha256: string | null, profile: WebProfile): Promise<WebProfileStoreSnapshot>;
+  removeWebProfile(expectedSha256: string | null, webProfileId: string): Promise<WebProfileStoreSnapshot>;
+  resetWebProfiles(expectedSha256: string): Promise<WebProfileStoreSnapshot>;
+  listWebActivity(): Promise<readonly WebActivitySummary[]>;
+  getWebLiveViewerState(): Promise<WebLiveViewerState>;
+  listWebTabs(sessionId: string): Promise<readonly WebTabActivitySummary[]>;
+  setWebViewport(sessionId: string, tabId: string, width: number, height: number, mobile: boolean): Promise<void>;
+  showWebLiveViewer(sessionId: string, mode: 'follow' | 'pinned', displayId?: string, tabId?: string, presentationMode?: ViewerPresentationMode): Promise<void>;
+  moveWebLiveViewer(sessionId: string, displayId: string): Promise<void>;
+  hideWebLiveViewer(sessionId: string): Promise<void>;
+  setWebLiveViewerPresentation(sessionId: string, mode: ViewerPresentationMode, panX?: number, panY?: number): Promise<void>;
+  cancelWebMotion(sessionId: string, tabId: string): Promise<void>;
+  takeWebHumanControl(sessionId: string, tabId?: string): Promise<void>;
+  cycleWebHumanTab(sessionId: string, direction: 'previous' | 'next'): Promise<void>;
+  returnWebHumanControl(sessionId: string): Promise<void>;
+  declineWebHumanControl(sessionId: string): Promise<void>;
+  stopWebSession(sessionId: string): Promise<void>;
+  onWebActivityChange(callback: () => void): () => void;
 
   getSettings(): Promise<DesktopSettings>;
   getRuntimeInfo(): Promise<BundledRuntimePaths>;
@@ -132,6 +161,7 @@ export interface DesktopApi {
   diagnoseTunnel(apiKey: string): Promise<TunnelDoctorResult>;
   disconnectTunnel(): Promise<void>;
   getTunnelStatus(): Promise<TunnelStatus>;
+  getEffectiveGitApprovalMode(): Promise<DesktopSettings["gitApprovalMode"] | undefined>;
   onTunnelStatusChange(callback: (status: TunnelStatus, detail: string | undefined) => void): () => void;
   onTunnelLog(callback: (line: string, stream: "stdout" | "stderr") => void): () => void;
 
@@ -139,6 +169,15 @@ export interface DesktopApi {
   getSavedTunnelKey(): Promise<string | undefined>;
   saveTunnelKey(apiKey: string): Promise<void>;
   forgetTunnelKey(): Promise<void>;
+}
+
+export interface DevelopmentProjectRemovalResult {
+  readonly removed: boolean;
+  readonly workspacesRemoved: number;
+  readonly applicationsRemoved: number;
+  readonly sharedWorkspacesKept: number;
+  readonly sharedApplicationsKept: number;
+  readonly filesDeleted: false;
 }
 
 export interface OnboardingFolderSummary {
@@ -224,6 +263,25 @@ export interface AdoptDevelopmentProjectDraft {
 }
 
 export interface DevelopmentActivity {
+  readonly analysisAvailability?:
+    | { readonly available: true }
+    | { readonly available: false; readonly reason: 'journal-unavailable' };
+  readonly jobs?: ReadonlyArray<{
+    readonly jobId: string;
+    readonly operationId: string;
+    readonly operationKind: 'artifact.inspect' | 'artifact.hash' | 'artifact.text.read' | 'binary.inspect' | 'document.process' | 'web.download.start';
+    readonly workspaceId: string;
+    readonly sourcePath?: string;
+    readonly createdAt: string;
+    readonly updatedAt: string;
+    readonly state: 'queued' | 'running' | 'waiting_resource' | 'cancel_requested' | 'cancelled' | 'completed' | 'failed' | 'source_changed' | 'interrupted';
+    readonly stage: string;
+    readonly progress: { readonly completed: number; readonly total?: number; readonly unit: 'bytes' | 'pages' | 'items' };
+    readonly coverage: { readonly status: 'supported' | 'partial' | 'unsupported' | 'source_changed'; readonly bytesRead: number; readonly uniqueBytesRead: number; readonly sourceBytes?: number; readonly omissions?: readonly string[] };
+    readonly effectState: 'not_started' | 'applied' | 'not_applied' | 'uncertain';
+    readonly resumeCapability: 'continue' | 'restart' | 'result_only' | 'none';
+    readonly errorCode?: string;
+  }>;
   readonly terminals?: ReadonlyArray<{
     readonly sessionId: string;
     readonly projectId: string;
@@ -274,6 +332,10 @@ export interface DevelopmentActivity {
     controlExpiresAt?: string;
     postHumanExpiresAt?: string;
     humanReason?: 'sign_in' | 'file_selection' | 'manual_step';
+    viewport?: { readonly width: number; readonly height: number; readonly mobile: boolean };
+    motionCapture?: { readonly completed: number; readonly total: number; readonly mode: 'auto' | 'stepped' | 'screencast' };
+    lastMotionCapture?: MotionCaptureReceipt;
+    viewerPresentation?: ViewerPresentationSummary;
   }>;
   readonly applications: ReadonlyArray<ApplicationRunSummary>;
   readonly displays?: ReadonlyArray<{
@@ -285,6 +347,80 @@ export interface DevelopmentActivity {
   readonly recommendedDisplayId?: string;
   readonly liveViewerSessionId?: string;
   readonly liveViewerDisplayId?: string;
+}
+
+export type ViewerPresentationMode = 'fit' | 'actual';
+
+export interface ViewerPresentationSummary {
+  readonly mode: ViewerPresentationMode;
+  readonly renderWidth: number;
+  readonly renderHeight: number;
+  readonly viewWidth: number;
+  readonly viewHeight: number;
+  readonly scale: number;
+  readonly panX: number;
+  readonly panY: number;
+}
+
+export interface MotionCaptureReceipt {
+  readonly path: string;
+  readonly frameCount: number;
+  readonly totalSize: number;
+  readonly captureMode: 'stepped' | 'screencast';
+  readonly warnings: readonly string[];
+}
+
+export type WebProfileCreateDraft =
+  | { readonly kind: 'public-research'; readonly name?: string }
+  | { readonly kind: 'site-account'; readonly name: string; readonly destinations: readonly string[]; readonly supportHosts?: readonly string[] };
+
+export interface WebActivitySummary {
+  readonly sessionId: string;
+  readonly webProfileId: string;
+  readonly profileName: string;
+  readonly profileKind: 'public-research' | 'site-account';
+  readonly state: 'running' | 'stopped';
+  readonly startedAt: string;
+  readonly controlState: 'agent_control' | 'waiting_for_human' | 'human_control' | 'returning_to_agent' | 'ready' | 'declined' | 'expired' | 'stopped';
+  readonly tabCount: number;
+  readonly controlExpiresAt?: string;
+  readonly humanReason?: 'sign_in' | 'file_selection' | 'manual_step';
+  readonly delegatedSite?: string;
+  readonly delegatedExpiresAt?: string;
+  readonly closedAt?: string;
+  readonly closeReason?: 'user' | 'agent' | 'policy' | 'expired' | 'failed';
+}
+
+export interface WebTabActivitySummary {
+  readonly tabId: string;
+  readonly title: string;
+  readonly url: string;
+  readonly state: 'ready' | 'loading' | 'failed' | 'closed';
+  readonly openedAt: string;
+  readonly viewport?: { readonly width: number; readonly height: number; readonly mobile: boolean };
+  readonly blockedNativeDownloads?: number;
+  readonly blockedFileChoosers?: number;
+  readonly blockedDialogs?: number;
+  readonly motionCapture?: { readonly completed: number; readonly total: number; readonly mode: 'auto' | 'stepped' | 'screencast' };
+  readonly lastMotionCapture?: MotionCaptureReceipt;
+  readonly viewerPresentation?: ViewerPresentationSummary;
+}
+
+export interface WebLiveViewerState {
+  readonly visible: boolean;
+  readonly mode?: 'follow' | 'pinned';
+  readonly sessionId?: string;
+  readonly tabId?: string;
+  readonly pageState?: 'loading' | 'action' | 'idle' | 'failed';
+  readonly presentation?: ViewerPresentationSummary;
+  readonly displays: ReadonlyArray<{
+    readonly id: string;
+    readonly ordinal: number;
+    readonly label: string;
+    readonly isPrimary: boolean;
+  }>;
+  readonly recommendedDisplayId: string;
+  readonly displayId?: string;
 }
 
 export type BrowserViewerFrame =
@@ -368,6 +504,7 @@ const api: DesktopApi = {
   stopApplication: (applicationId, runId) => ipcRenderer.invoke("applications:stop", applicationId, runId),
   detectProjectCommands: (rootPath) => ipcRenderer.invoke("workspaces:detectCommands", rootPath),
   listDevelopmentActivity: () => ipcRenderer.invoke("development:list"),
+  cancelAnalysisJob: (workspaceId, jobId) => ipcRenderer.invoke("development:cancelAnalysis", { workspaceId, jobId }),
   stopAllDevelopmentActivity: () => ipcRenderer.invoke("development:stopAll"),
   openTerminalListener: (projectId, terminalSessionId, listenerRef) => ipcRenderer.invoke('development:openTerminalListener', {
     projectId, terminalSessionId, listenerRef,
@@ -382,16 +519,54 @@ const api: DesktopApi = {
   declineBrowserHumanControl: (sessionId) => ipcRenderer.invoke('development:declineHumanControl', sessionId),
   revokeBrowserHumanControl: (sessionId) => ipcRenderer.invoke('development:revokeHumanControl', sessionId),
   captureBrowserViewer: (sessionId) => ipcRenderer.invoke('development:captureViewer', sessionId),
-  showBrowserLiveViewer: (sessionId, displayId) => ipcRenderer.invoke('development:showLiveViewer', {
+  showBrowserLiveViewer: (sessionId, displayId, presentationMode) => ipcRenderer.invoke('development:showLiveViewer', {
     sessionId,
     ...(displayId === undefined ? {} : { displayId }),
+    ...(presentationMode === undefined ? {} : { presentationMode }),
   }),
   moveBrowserLiveViewer: (sessionId, displayId) => ipcRenderer.invoke('development:moveLiveViewer', { sessionId, displayId }),
   hideBrowserLiveViewer: (sessionId) => ipcRenderer.invoke('development:hideLiveViewer', sessionId),
+  setBrowserLiveViewerPresentation: (sessionId, mode, panX = 0, panY = 0) => ipcRenderer.invoke('development:setLiveViewerPresentation', { sessionId, mode, panX, panY }),
+  cancelBrowserMotion: (sessionId) => ipcRenderer.invoke('development:cancelMotion', { sessionId }),
+  setBrowserViewport: (workspaceId, sessionId, width, height, mobile) => ipcRenderer.invoke('development:setViewport', { workspaceId, sessionId, width, height, mobile }),
   onDevelopmentActivityChange: (callback) => {
     const listener = (): void => callback();
     ipcRenderer.on('development:changed', listener);
     return () => ipcRenderer.removeListener('development:changed', listener);
+  },
+  getWebProfiles: () => ipcRenderer.invoke('webProfiles:get'),
+  enableWebBrowsing: (expectedSha256, download = false) => ipcRenderer.invoke('webProfiles:enableInternet', { expectedSha256, download }),
+  createWebProfile: (input) => ipcRenderer.invoke('webProfiles:create', input),
+  updateWebProfile: (expectedSha256, profile) => ipcRenderer.invoke('webProfiles:update', { expectedSha256, profile }),
+  removeWebProfile: (expectedSha256, webProfileId) => ipcRenderer.invoke('webProfiles:remove', { expectedSha256, webProfileId }),
+  resetWebProfiles: (expectedSha256) => ipcRenderer.invoke('webProfiles:reset', { expectedSha256 }),
+  listWebActivity: () => ipcRenderer.invoke('webActivity:list'),
+  getWebLiveViewerState: () => ipcRenderer.invoke('webActivity:viewerState', {}),
+  listWebTabs: (sessionId) => ipcRenderer.invoke('webActivity:tabs', { sessionId }),
+  setWebViewport: (sessionId, tabId, width, height, mobile) => ipcRenderer.invoke('webActivity:setViewport', { sessionId, tabId, width, height, mobile }),
+  showWebLiveViewer: (sessionId, mode, displayId, tabId, presentationMode) => ipcRenderer.invoke('webActivity:showLiveViewer', {
+    sessionId,
+    mode,
+    ...(displayId === undefined ? {} : { displayId }),
+    ...(tabId === undefined ? {} : { tabId }),
+    ...(presentationMode === undefined ? {} : { presentationMode }),
+  }),
+  moveWebLiveViewer: (sessionId, displayId) => ipcRenderer.invoke('webActivity:moveLiveViewer', { sessionId, displayId }),
+  hideWebLiveViewer: (sessionId) => ipcRenderer.invoke('webActivity:hideLiveViewer', { sessionId }),
+  setWebLiveViewerPresentation: (sessionId, mode, panX = 0, panY = 0) => ipcRenderer.invoke('webActivity:setLiveViewerPresentation', { sessionId, mode, panX, panY }),
+  cancelWebMotion: (sessionId, tabId) => ipcRenderer.invoke('webActivity:cancelMotion', { sessionId, tabId }),
+  takeWebHumanControl: (sessionId, tabId) => ipcRenderer.invoke('webActivity:takeHumanControl', {
+    sessionId,
+    ...(tabId === undefined ? {} : { tabId }),
+  }),
+  cycleWebHumanTab: (sessionId, direction) => ipcRenderer.invoke('webActivity:cycleHumanTab', { sessionId, direction }),
+  returnWebHumanControl: (sessionId) => ipcRenderer.invoke('webActivity:returnHumanControl', sessionId),
+  declineWebHumanControl: (sessionId) => ipcRenderer.invoke('webActivity:declineHumanControl', sessionId),
+  stopWebSession: (sessionId) => ipcRenderer.invoke('webActivity:stop', sessionId),
+  onWebActivityChange: (callback) => {
+    const listener = (): void => callback();
+    ipcRenderer.on('web:changed', listener);
+    return () => ipcRenderer.removeListener('web:changed', listener);
   },
 
   getSettings: () => ipcRenderer.invoke("settings:get"),
@@ -420,6 +595,7 @@ const api: DesktopApi = {
   diagnoseTunnel: (apiKey) => ipcRenderer.invoke("tunnel:doctor", apiKey),
   disconnectTunnel: () => ipcRenderer.invoke("tunnel:disconnect"),
   getTunnelStatus: () => ipcRenderer.invoke("tunnel:status"),
+  getEffectiveGitApprovalMode: () => ipcRenderer.invoke("tunnel:effectiveGitApprovalMode"),
   onTunnelStatusChange: (callback) => {
     const listener = (_event: Electron.IpcRendererEvent, status: TunnelStatus, detail: string | undefined): void =>
       callback(status, detail);

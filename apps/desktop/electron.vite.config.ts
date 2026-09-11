@@ -16,6 +16,8 @@ const LOCALBRIDGE_PACKAGES = [
   '@localbridge/development',
   '@localbridge/filesystem',
   '@localbridge/git',
+  '@localbridge/mcp-server',
+  '@localbridge/permissions',
   '@localbridge/shared',
   '@localbridge/workspace',
 ];

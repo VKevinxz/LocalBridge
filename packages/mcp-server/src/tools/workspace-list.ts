@@ -8,7 +8,7 @@ import { toolError, toolSuccess } from '../tool-result.js';
 
 /** `workspace.list` — riesgo R1, sin permiso propio (TOOL_CATALOG.md §2). */
 
-const inputSchema = z.object({});
+const inputSchema = z.object({}).strict();
 
 const permissionsSchema = z.object({
   read: z.boolean(),
@@ -29,6 +29,12 @@ const limitsSchema = z.object({
   maxTreeDepth: z.number(),
 });
 
+const profileAvailabilitySchema = z.object({
+  name: z.string(),
+  available: z.boolean(),
+  blockedReason: z.enum(['capability-disabled', 'automation-review-required']).optional(),
+}).strict();
+
 const outputSchema = z.object({
   workspaces: z.array(
     z.object({
@@ -37,6 +43,14 @@ const outputSchema = z.object({
       permissions: permissionsSchema,
       limits: limitsSchema,
       applicationIds: z.array(z.string()),
+      validationProfiles: z.array(z.string()),
+      processProfiles: z.array(z.string()),
+      browserProfiles: z.array(z.string()),
+      profileAvailability: z.object({
+        validations: z.array(profileAvailabilitySchema),
+        processes: z.array(profileAvailabilitySchema),
+        browser: z.array(profileAvailabilitySchema),
+      }).strict(),
     }),
   ),
   applications: z.array(z.object({
@@ -57,6 +71,7 @@ const DESCRIPTION = [
   'Lists the workspaces the user has authorized for this server, with their current permissions and limits.',
   'Only enabled workspaces are returned; the model can never see or reference a workspace the user has not explicitly authorized.',
   'Use this before any other workspace or file tool to discover valid workspaceId values and avoid calling operations that will be denied.',
+  'profileAvailability reports whether each saved validation, process and browser profile is currently usable, and why it is blocked, without granting any capability.',
   'Requires no permissions and never modifies state.',
 ].join(' ');
 
@@ -84,15 +99,45 @@ export function registerWorkspaceListTool(server: McpServer, ctx: ToolContext): 
         const result = {
           workspaces: registry.workspaces
             .filter((workspace) => workspace.enabled)
-            .map((workspace) => ({
+            .map((workspace) => {
+              const validationProfiles = Object.keys(workspace.validationProfiles).toSorted();
+              const processProfiles = Object.keys(workspace.processProfiles ?? {}).toSorted();
+              const browserProfiles = Object.keys(workspace.browserProfiles ?? {}).toSorted();
+              const automationBlocked = workspace.automationReviewRequired === true;
+              return {
               workspaceId: workspace.id,
               name: workspace.name,
               permissions: workspace.permissions,
               limits: workspace.limits,
+              validationProfiles,
+              processProfiles,
+              browserProfiles,
+              profileAvailability: {
+                validations: validationProfiles.map((name) => ({
+                  name,
+                  available: workspace.permissions.validations,
+                  ...(workspace.permissions.validations ? {} : { blockedReason: 'capability-disabled' as const }),
+                })),
+                processes: processProfiles.map((name) => ({
+                  name,
+                  available: workspace.permissions.processes && !automationBlocked,
+                  ...(!workspace.permissions.processes
+                    ? { blockedReason: 'capability-disabled' as const }
+                    : automationBlocked ? { blockedReason: 'automation-review-required' as const } : {}),
+                })),
+                browser: browserProfiles.map((name) => ({
+                  name,
+                  available: workspace.permissions.browserRead && !automationBlocked,
+                  ...(!workspace.permissions.browserRead
+                    ? { blockedReason: 'capability-disabled' as const }
+                    : automationBlocked ? { blockedReason: 'automation-review-required' as const } : {}),
+                })),
+              },
               applicationIds: registry.applications
                 .filter((application) => application.services.some((service) => service.workspaceId === workspace.id))
                 .map((application) => application.id),
-            })),
+              };
+            }),
           applications: registry.applications
             .filter((application) => application.services.every((service) => enabledIds.has(service.workspaceId)))
             .map((application) => ({

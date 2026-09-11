@@ -15,13 +15,30 @@ export interface FileReadResult {
   size: number;
   truncated: boolean;
   modifiedAt: string;
+  lineRange?: {
+    startLine: number;
+    endLine: number;
+    totalLines: number;
+    hasMoreBefore: boolean;
+    hasMoreAfter: boolean;
+  };
+}
+
+export interface FileReadOptions {
+  readonly startLine?: number;
+  readonly endLine?: number;
 }
 
 export async function readWorkspaceFile(
   workspace: AuthorizedWorkspace,
   relativePath: string,
   requestedMaxBytes: number | undefined,
+  options: FileReadOptions = {},
 ): Promise<FileReadResult> {
+  if ((options.startLine !== undefined && (!Number.isInteger(options.startLine) || options.startLine < 1))
+    || (options.endLine !== undefined && (!Number.isInteger(options.endLine) || options.endLine < 1))) {
+    throw new LocalBridgeError("INVALID_INPUT", { reason: "line numbers must be positive integers" });
+  }
   const safe = await resolveAllowedPath(workspace, relativePath);
 
   // Si el target no existe, `safe.realPath` es el de su ancestro existente más
@@ -58,14 +75,35 @@ export async function readWorkspaceFile(
   // El hash es siempre del contenido completo leído del disco, nunca del
   // fragmento truncado — es lo que hace útil `expectedSha256` en la Fase 3.
   const sha256 = createHash("sha256").update(buffer).digest("hex");
-  const truncated = buffer.byteLength > effectiveMaxBytes;
+  let selected = buffer;
+  let lineRange: FileReadResult["lineRange"];
+  if (options.startLine !== undefined || options.endLine !== undefined) {
+    const startLine = options.startLine ?? 1;
+    const text = buffer.toString("utf8");
+    const lineStarts = [0];
+    for (let index = 0; index < text.length; index += 1) {
+      if (text[index] === "\n" && index + 1 < text.length) lineStarts.push(index + 1);
+    }
+    const totalLines = lineStarts.length;
+    if (startLine > totalLines) throw new LocalBridgeError("INVALID_INPUT", { reason: "startLine exceeds file length" });
+    const endLine = Math.min(options.endLine ?? Math.min(totalLines, startLine + 499), totalLines);
+    if (endLine < startLine || endLine - startLine + 1 > 2_000) {
+      throw new LocalBridgeError("INVALID_INPUT", { reason: "invalid line range" });
+    }
+    const startOffset = lineStarts[startLine - 1] ?? 0;
+    const endOffset = endLine < totalLines ? lineStarts[endLine] ?? text.length : text.length;
+    selected = Buffer.from(text.slice(startOffset, endOffset), "utf8");
+    lineRange = { startLine, endLine, totalLines, hasMoreBefore: startLine > 1, hasMoreAfter: endLine < totalLines };
+  }
+  const truncated = selected.byteLength > effectiveMaxBytes;
 
   return {
     path: safe.relativePath,
-    content: buffer.subarray(0, effectiveMaxBytes).toString("utf8"),
+    content: selected.subarray(0, effectiveMaxBytes).toString("utf8"),
     sha256,
     size: buffer.byteLength,
     truncated,
     modifiedAt: stats.mtime.toISOString(),
+    ...(lineRange === undefined ? {} : { lineRange }),
   };
 }

@@ -43,7 +43,7 @@ describe('SEC-085 — migración v3 usa la intersección de autoridades previas'
       }],
       applications: [],
     });
-    expect(migrated.schemaVersion).toBe(4);
+    expect(migrated.schemaVersion).toBe(5);
     expect(migrated.workspaces[0]?.permissions.browserHumanControl).toBe(expected);
     expect(migrated.workspaces[0]?.automationReviewRequired).toBe(browserAuthenticate !== browserManualControl);
   });
@@ -169,7 +169,7 @@ describe('SEC-097 — portabilidad v4 nunca concede control humano', () => {
       ...base,
       permissions: { ...base.permissions, browserRead: true, browserHumanControl: true },
     });
-    const registry: WorkspaceRegistry = { schemaVersion: 4, workspaces: [workspace], applications: [] };
+    const registry: WorkspaceRegistry = { schemaVersion: 5, workspaces: [workspace], applications: [] };
     const portable = buildPortableConfig(DEFAULT_DESKTOP_SETTINGS, registry);
     expect(portable.version).toBe(4);
     if (portable.version !== 4) throw new Error('formato portable inesperado');

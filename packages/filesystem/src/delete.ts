@@ -15,14 +15,15 @@
  * no hay forma de que una sola llamada borre más de una ruta.
  */
 
-import { createHash } from "node:crypto";
-import { readFile, stat, unlink } from "node:fs/promises";
+import { unlink } from "node:fs/promises";
 import path from "node:path";
 
 import { LocalBridgeError } from "@localbridge/shared";
 import { isPathDenied, resolveWriteTarget, type AuthorizedWorkspace } from "@localbridge/workspace";
 
 import { mutationLockKey, withMutationLock } from "./mutex.js";
+import { hashResolvedFile } from './hash-file.js';
+import { runAuthorizedEffect, type MutationOptions } from "./mutation-options.js";
 
 export interface FileDeleteResult {
   path: string;
@@ -33,6 +34,7 @@ export async function deleteWorkspaceFile(
   workspace: AuthorizedWorkspace,
   relativePath: string,
   expectedSha256: string,
+  options: MutationOptions = {},
 ): Promise<FileDeleteResult> {
   const initial = await resolveWriteTarget(workspace.rootPath, relativePath, { createParentDirs: false });
   if (isPathDenied(initial.relativePath, workspace.denyPatterns)) {
@@ -40,6 +42,7 @@ export async function deleteWorkspaceFile(
   }
 
   return withMutationLock(mutationLockKey(workspace.id, initial.relativePath), async () => {
+    return runAuthorizedEffect(options, async () => {
     // Revalidación dentro del mutex (ADR-0005/ADR-0013): el archivo pudo
     // cambiar, desaparecer, o convertirse en symlink entre la primera pasada
     // y la adquisición del lock.
@@ -54,26 +57,14 @@ export async function deleteWorkspaceFile(
 
     const targetPath = path.join(current.realParentDir, current.basename);
 
-    let stats;
-    try {
-      stats = await stat(targetPath);
-    } catch {
-      throw new LocalBridgeError("INTERNAL_ERROR");
-    }
-    // Mismo invariante que file.write_guarded: nunca se carga en memoria un
-    // archivo que excede el techo del workspace, ni para hashearlo.
-    if (stats.size > workspace.limits.maxFileBytes) {
-      throw new LocalBridgeError("FILE_TOO_LARGE");
-    }
-
-    const buffer = await readFile(targetPath);
-    const currentSha256 = createHash("sha256").update(buffer).digest("hex");
-    if (currentSha256 !== expectedSha256) {
+    const currentFile = await hashResolvedFile(targetPath);
+    if (currentFile.sha256 !== expectedSha256) {
       throw new LocalBridgeError("HASH_MISMATCH");
     }
 
     await unlink(targetPath);
 
     return { path: current.relativePath, deleted: true as const };
+    });
   });
 }

@@ -23,7 +23,7 @@ export { withMutationLock, mutationLockKey } from './mutex.js';
 
 export { buildFilteredEnv } from './subprocess-env.js';
 
-export { killProcessTree } from './process-tree.js';
+export { killProcessTree, killProcessTreeAndWait } from './process-tree.js';
 
 export {
   SERVER_NAME,

@@ -25,3 +25,40 @@ export function killProcessTree(child: { pid?: number | undefined }, isWindows: 
     }
   }
 }
+
+export async function killProcessTreeAndWait(
+  child: { pid?: number | undefined; kill?: (signal?: NodeJS.Signals | number) => boolean },
+  isWindows: boolean = process.platform === "win32",
+): Promise<void> {
+  if (child.pid === undefined) return;
+  if (!isWindows) {
+    killProcessTree(child, false);
+    return;
+  }
+  await new Promise<void>((resolve) => {
+    let settled = false;
+    const killer = spawn("taskkill", ["/PID", String(child.pid), "/T", "/F"], {
+      windowsHide: true,
+      shell: false,
+      stdio: "ignore",
+    });
+    const finish = (): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve();
+    };
+    const timer = setTimeout(() => {
+      try { killer.kill("SIGKILL"); } catch { /* ya terminó */ }
+      finish();
+    }, 10_000);
+    timer.unref();
+    killer.once("error", finish);
+    killer.once("close", finish);
+  });
+  try {
+    child.kill?.("SIGKILL");
+  } catch {
+    // Ya terminó o el handle dejó de ser válido.
+  }
+}

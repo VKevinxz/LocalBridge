@@ -15,7 +15,7 @@ async function fixture() {
   roots.push(rootPath);
   const workspace = buildWorkspace({ id: "ws_plan", rootPath });
   const project = buildNewDevelopmentProject({ name: "Plan", workspaceIds: [workspace.id] });
-  return { rootPath, workspace, project, registry: { schemaVersion: 4 as const, workspaces: [workspace], applications: [] } };
+  return { rootPath, workspace, project, registry: { schemaVersion: 5 as const, workspaces: [workspace], applications: [] } };
 }
 
 const npmEvidence = [{ manager: "npm" as const, executableSha256: "f".repeat(64), version: "10.9.0" }];

@@ -22,7 +22,7 @@ function workspace(definitionHash: string, review = false): AuthorizedWorkspace 
     enabled: true,
     createdAt: new Date().toISOString(),
     permissions: { read: true, write: false, overwrite: false, gitRead: false, validations: false, gitWrite: false, processes: true },
-    limits: { maxFileBytes: 1024, maxTreeEntries: 30, maxTreeDepth: 2 },
+    limits: { maxFileBytes: 1024, maxTreeEntries: 30, maxTreeDepth: 2, largeArtifacts: { mode: 'standard', reserve: { minimumFreeBytes: 1024 * 1024 * 1024, minimumFreePercent: 10 }, maxConcurrentJobs: 1 } },
     denyPatterns: ['.env'],
     validationProfiles: {},
     processProfiles: {

@@ -1,17 +1,29 @@
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 
-import { BrowserWindow, WebContentsView, type Session, type WebContents } from 'electron';
+import { BrowserWindow, View, WebContentsView, type Session, type WebContents } from 'electron';
 
 import {
   DevelopmentBrokerError,
+  MAX_BROKER_FRAME_BYTES,
   type BrowserApplicationListenerInput,
+  type BrowserCondition,
   type ResolvedProcessListener,
   type ResolvedTerminalListener,
 } from '@localbridge/development';
 import type { AuthorizedWorkspace, BrowserProfile, LocalApplication } from '@localbridge/workspace';
+import type { WorkspaceArtifactDirectoryResult, WorkspaceArtifactWriter } from '@localbridge/filesystem';
 import { isSensitiveInput } from '@localbridge/desktop-core';
+import { ERROR_CODES, LocalBridgeError } from '@localbridge/shared';
 
 import { isAllowedBrowserRequest } from './browser-network-policy.js';
+import { resolveViewerPresentation, type ViewerPresentationMode } from './live-viewer-presentation.js';
+import {
+  capturePageMotion,
+  inspectPageMotion,
+  type MotionCaptureMode,
+  type MotionCaptureValue,
+  type MotionTrajectory,
+} from './motion-capture-engine.js';
 
 const MAX_SESSIONS = 4;
 const MAX_EVENT_BYTES = 1024 * 1024;
@@ -21,6 +33,7 @@ const HUMAN_REQUEST_TTL_MS = 5 * 60_000;
 const POST_HUMAN_SESSION_TTL_MS = 30 * 60_000;
 const HUMAN_CONTROL_TTL_MS = 15 * 60_000;
 const MAX_VIEWER_FRAME_BYTES = 16 * 1024 * 1024;
+const MAX_SCREENSHOT_BASE64_BYTES = MAX_BROKER_FRAME_BYTES - 128 * 1024;
 const TERMINAL_SESSION_TTL_MS = 5 * 60_000;
 const AUTH_TOOLBAR_HEIGHT = 112;
 const INTERACTIVE_ROLES = new Set([
@@ -74,6 +87,7 @@ interface ManagedBrowserSession {
   readonly profileName: string;
   readonly profile: BrowserProfile;
   readonly window: BrowserWindow;
+  readonly frame: View;
   readonly content: WebContentsView;
   readonly browserSession: Session;
   readonly workspaceName: string;
@@ -104,14 +118,20 @@ interface ManagedBrowserSession {
   controlEpoch: number;
   activeAgentOperations: number;
   blockedFileChooserCount: number;
+  dialogOpen: boolean;
   /** Viewport realmente renderizado. Cambia con `browser.viewport` (ADR-0042). */
   currentViewport: { width: number; height: number; mobile: boolean };
+  /** Viewport del agente que se reaplica al terminar el intervalo humano. */
+  agentViewportBeforeHuman?: { width: number; height: number; mobile: boolean };
   viewerCapturePromise?: Promise<BrowserViewerFrame>;
   restoreLiveViewerAfterHuman?: boolean;
   previousViewerWorkArea?: LiveViewerWorkArea;
   readonly agentIdleWaiters: Array<() => void>;
-  readonly agentShellUrl: string;
+  agentShellUrl: string;
   trustedShellUrl: string;
+  motionCapture?: { readonly completed: number; readonly total: number; readonly mode: MotionCaptureMode };
+  lastMotionCapture?: BrowserMotionCaptureSummary;
+  viewerPresentation?: BrowserViewerPresentation;
 }
 
 export type BrowserHumanReason = 'sign_in' | 'file_selection' | 'manual_step';
@@ -143,6 +163,31 @@ export interface BrowserSessionSummary {
   readonly controlExpiresAt?: string;
   readonly postHumanExpiresAt?: string;
   readonly humanReason?: BrowserHumanReason;
+  readonly viewport: { readonly width: number; readonly height: number; readonly mobile: boolean };
+  readonly motionCapture?: { readonly completed: number; readonly total: number; readonly mode: MotionCaptureMode };
+  readonly lastMotionCapture?: BrowserMotionCaptureSummary;
+  readonly viewerPresentation?: BrowserViewerPresentation;
+}
+
+export interface BrowserMotionCaptureSummary {
+  readonly path: string;
+  readonly frameCount: number;
+  readonly totalSize: number;
+  readonly captureMode: 'stepped' | 'screencast';
+  readonly warnings: readonly string[];
+}
+
+export interface BrowserViewerPresentation {
+  readonly mode: ViewerPresentationMode;
+  readonly renderWidth: number;
+  readonly renderHeight: number;
+  readonly viewWidth: number;
+  readonly viewHeight: number;
+  readonly scale: number;
+  readonly panX: number;
+  readonly panY: number;
+  readonly contentBounds: LiveViewerWorkArea;
+  readonly workArea: LiveViewerWorkArea;
 }
 
 export interface BrowserHumanControlStatus {
@@ -174,6 +219,10 @@ export interface BrowserControllerOptions {
   ) => Promise<ResolvedTerminalListener>;
   readonly reconciliationIntervalMs?: number;
   readonly onHumanControlRequest?: (session: BrowserSessionSummary & { workspaceId: string }) => void;
+  readonly beforeHumanControlRequest?: () => Promise<void>;
+  readonly reserveHumanControl?: (sessionId: string) => void | Promise<void>;
+  readonly releaseHumanControl?: (sessionId: string) => void;
+  readonly restoreLiveViewerAfterHuman?: (sessionId: string, workArea: LiveViewerWorkArea) => Promise<void>;
   readonly onActivityChange?: () => void;
   readonly confirmHumanControlHandoff?: (workspaceName: string) => Promise<boolean>;
   readonly onHumanControlTransition?: (event: {
@@ -186,10 +235,78 @@ export interface BrowserControllerOptions {
     readonly errorCode?: string;
   }) => void;
   readonly onSecurityDiagnostic?: (message: string) => void;
+  readonly onMotionDiagnostic?: (event: {
+    readonly workspaceId: string;
+    readonly sessionId: string;
+    readonly outcome: 'failed';
+    readonly causeCode?: string;
+    readonly operationId: string;
+  }) => void;
+  readonly saveScreenshot?: (input: {
+    readonly workspaceId: string;
+    readonly expectedWorkspace: AuthorizedWorkspace;
+    readonly path: string;
+    readonly bytes: Uint8Array;
+  }) => Promise<{ path: string; sha256: string; size: number; created: true }>;
+  readonly saveMotionBundle?: (input: {
+    readonly workspaceId: string;
+    readonly expectedWorkspace: AuthorizedWorkspace;
+    readonly path: string;
+    readonly produce: (writer: WorkspaceArtifactWriter) => Promise<MotionCaptureValue>;
+  }) => Promise<WorkspaceArtifactDirectoryResult<MotionCaptureValue>>;
 }
 
-function fail(code: string, message: string): never {
-  throw new DevelopmentBrokerError(code, message);
+interface ElementState {
+  readonly attached: boolean;
+  readonly visible: boolean;
+  readonly enabled: boolean;
+  readonly checked: boolean;
+  readonly selected: boolean;
+  readonly receivesPointer: boolean;
+  readonly fileInput: boolean;
+  readonly select: boolean;
+}
+
+interface InteractionOperationRecord {
+  readonly fingerprint: string;
+  readonly sessionId: string;
+  readonly result: unknown;
+}
+
+interface MotionOperationRecord {
+  readonly fingerprint: string;
+  readonly sessionId: string;
+  state: 'pending' | 'complete' | 'uncertain';
+  result?: unknown;
+  causeCode?: string;
+}
+
+interface AppliedInteractionResult {
+  readonly sessionId: string;
+  readonly applied: true;
+  readonly snapshotInvalidated: true;
+}
+
+interface BrowserViewportResult {
+  readonly sessionId: string;
+  readonly width: number;
+  readonly height: number;
+  readonly mobile: boolean;
+  readonly state: 'running' | 'stopped';
+}
+
+function fail(code: string, message: string, causeCode?: string): never {
+  throw new DevelopmentBrokerError(code, message, causeCode);
+}
+
+function safeCauseCode(error: unknown): string | undefined {
+  const candidate = error instanceof DevelopmentBrokerError
+    ? error.causeCode ?? error.code
+    : error instanceof LocalBridgeError
+      ? (typeof error.details?.['causeCode'] === 'string' ? error.details['causeCode'] : error.code)
+      : undefined;
+  return candidate !== undefined && candidate !== 'MOTION_EFFECT_UNCERTAIN' &&
+    (ERROR_CODES as readonly string[]).includes(candidate) ? candidate : undefined;
 }
 
 function isResolvedTerminalListener(
@@ -214,6 +331,35 @@ function stringValue(value: unknown): string {
   return '';
 }
 
+function capturedImageDimensions(
+  dataBase64: string,
+  mimeType: 'image/png' | 'image/jpeg',
+  fallback: { width: number; height: number },
+): { width: number; height: number } {
+  const bytes = Buffer.from(dataBase64, 'base64');
+  if (mimeType === 'image/png' && bytes.length >= 24 && bytes.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) {
+    return { width: bytes.readUInt32BE(16), height: bytes.readUInt32BE(20) };
+  }
+  if (mimeType === 'image/jpeg' && bytes.length >= 4 && bytes[0] === 0xff && bytes[1] === 0xd8) {
+    let offset = 2;
+    while (offset + 8 < bytes.length) {
+      if (bytes[offset] !== 0xff) { offset += 1; continue; }
+      const marker = bytes[offset + 1] ?? 0;
+      const length = bytes.readUInt16BE(offset + 2);
+      if ([0xc0, 0xc1, 0xc2, 0xc3, 0xc5, 0xc6, 0xc7, 0xc9, 0xca, 0xcb, 0xcd, 0xce, 0xcf].includes(marker)) {
+        return { height: bytes.readUInt16BE(offset + 5), width: bytes.readUInt16BE(offset + 7) };
+      }
+      if (length < 2) break;
+      offset += length + 2;
+    }
+  }
+  return fallback;
+}
+
+function interactionFingerprint(parts: readonly unknown[]): string {
+  return createHash('sha256').update(JSON.stringify(parts)).digest('hex');
+}
+
 function summary(entry: ManagedBrowserSession): BrowserSessionSummary {
   return {
     sessionId: entry.sessionId,
@@ -226,6 +372,10 @@ function summary(entry: ManagedBrowserSession): BrowserSessionSummary {
     ...(entry.controlExpiresAt === undefined ? {} : { controlExpiresAt: new Date(entry.controlExpiresAt).toISOString() }),
     ...(entry.postHumanExpiresAt === undefined ? {} : { postHumanExpiresAt: new Date(entry.postHumanExpiresAt).toISOString() }),
     ...(entry.humanReason === undefined ? {} : { humanReason: entry.humanReason }),
+    viewport: entry.currentViewport,
+    ...(entry.motionCapture === undefined ? {} : { motionCapture: entry.motionCapture }),
+    ...(entry.lastMotionCapture === undefined ? {} : { lastMotionCapture: entry.lastMotionCapture }),
+    ...(entry.viewerPresentation === undefined ? {} : { viewerPresentation: entry.viewerPresentation }),
   };
 }
 
@@ -262,8 +412,10 @@ function controlShellHtml(
   return `<!doctype html><html lang="es"><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'"><title>${title} — LocalBridge</title><style>body{margin:0;font:14px system-ui;background:#10243e;color:#fff}.bar{height:${AUTH_TOOLBAR_HEIGHT}px;box-sizing:border-box;padding:14px 18px;display:flex;align-items:center;justify-content:space-between;gap:20px}.title{font-weight:700;font-size:16px}.meta{color:#c7d7e9;margin-top:5px}.notice{color:#ffd18c;margin-top:5px}.actions{display:flex;gap:10px;white-space:nowrap}a{padding:10px 14px;border-radius:8px;text-decoration:none;font-weight:700}a.cancel{color:#fff;border:1px solid #789}a.handoff{color:#08233a;background:#55d6be}a[aria-disabled=true]{pointer-events:none;opacity:.55}</style></head><body><div class="bar"><div><div class="title">${title} — ${escapeHtml(workspaceName)}</div><div class="meta">${escapeHtml(origin)} · <span id="remaining">Tiempo limitado</span></div><div class="notice" id="status" aria-live="polite">${notice}</div></div><div class="actions"><a class="cancel" href="localbridge-control-action://cancel">Cancelar y destruir</a><a class="handoff" href="localbridge-control-action://handoff">Terminé — devolver a ChatGPT</a></div></div><script>(()=>{const expiry=${safeExpiry};const remaining=document.querySelector('#remaining');const update=()=>{if(!expiry){remaining.textContent='Tiempo limitado';return}const seconds=Math.max(0,Math.ceil((expiry-Date.now())/1000));const minutes=Math.floor(seconds/60);remaining.textContent='Vence en '+minutes+':'+String(seconds%60).padStart(2,'0')};update();setInterval(update,1000);for(const action of document.querySelectorAll('a'))action.addEventListener('click',()=>{for(const link of document.querySelectorAll('a'))link.setAttribute('aria-disabled','true');document.querySelector('#status').textContent='Procesando de forma segura…'})})()</script></body></html>`;
 }
 
-function agentShellHtml(workspaceName: string, origin: string): string {
-  return `<!doctype html><html lang="es"><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'"><title>Vista en vivo — LocalBridge</title><style>body{margin:0;font:14px system-ui;background:#10243e;color:#fff}.bar{height:${AUTH_TOOLBAR_HEIGHT}px;box-sizing:border-box;padding:17px 20px;display:flex;align-items:center;justify-content:space-between;gap:20px}.title{font-weight:800;font-size:17px}.meta{color:#c7d7e9;margin-top:6px}.badge{padding:9px 12px;border:1px solid #55d6be;border-radius:999px;color:#8ff1df;font-weight:800}.notice{color:#ffd18c;margin-top:6px}</style></head><body><div class="bar"><div><div class="title">Vista en vivo · solo lectura — ${escapeHtml(workspaceName)}</div><div class="meta">${escapeHtml(origin)}</div><div class="notice">ChatGPT controla esta sesión. Oculta la ventana desde Actividad en LocalBridge.</div></div><div class="badge">Sin ratón ni teclado</div></div></body></html>`;
+function agentShellHtml(workspaceName: string, origin: string, presentation?: BrowserViewerPresentation): string {
+  const metrics = presentation === undefined ? 'Preparando vista…' :
+    `Render ${presentation.renderWidth}×${presentation.renderHeight} · Vista ${presentation.viewWidth}×${presentation.viewHeight} · ${new Intl.NumberFormat('es-PE', { style: 'percent', maximumFractionDigits: 1 }).format(presentation.scale)} · ${presentation.mode === 'fit' ? 'Encajar' : `1:1 · pan ${presentation.panX},${presentation.panY}`}`;
+  return `<!doctype html><html lang="es"><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'"><title>Vista en vivo — LocalBridge</title><style>body{margin:0;font:14px system-ui;background:#10243e;color:#fff}.bar{height:${AUTH_TOOLBAR_HEIGHT}px;box-sizing:border-box;padding:12px 20px;display:flex;align-items:center;justify-content:space-between;gap:20px}.title{font-weight:800;font-size:17px}.meta{color:#c7d7e9;margin-top:4px}.metrics{color:#8ff1df;margin-top:4px;font-weight:700}.badge{padding:9px 12px;border:1px solid #55d6be;border-radius:999px;color:#8ff1df;font-weight:800}.notice{color:#ffd18c;margin-top:4px}</style></head><body><div class="bar"><div><div class="title">Vista en vivo · solo lectura — ${escapeHtml(workspaceName)}</div><div class="meta">${escapeHtml(origin)}</div><div class="metrics">${escapeHtml(metrics)}</div><div class="notice">ChatGPT controla esta sesión. Ajusta la presentación desde Actividad.</div></div><div class="badge">Sin ratón ni teclado</div></div></body></html>`;
 }
 
 function sameProfile(left: BrowserProfile, right: BrowserProfile): boolean {
@@ -297,10 +449,12 @@ export class BrowserController {
   private readonly entries = new Map<string, ManagedBrowserSession>();
   private readonly operations = new Map<string, string>();
   private readonly humanControlOperations = new Map<string, string>();
-  private readonly interactionOperations = new Map<string, { sessionId: string; applied: true; snapshotInvalidated: true }>();
+  private readonly interactionOperations = new Map<string, InteractionOperationRecord>();
+  private readonly motionOperations = new Map<string, MotionOperationRecord>();
   private readonly reconciliationTimer: NodeJS.Timeout;
   private humanSessionId: string | undefined;
   private liveViewerSessionId: string | undefined;
+  private liveViewerWorkArea: LiveViewerWorkArea | undefined;
 
   constructor(private readonly options: BrowserControllerOptions) {
     this.reconciliationTimer = setInterval(() => { void this.reconcile(); }, options.reconciliationIntervalMs ?? 2_000);
@@ -310,6 +464,7 @@ export class BrowserController {
   private hideLiveViewerEntry(entry: ManagedBrowserSession, notify = true): void {
     if (this.liveViewerSessionId !== entry.sessionId) return;
     this.liveViewerSessionId = undefined;
+    this.liveViewerWorkArea = undefined;
     if (!entry.window.isDestroyed()) {
       entry.window.setIgnoreMouseEvents(true);
       entry.window.setFocusable(false);
@@ -345,18 +500,56 @@ export class BrowserController {
     return entry.window.getBounds();
   }
 
-  private positionLiveViewer(entry: ManagedBrowserSession, workArea: LiveViewerWorkArea): void {
-    const values = [workArea.x, workArea.y, workArea.width, workArea.height];
-    if (!values.every(Number.isSafeInteger) || workArea.width < 1 || workArea.height < 1) {
+  private async positionLiveViewer(
+    entry: ManagedBrowserSession,
+    workArea: LiveViewerWorkArea,
+    mode: ViewerPresentationMode = entry.viewerPresentation?.mode ?? 'fit',
+    pan: { readonly x: number; readonly y: number } = { x: entry.viewerPresentation?.panX ?? 0, y: entry.viewerPresentation?.panY ?? 0 },
+  ): Promise<void> {
+    let presentation;
+    try {
+      const outer = entry.window.getBounds();
+      const content = entry.window.getContentBounds();
+      presentation = resolveViewerPresentation(entry.currentViewport, AUTH_TOOLBAR_HEIGHT, workArea, {
+        width: Math.max(0, outer.width - content.width),
+        height: Math.max(0, outer.height - content.height),
+      }, mode, pan);
+    } catch {
       fail('INVALID_INPUT', 'El área de pantalla no es válida.');
     }
-    const { width: windowWidth, height: windowHeight } = entry.window.getBounds();
-    const x = workArea.x + Math.max(0, Math.floor((workArea.width - windowWidth) / 2));
-    const y = workArea.y + Math.max(0, Math.floor((workArea.height - windowHeight) / 2));
-    entry.window.setPosition(x, y, false);
+    entry.window.setBounds(presentation.bounds, false);
+    entry.frame.setBounds({
+      x: 0,
+      y: AUTH_TOOLBAR_HEIGHT,
+      width: presentation.visibleContentWidth,
+      height: presentation.visibleContentHeight,
+    });
+    entry.content.setBounds(presentation.contentBounds);
+    await entry.content.webContents.debugger.sendCommand('Emulation.setDeviceMetricsOverride', {
+      width: entry.currentViewport.width,
+      height: entry.currentViewport.height,
+      deviceScaleFactor: 1,
+      mobile: entry.currentViewport.mobile,
+      scale: presentation.scale,
+    });
+    entry.viewerPresentation = {
+      mode: presentation.mode,
+      renderWidth: entry.currentViewport.width,
+      renderHeight: entry.currentViewport.height,
+      viewWidth: presentation.visibleContentWidth,
+      viewHeight: presentation.visibleContentHeight,
+      scale: presentation.scale,
+      panX: presentation.panX,
+      panY: presentation.panY,
+      contentBounds: presentation.contentBounds,
+      workArea,
+    };
+    entry.agentShellUrl = `data:text/html;charset=utf-8,${encodeURIComponent(agentShellHtml(entry.workspaceName, entry.profile.origin, entry.viewerPresentation))}`;
+    entry.trustedShellUrl = entry.agentShellUrl;
+    if (entry.window.webContents.getURL() !== entry.agentShellUrl) await entry.window.loadURL(entry.agentShellUrl);
   }
 
-  async showLiveViewerLocally(sessionId: string, workArea: LiveViewerWorkArea): Promise<void> {
+  async showLiveViewerLocally(sessionId: string, workArea: LiveViewerWorkArea, mode?: ViewerPresentationMode): Promise<void> {
     const entry = this.entries.get(sessionId);
     if (entry === undefined || entry.application?.localReview === true || entry.state !== 'running' || entry.window.isDestroyed()) {
       fail('SESSION_NOT_FOUND', 'La sesión de navegador no existe.');
@@ -373,9 +566,10 @@ export class BrowserController {
     entry.window.setFocusable(false);
     entry.window.setSkipTaskbar(false);
     entry.window.setTitle('Vista en vivo — LocalBridge');
-    this.positionLiveViewer(entry, workArea);
+    await this.positionLiveViewer(entry, workArea, mode ?? entry.viewerPresentation?.mode ?? 'fit', { x: 0, y: 0 });
     entry.window.showInactive();
     this.liveViewerSessionId = sessionId;
+    this.liveViewerWorkArea = workArea;
     this.options.onActivityChange?.();
   }
 
@@ -397,8 +591,34 @@ export class BrowserController {
     this.ensureAgentControl(entry);
     entry.window.setIgnoreMouseEvents(true);
     entry.window.setFocusable(false);
-    this.positionLiveViewer(entry, workArea);
+    await this.positionLiveViewer(entry, workArea);
+    this.liveViewerWorkArea = workArea;
     entry.window.showInactive();
+    this.options.onActivityChange?.();
+  }
+
+  async setLiveViewerPresentationLocally(
+    sessionId: string,
+    mode: ViewerPresentationMode,
+    panX = 0,
+    panY = 0,
+  ): Promise<void> {
+    const entry = this.entries.get(sessionId);
+    if (entry === undefined || entry.state !== 'running' || entry.window.isDestroyed() ||
+        this.liveViewerSessionId !== sessionId || this.liveViewerWorkArea === undefined) {
+      fail('SESSION_NOT_FOUND', 'La ventana en vivo no está abierta para esta sesión.');
+    }
+    await this.requireWorkspace(entry.workspaceId);
+    this.ensureAgentControl(entry);
+    await this.positionLiveViewer(entry, this.liveViewerWorkArea, mode, { x: panX, y: panY });
+    entry.window.showInactive();
+    this.options.onActivityChange?.();
+  }
+
+  cancelMotionLocally(sessionId: string): void {
+    const entry = this.entries.get(sessionId);
+    if (entry === undefined || entry.state !== 'running') return;
+    if (entry.motionCapture !== undefined) entry.generation += 1;
     this.options.onActivityChange?.();
   }
 
@@ -593,20 +813,145 @@ export class BrowserController {
     return entry;
   }
 
-  private async resolveElement(entry: ManagedBrowserSession, snapshotId: string, elementRef: string) {
+  private async resolveElements(entry: ManagedBrowserSession, snapshotId: string, elementRefs: readonly string[]) {
     const snapshot = entry.snapshot;
     if (snapshot === undefined || snapshot.snapshotId !== snapshotId || snapshot.generation !== entry.generation) {
       fail('STALE_SNAPSHOT', 'El snapshot ya no representa el documento actual.');
     }
-    const binding = snapshot.elements.get(elementRef);
-    if (binding === undefined) fail('STALE_SNAPSHOT', 'La referencia no pertenece al snapshot vigente.');
+    const bindings = elementRefs.map((elementRef) => snapshot.elements.get(elementRef));
+    if (bindings.some((binding) => binding === undefined)) fail('STALE_SNAPSHOT', 'La referencia no pertenece al snapshot vigente.');
+    const existingBindings = bindings as ElementBinding[];
     await entry.content.webContents.debugger.sendCommand('DOM.getDocument', { depth: 0, pierce: true });
     const pushed = await entry.content.webContents.debugger.sendCommand('DOM.pushNodesByBackendIdsToFrontend', {
-      backendNodeIds: [binding.backendNodeId],
+      backendNodeIds: existingBindings.map((binding) => binding.backendNodeId),
     }) as { nodeIds?: number[] };
-    const nodeId = pushed.nodeIds?.[0];
-    if (nodeId === undefined || nodeId === 0) fail('STALE_SNAPSHOT', 'El elemento ya no existe.');
-    return { nodeId, binding };
+    const nodeIds = pushed.nodeIds;
+    if (nodeIds === undefined || nodeIds.length !== existingBindings.length || nodeIds.some((nodeId) => nodeId === 0)) {
+      fail('STALE_SNAPSHOT', 'El elemento ya no existe.');
+    }
+    return existingBindings.map((binding, index) => ({ nodeId: nodeIds[index] as number, binding }));
+  }
+
+  private async resolveElement(entry: ManagedBrowserSession, snapshotId: string, elementRef: string) {
+    return (await this.resolveElements(entry, snapshotId, [elementRef]))[0] as { nodeId: number; binding: ElementBinding };
+  }
+
+  private async inspectElement(entry: ManagedBrowserSession, nodeId: number): Promise<ElementState> {
+    const resolved = await entry.content.webContents.debugger.sendCommand('DOM.resolveNode', { nodeId }) as {
+      object?: { objectId?: string };
+    };
+    const objectId = resolved.object?.objectId;
+    if (objectId === undefined) fail('STALE_SNAPSHOT', 'El elemento ya no es interactuable.');
+    try {
+      const inspected = await entry.content.webContents.debugger.sendCommand('Runtime.callFunctionOn', {
+        objectId,
+        functionDeclaration: `function () {
+          const element = this;
+          if (!(element instanceof Element) || !element.isConnected) {
+            return { attached: false, visible: false, enabled: false, checked: false, selected: false, receivesPointer: false, fileInput: false, select: false };
+          }
+          const style = getComputedStyle(element);
+          const rect = element.getBoundingClientRect();
+          const visible = rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden' && Number(style.opacity) > 0;
+          const x = Math.max(0, Math.min(innerWidth - 1, rect.left + rect.width / 2));
+          const y = Math.max(0, Math.min(innerHeight - 1, rect.top + rect.height / 2));
+          const hit = visible ? document.elementFromPoint(x, y) : null;
+          const receivesPointer = hit !== null && (hit === element || element.contains(hit));
+          const disabledProperty = 'disabled' in element && Boolean(element.disabled);
+          const enabled = !disabledProperty && element.getAttribute('aria-disabled') !== 'true';
+          const checked = 'checked' in element ? Boolean(element.checked) : element.getAttribute('aria-checked') === 'true';
+          const selected = 'selected' in element ? Boolean(element.selected) : element.getAttribute('aria-selected') === 'true';
+          const fileInput = element.matches('input[type="file"]') ||
+            (element.matches('label') && ((element.control instanceof HTMLInputElement && element.control.type === 'file') || element.querySelector('input[type="file"]') !== null));
+          return { attached: true, visible, enabled, checked, selected, receivesPointer, fileInput, select: element instanceof HTMLSelectElement };
+        }`,
+        returnByValue: true,
+      }) as { result?: { value?: ElementState } };
+      return inspected.result?.value ?? {
+        attached: false,
+        visible: false,
+        enabled: false,
+        checked: false,
+        selected: false,
+        receivesPointer: false,
+        fileInput: false,
+        select: false,
+      };
+    } finally {
+      await entry.content.webContents.debugger.sendCommand('Runtime.releaseObject', { objectId }).catch(() => undefined);
+    }
+  }
+
+  private async elementPoint(entry: ManagedBrowserSession, nodeId: number): Promise<{ x: number; y: number }> {
+    let model: { model?: { border?: number[] } };
+    try {
+      model = await entry.content.webContents.debugger.sendCommand('DOM.getBoxModel', { nodeId }) as { model?: { border?: number[] } };
+    } catch {
+      fail('ELEMENT_NOT_INTERACTABLE', 'El elemento no tiene geometría interactuable.');
+    }
+    const border = model.model?.border;
+    if (border === undefined || border.length < 8) fail('ELEMENT_NOT_INTERACTABLE', 'El elemento no tiene geometría interactuable.');
+    const x = ((border[0] ?? 0) + (border[2] ?? 0) + (border[4] ?? 0) + (border[6] ?? 0)) / 4;
+    const y = ((border[1] ?? 0) + (border[3] ?? 0) + (border[5] ?? 0) + (border[7] ?? 0)) / 4;
+    return { x, y };
+  }
+
+  private previousInteraction<T = AppliedInteractionResult>(operationKey: string | undefined, fingerprint: string): T | undefined {
+    if (operationKey === undefined) return undefined;
+    const previous = this.interactionOperations.get(operationKey);
+    if (previous === undefined) return undefined;
+    if (previous.fingerprint !== fingerprint) {
+      fail('IDEMPOTENCY_CONFLICT', 'El operationId ya se usó con otra interacción.');
+    }
+    return previous.result as T;
+  }
+
+  private async conditionSatisfied(entry: ManagedBrowserSession, condition: BrowserCondition): Promise<boolean> {
+    if (condition.kind === 'path') {
+      const path = safePathFromUrl(entry.content.webContents.getURL());
+      return condition.operator === 'equals' ? path === condition.value : path.includes(condition.value);
+    }
+    if (condition.kind === 'title') {
+      const title = entry.content.webContents.getTitle();
+      return condition.operator === 'equals' ? title === condition.value : title.includes(condition.value);
+    }
+    if (condition.kind === 'text') {
+      const tree = await entry.content.webContents.debugger.sendCommand('Accessibility.getFullAXTree') as {
+        nodes?: Array<Record<string, unknown>>;
+      };
+      const present = (tree.nodes ?? []).some((node) => {
+        const role = stringValue((node['role'] as Record<string, unknown> | undefined)?.['value']);
+        if (role === 'password') return false;
+        const name = stringValue((node['name'] as Record<string, unknown> | undefined)?.['value']);
+        const value = stringValue((node['value'] as Record<string, unknown> | undefined)?.['value']);
+        return name.includes(condition.value) || value.includes(condition.value);
+      });
+      return condition.state === 'present' ? present : !present;
+    }
+    if (condition.kind === 'element') {
+      let actual = false;
+      try {
+        const { nodeId } = await this.resolveElement(entry, condition.snapshotId, condition.elementRef);
+        if (condition.state === 'attached') {
+          actual = true;
+        } else {
+          const state = await this.inspectElement(entry, nodeId);
+          actual = state[condition.state];
+        }
+      } catch (error) {
+        if (!(error instanceof DevelopmentBrokerError) || error.code !== 'STALE_SNAPSHOT') throw error;
+      }
+      return actual === condition.expected;
+    }
+    if (condition.kind === 'response') {
+      return entry.events.some((event) => event.cursor >= condition.afterCursor && event.type === 'network' &&
+        event.path === condition.path && (condition.status === undefined || event.message === `HTTP ${condition.status}`));
+    }
+    if (condition.kind === 'no-console-errors') {
+      return !entry.events.some((event) => event.cursor >= condition.afterCursor &&
+        (event.type === 'error' || (event.type === 'console' && ['error', 'assert'].includes(event.level))));
+    }
+    return condition.state === (entry.dialogOpen ? 'open' : 'closed');
   }
 
   private invalidateSnapshot(entry: ManagedBrowserSession): void {
@@ -614,13 +959,14 @@ export class BrowserController {
     delete entry.snapshot;
   }
 
-  private rememberInteractionOperation(
+  private rememberInteractionOperation<T extends { readonly sessionId: string }>(
     operationKey: string | undefined,
-    result: { sessionId: string; applied: true; snapshotInvalidated: true },
+    fingerprint: string,
+    result: T,
   ): void {
     if (operationKey === undefined) return;
     this.interactionOperations.delete(operationKey);
-    this.interactionOperations.set(operationKey, result);
+    this.interactionOperations.set(operationKey, { fingerprint, sessionId: result.sessionId, result });
     while (this.interactionOperations.size > MAX_INTERACTION_OPERATIONS) {
       const oldest = this.interactionOperations.keys().next().value as string | undefined;
       if (oldest === undefined) break;
@@ -663,6 +1009,10 @@ export class BrowserController {
           entry.blockedFileChooserCount += 1;
           this.invalidateSnapshot(entry);
           this.options.onSecurityDiagnostic?.('Se bloqueó un selector de archivos iniciado durante el control del agente.');
+        } else if (method === 'Page.javascriptDialogOpening') {
+          entry.dialogOpen = true;
+        } else if (method === 'Page.javascriptDialogClosed') {
+          entry.dialogOpen = false;
         }
       });
     }
@@ -675,6 +1025,16 @@ export class BrowserController {
       webContents.debugger.sendCommand('Page.setInterceptFileChooserDialog', { enabled: true }),
       webContents.debugger.sendCommand('Runtime.enable'),
     ]);
+    await webContents.debugger.sendCommand('Emulation.setDeviceMetricsOverride', {
+      width: entry.currentViewport.width,
+      height: entry.currentViewport.height,
+      deviceScaleFactor: 1,
+      mobile: entry.currentViewport.mobile,
+    });
+    await webContents.debugger.sendCommand('Emulation.setTouchEmulationEnabled', {
+      enabled: entry.currentViewport.mobile,
+      ...(entry.currentViewport.mobile ? { maxTouchPoints: 5 } : {}),
+    }).catch(() => undefined);
   }
 
   private async startSession(
@@ -728,6 +1088,7 @@ export class BrowserController {
         devTools: false,
       },
     });
+    const frame = new View();
     const content = new WebContentsView({ webPreferences: {
       partition,
       nodeIntegration: false,
@@ -737,10 +1098,20 @@ export class BrowserController {
       devTools: false,
       backgroundThrottling: false,
     } });
-    window.contentView.addChildView(content);
+    window.contentView.addChildView(frame);
+    frame.addChildView(content);
+    // eslint-disable-next-line prefer-const -- el primer layout ocurre antes de enlazar la sesión administrada
+    let currentEntry: ManagedBrowserSession | undefined;
     const resizeContent = (): void => {
+      if (currentEntry?.controlState === 'agent_control' && currentEntry.viewerPresentation !== undefined) {
+        const presentation = currentEntry.viewerPresentation;
+        frame.setBounds({ x: 0, y: AUTH_TOOLBAR_HEIGHT, width: presentation.viewWidth, height: presentation.viewHeight });
+        content.setBounds(presentation.contentBounds);
+        return;
+      }
       const bounds = window.getContentBounds();
-      content.setBounds({ x: 0, y: AUTH_TOOLBAR_HEIGHT, width: bounds.width, height: Math.max(1, bounds.height - AUTH_TOOLBAR_HEIGHT) });
+      frame.setBounds({ x: 0, y: AUTH_TOOLBAR_HEIGHT, width: bounds.width, height: Math.max(1, bounds.height - AUTH_TOOLBAR_HEIGHT) });
+      content.setBounds({ x: 0, y: 0, width: bounds.width, height: Math.max(1, bounds.height - AUTH_TOOLBAR_HEIGHT) });
     };
     resizeContent();
     window.on('resize', resizeContent);
@@ -750,6 +1121,7 @@ export class BrowserController {
       profileName,
       profile,
       window,
+      frame,
       content,
       browserSession: content.webContents.session,
       workspaceName: workspace.name,
@@ -766,11 +1138,13 @@ export class BrowserController {
       controlEpoch: 0,
       activeAgentOperations: 0,
       blockedFileChooserCount: 0,
+      dialogOpen: false,
       currentViewport: { width: profile.viewport.width, height: profile.viewport.height, mobile: false },
       agentIdleWaiters: [],
       agentShellUrl,
       trustedShellUrl: agentShellUrl,
     };
+    currentEntry = entry;
     this.entries.set(sessionId, entry);
     if (operationKey !== undefined) this.operations.set(operationKey, sessionId);
 
@@ -906,7 +1280,7 @@ export class BrowserController {
     const profile: BrowserProfile = {
       origin: listener.origin,
       allowedOrigins: [listener.origin],
-      viewport: { width: 1280, height: 800 },
+      viewport: { width: 1920, height: 1080 },
       linkedProcessProfile: listener.profile,
     };
     return this.startSession(
@@ -980,7 +1354,7 @@ export class BrowserController {
     const profile: BrowserProfile = {
       origin: primary.origin,
       allowedOrigins: origins,
-      viewport: { width: 1280, height: 800 },
+      viewport: { width: 1920, height: 1080 },
       linkedProcessProfile: 'terminal',
     };
     return this.startSession(
@@ -1125,20 +1499,29 @@ export class BrowserController {
     return [...this.entries.values()].map((entry) => ({ workspaceId: entry.workspaceId, ...summary(entry) }));
   }
 
-  async navigate(workspaceId: string, sessionId: string, relativePath: string): Promise<BrowserSessionSummary> {
+  async navigate(workspaceId: string, sessionId: string, relativePath: string, operationId?: string): Promise<BrowserSessionSummary> {
     const entry = await this.requireSession(workspaceId, sessionId);
+    if (!relativePath.startsWith('/') || relativePath.startsWith('//') || relativePath.includes('\\')) {
+      fail('ORIGIN_BLOCKED', 'La navegación debe usar una ruta relativa al origen aprobado.');
+    }
+    const destination = new URL(relativePath, entry.profile.origin);
+    if (!entry.profile.allowedOrigins.includes(destination.origin)) fail('ORIGIN_BLOCKED', 'El origen no está aprobado.');
+    const operationKey = operationId === undefined ? undefined : `${workspaceId}:${sessionId}:${operationId}`;
+    const fingerprint = interactionFingerprint(['browser.navigate', destination.toString()]);
+    const previous = this.previousInteraction<BrowserSessionSummary>(operationKey, fingerprint);
+    if (previous !== undefined) {
+      if (entry.content.webContents.getURL() === destination.toString()) return previous;
+      fail('IDEMPOTENCY_CONFLICT', 'La sesión navegó después de la operación original.');
+    }
     return this.withAgentOperation(entry, async () => {
-      if (!relativePath.startsWith('/') || relativePath.startsWith('//') || relativePath.includes('\\')) {
-        fail('ORIGIN_BLOCKED', 'La navegación debe usar una ruta relativa al origen aprobado.');
-      }
-      const destination = new URL(relativePath, entry.profile.origin);
-      if (!entry.profile.allowedOrigins.includes(destination.origin)) fail('ORIGIN_BLOCKED', 'El origen no está aprobado.');
       try {
         await entry.content.webContents.loadURL(destination.toString());
       } catch {
         fail('FEATURE_UNAVAILABLE', 'La navegación local falló.');
       }
-      return summary(entry);
+      const result = summary(entry);
+      this.rememberInteractionOperation(operationKey, fingerprint, result);
+      return result;
     });
   }
 
@@ -1152,15 +1535,23 @@ export class BrowserController {
       const byId = new Map(nodes.map((node) => [stringValue(node['nodeId']), node]));
       const elements = new Map<string, ElementBinding>();
       const output: Array<Record<string, unknown>> = [];
+      let truncated = false;
       for (const node of nodes) {
-        if (output.length >= maxElements || node['ignored'] === true) continue;
+        if (node['ignored'] === true) continue;
         let depth = 0;
         let parentId = stringValue(node['parentId']);
         while (parentId !== '' && depth <= maxDepth) {
           depth += 1;
           parentId = stringValue(byId.get(parentId)?.['parentId']);
         }
-        if (depth > maxDepth) continue;
+        if (depth > maxDepth) {
+          truncated = true;
+          continue;
+        }
+        if (output.length >= maxElements) {
+          truncated = true;
+          continue;
+        }
         const role = stringValue((node['role'] as Record<string, unknown> | undefined)?.['value']) || 'generic';
         const name = stringValue((node['name'] as Record<string, unknown> | undefined)?.['value']).trim().slice(0, 512);
         const rawValue = stringValue((node['value'] as Record<string, unknown> | undefined)?.['value']);
@@ -1179,26 +1570,208 @@ export class BrowserController {
       }
       const snapshotId = `snapshot_${randomBytes(10).toString('hex')}`;
       entry.snapshot = { snapshotId, generation: entry.generation, elements };
-      return { snapshotId, title: entry.content.webContents.getTitle().slice(0, 256), path: safePathFromUrl(entry.content.webContents.getURL()), nodes: output };
+      return { snapshotId, title: entry.content.webContents.getTitle().slice(0, 256), path: safePathFromUrl(entry.content.webContents.getURL()), nodes: output, truncated };
     });
+  }
+
+  private async captureScreenshotData(entry: ManagedBrowserSession, transportBounded = true): Promise<{
+    mimeType: 'image/png' | 'image/jpeg'; dataBase64: string; width: number; height: number; fallbackUsed: boolean;
+  }> {
+    const capture = async (format: 'png' | 'jpeg', quality?: number): Promise<string> => {
+      const invoke = () => entry.content.webContents.debugger.sendCommand('Page.captureScreenshot', {
+        format, ...(quality === undefined ? {} : { quality }), fromSurface: true, captureBeyondViewport: false,
+      }) as Promise<{ data?: unknown }>;
+      let captured: { data?: unknown };
+      try {
+        captured = await invoke();
+      } catch {
+        try {
+          await entry.content.webContents.debugger.sendCommand('Page.enable');
+          captured = await invoke();
+        } catch {
+          fail('WEB_CAPTURE_FAILED', 'El navegador local no pudo completar la captura tras un reintento seguro.');
+        }
+      }
+      if (typeof captured.data !== 'string' || !/^[A-Za-z0-9+/]+={0,2}$/.test(captured.data)) {
+        fail('WEB_CAPTURE_FAILED', 'El navegador local no devolvió una captura válida.');
+      }
+      const bytes = Buffer.from(captured.data, 'base64');
+      const valid = format === 'png'
+        ? bytes.length >= 24 && bytes.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))
+        : bytes.length >= 4 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes.at(-2) === 0xff && bytes.at(-1) === 0xd9;
+      if (!valid) fail('WEB_CAPTURE_FAILED', 'El navegador local devolvió una imagen con firma inválida.');
+      return captured.data;
+    };
+    const png = await capture('png');
+    if (!transportBounded || Buffer.byteLength(png, 'utf8') <= MAX_SCREENSHOT_BASE64_BYTES) {
+      return { mimeType: 'image/png', dataBase64: png, ...capturedImageDimensions(png, 'image/png', entry.currentViewport), fallbackUsed: false };
+    }
+    for (const quality of [85, 70]) {
+      const jpeg = await capture('jpeg', quality);
+      if (Buffer.byteLength(jpeg, 'utf8') <= MAX_SCREENSHOT_BASE64_BYTES) {
+        return { mimeType: 'image/jpeg', dataBase64: jpeg, ...capturedImageDimensions(jpeg, 'image/jpeg', entry.currentViewport), fallbackUsed: true };
+      }
+    }
+    fail('WEB_CAPTURE_TOO_LARGE', 'La captura local supera el presupuesto seguro del broker.');
   }
 
   async screenshot(workspaceId: string, sessionId: string) {
     const entry = await this.requireSession(workspaceId, sessionId);
+    return this.withAgentOperation(entry, () => this.captureScreenshotData(entry));
+  }
+
+  async saveScreenshot(workspaceId: string, sessionId: string, destinationPath: string, operationId: string) {
+    const entry = await this.requireSession(workspaceId, sessionId);
+    const expectedWorkspace = await this.requireWorkspace(workspaceId);
+    if (this.options.saveScreenshot === undefined) fail('FEATURE_UNAVAILABLE', 'El guardado de evidencia visual no está disponible.');
+    const operationKey = `${workspaceId}:${sessionId}:${operationId}`;
+    const fingerprint = interactionFingerprint(['browser.screenshot.save', destinationPath]);
+    const previous = this.previousInteraction<{
+      readonly sessionId: string; readonly path: string; readonly sha256: string; readonly size: number; readonly created: true;
+      readonly mimeType: 'image/png'; readonly width: number; readonly height: number; readonly fallbackUsed: false; readonly sourcePath: string;
+    }>(operationKey, fingerprint);
+    if (previous !== undefined) return previous;
     return this.withAgentOperation(entry, async () => {
-      const captured = await entry.content.webContents.debugger.sendCommand('Page.captureScreenshot', {
-        format: 'png',
-        fromSurface: true,
-        captureBeyondViewport: false,
-      }) as { data?: string };
-      if (captured.data === undefined) fail('FEATURE_UNAVAILABLE', 'No se pudo capturar la vista local.');
-      return {
-        mimeType: 'image/png' as const,
-        dataBase64: captured.data,
-        width: entry.currentViewport.width,
-        height: entry.currentViewport.height,
+      if (!destinationPath.toLowerCase().endsWith('.png')) fail('INVALID_INPUT', 'La evidencia de navegador local debe guardarse como PNG.');
+      const captured = await this.captureScreenshotData(entry, false);
+      const bytes = Buffer.from(captured.dataBase64, 'base64');
+      const saved = await this.options.saveScreenshot!({ workspaceId, expectedWorkspace, path: destinationPath, bytes });
+      const result = {
+        sessionId, ...saved, mimeType: 'image/png' as const,
+        width: captured.width, height: captured.height, fallbackUsed: false as const,
+        sourcePath: safePathFromUrl(entry.content.webContents.getURL()),
       };
+      this.rememberInteractionOperation(operationKey, fingerprint, result);
+      return result;
     });
+  }
+
+  async inspectMotion(workspaceId: string, sessionId: string, maxAnimations: number) {
+    const entry = await this.requireSession(workspaceId, sessionId);
+    return this.withAgentOperation(entry, () => inspectPageMotion(
+      entry.content.webContents,
+      entry.currentViewport,
+      entry.generation,
+      maxAnimations,
+      'motion',
+    ));
+  }
+
+  async captureMotion(
+    workspaceId: string,
+    sessionId: string,
+    destinationPath: string,
+    trajectory: MotionTrajectory,
+    settleBeforeMs: number,
+    captureMode: MotionCaptureMode,
+    operationId: string,
+  ) {
+    const entry = await this.requireSession(workspaceId, sessionId);
+    const expectedWorkspace = await this.requireWorkspace(workspaceId);
+    if (this.options.saveMotionBundle === undefined) fail('FEATURE_UNAVAILABLE', 'La captura temporal no está disponible.');
+    if (!destinationPath.toLowerCase().endsWith('.lbmotion')) fail('INVALID_INPUT', 'La traza temporal debe guardarse como un directorio .lbmotion nuevo.');
+    const operationKey = `${workspaceId}:${sessionId}:${operationId}`;
+    const operationFingerprint = interactionFingerprint([
+      'browser.motion.capture', destinationPath, trajectory, settleBeforeMs, captureMode,
+    ]);
+    const previous = this.motionOperations.get(operationKey);
+    if (previous !== undefined) {
+      if (previous.fingerprint !== operationFingerprint) fail('IDEMPOTENCY_CONFLICT', 'El operationId ya representa otra captura temporal.');
+      if (previous.state !== 'complete') fail('MOTION_EFFECT_UNCERTAIN', 'La captura temporal anterior pudo desplazar la página; no se repetirá automáticamente.', previous.causeCode);
+      return previous.result;
+    }
+    const record: MotionOperationRecord = {
+      fingerprint: operationFingerprint,
+      sessionId,
+      state: 'pending',
+    };
+    this.motionOperations.set(operationKey, record);
+    while (this.motionOperations.size > MAX_INTERACTION_OPERATIONS) {
+      this.motionOperations.delete(this.motionOperations.keys().next().value as string);
+    }
+    let effectStarted = false;
+    const generation = entry.generation;
+    try {
+      entry.motionCapture = { completed: 0, total: trajectory.sampleCount, mode: captureMode };
+      this.options.onActivityChange?.();
+      const result = await this.withAgentOperation(entry, async () => {
+        const saved = await this.options.saveMotionBundle!({
+          workspaceId,
+          expectedWorkspace,
+          path: destinationPath,
+          produce: (writer) => capturePageMotion({
+            webContents: entry.content.webContents,
+            writer,
+            viewport: entry.currentViewport,
+            trajectory,
+            settleBeforeMs,
+            captureMode,
+            sourceFamily: 'browser',
+            source: { path: safePathFromUrl(entry.content.webContents.getURL()) },
+            generation,
+            assertCurrent: () => {
+              if (entry.generation !== generation) fail('MOTION_CAPTURE_INTERRUPTED', 'La página cambió durante la captura temporal.');
+              this.ensureAgentControl(entry);
+              if (entry.state !== 'running' || entry.content.webContents.isDestroyed()) {
+                fail('MOTION_CAPTURE_INTERRUPTED', 'La sesión terminó durante la captura temporal.');
+              }
+            },
+            onEffectStart: () => { effectStarted = true; },
+            onProgress: (progress) => {
+              entry.motionCapture = { ...progress, mode: captureMode };
+              this.options.onActivityChange?.();
+            },
+          }),
+        });
+        this.invalidateSnapshot(entry);
+        return {
+          sessionId,
+          path: saved.path,
+          created: saved.created,
+          totalSize: saved.totalSize,
+          fileCount: saved.fileCount,
+          manifestPath: `${saved.path}/${saved.value.manifest.path}`,
+          contactSheetPath: `${saved.path}/${saved.value.contactSheet.path}`,
+          frameCount: saved.value.frameCount,
+          width: saved.value.width,
+          height: saved.value.height,
+          captureMode: saved.value.captureMode,
+          temporalFidelity: saved.value.temporalFidelity,
+          droppedFrames: saved.value.droppedFrames,
+          warnings: saved.value.warnings,
+          sourcePath: safePathFromUrl(entry.content.webContents.getURL()),
+        };
+      });
+      entry.lastMotionCapture = {
+        path: result.path,
+        frameCount: result.frameCount,
+        totalSize: result.totalSize,
+        captureMode: result.captureMode,
+        warnings: result.warnings,
+      };
+      record.state = 'complete';
+      record.result = result;
+      return result;
+    } catch (error) {
+      if (!effectStarted) this.motionOperations.delete(operationKey);
+      else {
+        record.state = 'uncertain';
+        const causeCode = safeCauseCode(error);
+        if (causeCode !== undefined) record.causeCode = causeCode;
+        this.options.onMotionDiagnostic?.({
+          workspaceId: entry.workspaceId,
+          sessionId,
+          outcome: 'failed',
+          operationId,
+          ...(causeCode === undefined ? {} : { causeCode }),
+        });
+        fail('MOTION_EFFECT_UNCERTAIN', 'La captura se interrumpió después de desplazar la página; comprueba el estado antes de reintentar.', causeCode);
+      }
+      throw error;
+    } finally {
+      delete entry.motionCapture;
+      this.options.onActivityChange?.();
+    }
   }
 
   /**
@@ -1215,6 +1788,13 @@ export class BrowserController {
    */
   async setViewport(workspaceId: string, sessionId: string, width: number, height: number, mobile: boolean, operationId?: string) {
     const entry = await this.requireSession(workspaceId, sessionId);
+    const operationKey = operationId === undefined ? undefined : `${workspaceId}:${sessionId}:${operationId}`;
+    const fingerprint = interactionFingerprint(['browser.viewport', width, height, mobile]);
+    const previous = this.previousInteraction<BrowserViewportResult>(operationKey, fingerprint);
+    if (previous !== undefined) {
+      if (entry.currentViewport.width === width && entry.currentViewport.height === height && entry.currentViewport.mobile === mobile) return previous;
+      fail('IDEMPOTENCY_CONFLICT', 'El viewport cambió después de la operación original.');
+    }
     return this.withAgentOperation(entry, async () => {
       if (!Number.isInteger(width) || !Number.isInteger(height) || width < 320 || width > 3840 || height < 320 || height > 2160) {
         fail('INVALID_INPUT', 'Las dimensiones del viewport están fuera del rango permitido.');
@@ -1235,11 +1815,15 @@ export class BrowserController {
       entry.currentViewport = { width, height, mobile };
       this.invalidateSnapshot(entry);
       await waitForInteractionToSettle();
+      if (this.liveViewerSessionId === sessionId && this.liveViewerWorkArea !== undefined) {
+        await this.positionLiveViewer(entry, this.liveViewerWorkArea);
+      }
       // La evidencia queda en la auditoría, no en el flujo de eventos de la
       // página: `browser.events` describe consola y red del sitio, no acciones
       // del agente.
-      void operationId;
-      return { sessionId, width, height, mobile, state: entry.state };
+      const result = { sessionId, width, height, mobile, state: entry.state };
+      this.rememberInteractionOperation(operationKey, fingerprint, result);
+      return result;
     });
   }
 
@@ -1276,10 +1860,34 @@ export class BrowserController {
     });
   }
 
+  async assert(workspaceId: string, sessionId: string, condition: BrowserCondition) {
+    const entry = await this.requireSession(workspaceId, sessionId);
+    return this.withAgentOperation(entry, async () => {
+      if (!(await this.conditionSatisfied(entry, condition))) fail('ASSERTION_FAILED', 'La condición del navegador no se cumple.');
+      return { sessionId, satisfied: true as const, conditionKind: condition.kind };
+    });
+  }
+
+  async wait(workspaceId: string, sessionId: string, condition: BrowserCondition, timeoutMs: number) {
+    const entry = await this.requireSession(workspaceId, sessionId);
+    return this.withAgentOperation(entry, async () => {
+      const startedAt = Date.now();
+      const deadline = startedAt + timeoutMs;
+      do {
+        if (await this.conditionSatisfied(entry, condition)) {
+          return { sessionId, satisfied: true as const, conditionKind: condition.kind, waitedMs: Date.now() - startedAt };
+        }
+        await new Promise((resolve) => setTimeout(resolve, Math.min(100, Math.max(1, deadline - Date.now()))));
+      } while (Date.now() < deadline);
+      fail('TIMEOUT', 'La condición del navegador no se cumplió dentro del límite.');
+    });
+  }
+
   async click(workspaceId: string, sessionId: string, snapshotId: string, elementRef: string, operationId?: string) {
     const operationKey = operationId === undefined ? undefined : `${workspaceId}:${sessionId}:${operationId}`;
+    const fingerprint = interactionFingerprint(['browser.click', snapshotId, elementRef]);
     const entry = await this.requireInteractionSession(workspaceId, sessionId);
-    const previous = operationKey === undefined ? undefined : this.interactionOperations.get(operationKey);
+    const previous = this.previousInteraction(operationKey, fingerprint);
     if (previous !== undefined) return previous;
     const epoch = this.beginAgentOperation(entry);
     try {
@@ -1287,39 +1895,57 @@ export class BrowserController {
     await entry.content.webContents.debugger.sendCommand('Page.bringToFront');
     const { nodeId } = await this.resolveElement(entry, snapshotId, elementRef);
     const chooserCount = entry.blockedFileChooserCount;
-    const resolved = await entry.content.webContents.debugger.sendCommand('DOM.resolveNode', { nodeId }) as {
-      object?: { objectId?: string };
-    };
+    const state = await this.inspectElement(entry, nodeId);
+    if (state.fileInput) fail('SENSITIVE_INPUT_BLOCKED', 'El selector de archivos requiere control humano exclusivo.');
+    if (!state.visible || !state.enabled || !state.receivesPointer) {
+      fail('ELEMENT_NOT_INTERACTABLE', 'El elemento no puede recibir un clic real.');
+    }
+    const resolved = await entry.content.webContents.debugger.sendCommand('DOM.resolveNode', { nodeId }) as { object?: { objectId?: string } };
     const objectId = resolved.object?.objectId;
-    if (objectId === undefined) fail('STALE_SNAPSHOT', 'El elemento ya no es interactuable.');
+    if (objectId === undefined) fail('STALE_SNAPSHOT', 'El elemento ya no existe.');
+    const releaseObject = async (): Promise<void> => {
+      await entry.content.webContents.debugger.sendCommand('Runtime.releaseObject', { objectId }).catch(() => undefined);
+    };
     try {
-      const classification = await entry.content.webContents.debugger.sendCommand('Runtime.callFunctionOn', {
+      // Electron no entrega mouseDown/mouseUp de sendInputEvent a un
+      // WebContentsView en Windows de forma fiable. Se emite una secuencia fija
+      // de puntero y se activa el elemento con gesto de usuario; no se acepta JS,
+      // selectores ni coordenadas desde MCP.
+      const activation = entry.content.webContents.debugger.sendCommand('Runtime.callFunctionOn', {
         objectId,
         functionDeclaration: `function () {
-          const element = this;
-          if (!(element instanceof Element)) return false;
-          if (element.matches('input[type="file"]')) return true;
-          if (element.matches('label')) {
-            const control = element.control;
-            if (control instanceof HTMLInputElement && control.type === 'file') return true;
-            return element.querySelector('input[type="file"]') !== null;
-          }
-          return false;
+          const options = { bubbles: true, cancelable: true, composed: true, view: window };
+          this.dispatchEvent(new PointerEvent('pointerover', options));
+          this.dispatchEvent(new MouseEvent('mouseover', options));
+          this.dispatchEvent(new PointerEvent('pointerenter', { ...options, bubbles: false }));
+          this.dispatchEvent(new MouseEvent('mouseenter', { ...options, bubbles: false }));
+          this.dispatchEvent(new PointerEvent('pointerdown', options));
+          this.dispatchEvent(new MouseEvent('mousedown', options));
+          this.dispatchEvent(new PointerEvent('pointerup', options));
+          this.dispatchEvent(new MouseEvent('mouseup', options));
+          this.click();
         }`,
-        returnByValue: true,
-      }) as { result?: { value?: boolean } };
-      if (classification.result?.value === true) {
-        fail('SENSITIVE_INPUT_BLOCKED', 'El selector de archivos requiere control humano exclusivo.');
-      }
-      // Función interna fija: el modelo nunca aporta JavaScript ni selectores.
-      await entry.content.webContents.debugger.sendCommand('Runtime.callFunctionOn', {
-        objectId,
-        functionDeclaration: 'function () { this.click(); }',
-        awaitPromise: true,
         userGesture: true,
       });
+      const outcome = await Promise.race([
+        activation.then(() => 'completed' as const),
+        (async () => {
+          const deadline = Date.now() + 500;
+          while (Date.now() < deadline) {
+            if (entry.dialogOpen) return 'dialog' as const;
+            await new Promise((resolve) => setTimeout(resolve, 10));
+          }
+          return 'pending' as const;
+        })(),
+      ]);
+      if (outcome === 'dialog') {
+        void activation.finally(releaseObject).catch(() => undefined);
+      } else {
+        await activation;
+        await releaseObject();
+      }
     } finally {
-      await entry.content.webContents.debugger.sendCommand('Runtime.releaseObject', { objectId }).catch(() => undefined);
+      if (!entry.dialogOpen) await releaseObject();
     }
     await waitForInteractionToSettle();
     if (entry.blockedFileChooserCount !== chooserCount) {
@@ -1328,7 +1954,7 @@ export class BrowserController {
     this.invalidateSnapshot(entry);
     const result = { sessionId, applied: true as const, snapshotInvalidated: true as const };
     this.assertAgentOperation(entry, epoch);
-    this.rememberInteractionOperation(operationKey, result);
+    this.rememberInteractionOperation(operationKey, fingerprint, result);
     return result;
     } finally {
       this.endAgentOperation(entry);
@@ -1337,8 +1963,9 @@ export class BrowserController {
 
   async fill(workspaceId: string, sessionId: string, snapshotId: string, elementRef: string, text: string, operationId?: string) {
     const operationKey = operationId === undefined ? undefined : `${workspaceId}:${sessionId}:${operationId}`;
+    const fingerprint = interactionFingerprint(['browser.fill', snapshotId, elementRef, text]);
     const entry = await this.requireInteractionSession(workspaceId, sessionId);
-    const previous = operationKey === undefined ? undefined : this.interactionOperations.get(operationKey);
+    const previous = this.previousInteraction(operationKey, fingerprint);
     if (previous !== undefined) return previous;
     const epoch = this.beginAgentOperation(entry);
     try {
@@ -1381,7 +2008,7 @@ export class BrowserController {
     this.invalidateSnapshot(entry);
     const result = { sessionId, applied: true as const, snapshotInvalidated: true as const };
     this.assertAgentOperation(entry, epoch);
-    this.rememberInteractionOperation(operationKey, result);
+    this.rememberInteractionOperation(operationKey, fingerprint, result);
     return result;
     } finally {
       this.endAgentOperation(entry);
@@ -1390,8 +2017,9 @@ export class BrowserController {
 
   async press(workspaceId: string, sessionId: string, snapshotId: string, elementRef: string, key: string, operationId?: string) {
     const operationKey = operationId === undefined ? undefined : `${workspaceId}:${sessionId}:${operationId}`;
+    const fingerprint = interactionFingerprint(['browser.press', snapshotId, elementRef, key]);
     const entry = await this.requireInteractionSession(workspaceId, sessionId);
-    const previous = operationKey === undefined ? undefined : this.interactionOperations.get(operationKey);
+    const previous = this.previousInteraction(operationKey, fingerprint);
     if (previous !== undefined) return previous;
     const epoch = this.beginAgentOperation(entry);
     try {
@@ -1404,8 +2032,195 @@ export class BrowserController {
     this.invalidateSnapshot(entry);
     const result = { sessionId, applied: true as const, snapshotInvalidated: true as const };
     this.assertAgentOperation(entry, epoch);
-    this.rememberInteractionOperation(operationKey, result);
+    this.rememberInteractionOperation(operationKey, fingerprint, result);
     return result;
+    } finally {
+      this.endAgentOperation(entry);
+    }
+  }
+
+  async hover(workspaceId: string, sessionId: string, snapshotId: string, elementRef: string, operationId?: string) {
+    const operationKey = operationId === undefined ? undefined : `${workspaceId}:${sessionId}:${operationId}`;
+    const fingerprint = interactionFingerprint(['browser.hover', snapshotId, elementRef]);
+    const entry = await this.requireInteractionSession(workspaceId, sessionId);
+    const previous = this.previousInteraction(operationKey, fingerprint);
+    if (previous !== undefined) return previous;
+    const epoch = this.beginAgentOperation(entry);
+    try {
+      entry.content.webContents.focus();
+      await entry.content.webContents.debugger.sendCommand('Page.bringToFront');
+      const { nodeId } = await this.resolveElement(entry, snapshotId, elementRef);
+      const state = await this.inspectElement(entry, nodeId);
+      if (!state.visible || !state.receivesPointer) fail('ELEMENT_NOT_INTERACTABLE', 'El elemento no puede recibir hover.');
+      const resolved = await entry.content.webContents.debugger.sendCommand('DOM.resolveNode', { nodeId }) as { object?: { objectId?: string } };
+      const objectId = resolved.object?.objectId;
+      if (objectId === undefined) fail('STALE_SNAPSHOT', 'El elemento ya no existe.');
+      try {
+        await entry.content.webContents.debugger.sendCommand('Runtime.callFunctionOn', {
+          objectId,
+          functionDeclaration: `function () {
+            const options = { bubbles: true, cancelable: true, composed: true, view: window };
+            this.dispatchEvent(new PointerEvent('pointerover', options));
+            this.dispatchEvent(new MouseEvent('mouseover', options));
+            this.dispatchEvent(new PointerEvent('pointerenter', { ...options, bubbles: false }));
+            this.dispatchEvent(new MouseEvent('mouseenter', { ...options, bubbles: false }));
+          }`,
+          userGesture: true,
+        });
+      } finally {
+        await entry.content.webContents.debugger.sendCommand('Runtime.releaseObject', { objectId }).catch(() => undefined);
+      }
+      await waitForInteractionToSettle();
+      this.invalidateSnapshot(entry);
+      const result = { sessionId, applied: true as const, snapshotInvalidated: true as const };
+      this.assertAgentOperation(entry, epoch);
+      this.rememberInteractionOperation(operationKey, fingerprint, result);
+      return result;
+    } finally {
+      this.endAgentOperation(entry);
+    }
+  }
+
+  async scroll(workspaceId: string, sessionId: string, direction: 'up' | 'down' | 'left' | 'right', amount: number, operationId?: string) {
+    const operationKey = operationId === undefined ? undefined : `${workspaceId}:${sessionId}:${operationId}`;
+    const fingerprint = interactionFingerprint(['browser.scroll', direction, amount]);
+    const entry = await this.requireInteractionSession(workspaceId, sessionId);
+    const previous = this.previousInteraction(operationKey, fingerprint);
+    if (previous !== undefined) return previous;
+    const epoch = this.beginAgentOperation(entry);
+    try {
+      const horizontal = direction === 'left' || direction === 'right';
+      const deltaX = horizontal ? (direction === 'left' ? -amount : amount) : 0;
+      const deltaY = horizontal ? 0 : (direction === 'up' ? -amount : amount);
+      await entry.content.webContents.debugger.sendCommand('Runtime.evaluate', {
+        expression: `globalThis.scrollBy({ left: ${deltaX}, top: ${deltaY}, behavior: 'instant' })`,
+        userGesture: true,
+      });
+      await waitForInteractionToSettle();
+      this.invalidateSnapshot(entry);
+      const result = { sessionId, applied: true as const, snapshotInvalidated: true as const };
+      this.assertAgentOperation(entry, epoch);
+      this.rememberInteractionOperation(operationKey, fingerprint, result);
+      return result;
+    } finally {
+      this.endAgentOperation(entry);
+    }
+  }
+
+  async select(workspaceId: string, sessionId: string, snapshotId: string, elementRef: string, value: string, operationId?: string) {
+    const operationKey = operationId === undefined ? undefined : `${workspaceId}:${sessionId}:${operationId}`;
+    const fingerprint = interactionFingerprint(['browser.select', snapshotId, elementRef, value]);
+    const entry = await this.requireInteractionSession(workspaceId, sessionId);
+    const previous = this.previousInteraction(operationKey, fingerprint);
+    if (previous !== undefined) return previous;
+    const epoch = this.beginAgentOperation(entry);
+    try {
+      const { nodeId } = await this.resolveElement(entry, snapshotId, elementRef);
+      const state = await this.inspectElement(entry, nodeId);
+      if (!state.select || !state.visible || !state.enabled) fail('ELEMENT_NOT_INTERACTABLE', 'El elemento no es un select habilitado y visible.');
+      const resolved = await entry.content.webContents.debugger.sendCommand('DOM.resolveNode', { nodeId }) as { object?: { objectId?: string } };
+      const objectId = resolved.object?.objectId;
+      if (objectId === undefined) fail('STALE_SNAPSHOT', 'El select ya no existe.');
+      try {
+        const selected = await entry.content.webContents.debugger.sendCommand('Runtime.callFunctionOn', {
+          objectId,
+          functionDeclaration: `function (nextValue) {
+            if (!(this instanceof HTMLSelectElement) || !Array.from(this.options).some((option) => option.value === nextValue)) return false;
+            this.value = nextValue;
+            this.dispatchEvent(new Event('input', { bubbles: true }));
+            this.dispatchEvent(new Event('change', { bubbles: true }));
+            return true;
+          }`,
+          arguments: [{ value }],
+          returnByValue: true,
+          userGesture: true,
+        }) as { result?: { value?: boolean } };
+        if (selected.result?.value !== true) fail('INVALID_INPUT', 'El valor no existe en el select.');
+      } finally {
+        await entry.content.webContents.debugger.sendCommand('Runtime.releaseObject', { objectId }).catch(() => undefined);
+      }
+      await waitForInteractionToSettle();
+      this.invalidateSnapshot(entry);
+      const result = { sessionId, applied: true as const, snapshotInvalidated: true as const };
+      this.assertAgentOperation(entry, epoch);
+      this.rememberInteractionOperation(operationKey, fingerprint, result);
+      return result;
+    } finally {
+      this.endAgentOperation(entry);
+    }
+  }
+
+  async drag(workspaceId: string, sessionId: string, snapshotId: string, elementRef: string, targetElementRef: string, operationId?: string) {
+    const operationKey = operationId === undefined ? undefined : `${workspaceId}:${sessionId}:${operationId}`;
+    const fingerprint = interactionFingerprint(['browser.drag', snapshotId, elementRef, targetElementRef]);
+    const entry = await this.requireInteractionSession(workspaceId, sessionId);
+    const previous = this.previousInteraction(operationKey, fingerprint);
+    if (previous !== undefined) return previous;
+    const epoch = this.beginAgentOperation(entry);
+    try {
+      const resolvedElements = await this.resolveElements(entry, snapshotId, [elementRef, targetElementRef]);
+      const source = resolvedElements[0];
+      const target = resolvedElements[1];
+      if (source === undefined || target === undefined) fail('STALE_SNAPSHOT', 'El origen o destino ya no existe.');
+      const [sourceState, targetState] = await Promise.all([this.inspectElement(entry, source.nodeId), this.inspectElement(entry, target.nodeId)]);
+      if (!sourceState.visible || !sourceState.receivesPointer || !targetState.visible || !targetState.receivesPointer) {
+        fail('ELEMENT_NOT_INTERACTABLE', 'El origen o destino del arrastre no recibe eventos de puntero.');
+      }
+      const [resolvedSource, resolvedTarget] = await Promise.all([
+        entry.content.webContents.debugger.sendCommand('DOM.resolveNode', { nodeId: source.nodeId }) as Promise<{ object?: { objectId?: string } }>,
+        entry.content.webContents.debugger.sendCommand('DOM.resolveNode', { nodeId: target.nodeId }) as Promise<{ object?: { objectId?: string } }>,
+      ]);
+      const sourceObjectId = resolvedSource.object?.objectId;
+      const targetObjectId = resolvedTarget.object?.objectId;
+      if (sourceObjectId === undefined || targetObjectId === undefined) fail('STALE_SNAPSHOT', 'El origen o destino ya no existe.');
+      try {
+        await entry.content.webContents.debugger.sendCommand('Runtime.callFunctionOn', {
+          objectId: sourceObjectId,
+          functionDeclaration: `function (target) {
+            const options = { bubbles: true, cancelable: true, composed: true, view: window };
+            this.dispatchEvent(new PointerEvent('pointerdown', options));
+            this.dispatchEvent(new MouseEvent('mousedown', options));
+            target.dispatchEvent(new PointerEvent('pointermove', options));
+            target.dispatchEvent(new MouseEvent('mousemove', options));
+            target.dispatchEvent(new PointerEvent('pointerup', options));
+            target.dispatchEvent(new MouseEvent('mouseup', options));
+          }`,
+          arguments: [{ objectId: targetObjectId }],
+          userGesture: true,
+        });
+      } finally {
+        await Promise.all([
+          entry.content.webContents.debugger.sendCommand('Runtime.releaseObject', { objectId: sourceObjectId }).catch(() => undefined),
+          entry.content.webContents.debugger.sendCommand('Runtime.releaseObject', { objectId: targetObjectId }).catch(() => undefined),
+        ]);
+      }
+      await waitForInteractionToSettle();
+      this.invalidateSnapshot(entry);
+      const result = { sessionId, applied: true as const, snapshotInvalidated: true as const };
+      this.assertAgentOperation(entry, epoch);
+      this.rememberInteractionOperation(operationKey, fingerprint, result);
+      return result;
+    } finally {
+      this.endAgentOperation(entry);
+    }
+  }
+
+  async dialog(workspaceId: string, sessionId: string, action: 'accept' | 'dismiss', operationId?: string) {
+    const operationKey = operationId === undefined ? undefined : `${workspaceId}:${sessionId}:${operationId}`;
+    const fingerprint = interactionFingerprint(['browser.dialog', action]);
+    const entry = await this.requireInteractionSession(workspaceId, sessionId);
+    const previous = this.previousInteraction(operationKey, fingerprint);
+    if (previous !== undefined) return previous;
+    const epoch = this.beginAgentOperation(entry);
+    try {
+      if (!entry.dialogOpen) fail('ELEMENT_NOT_INTERACTABLE', 'No hay un diálogo JavaScript abierto.');
+      await entry.content.webContents.debugger.sendCommand('Page.handleJavaScriptDialog', { accept: action === 'accept' });
+      entry.dialogOpen = false;
+      this.invalidateSnapshot(entry);
+      const result = { sessionId, applied: true as const, snapshotInvalidated: true as const };
+      this.assertAgentOperation(entry, epoch);
+      this.rememberInteractionOperation(operationKey, fingerprint, result);
+      return result;
     } finally {
       this.endAgentOperation(entry);
     }
@@ -1447,9 +2262,9 @@ export class BrowserController {
     if (currentOrigin !== entry.profile.origin) {
       fail('ORIGIN_BLOCKED', 'El control humano solo puede abrirse en el origen principal aprobado.');
     }
+    await this.options.reserveHumanControl?.(sessionId);
     entry.restoreLiveViewerAfterHuman = this.liveViewerSessionId === sessionId;
-    if (entry.restoreLiveViewerAfterHuman) entry.previousViewerWorkArea = entry.window.getBounds();
-    this.hideLiveViewerEntry(entry);
+    if (entry.restoreLiveViewerAfterHuman) entry.previousViewerWorkArea = this.liveViewerWorkArea ?? entry.window.getBounds();
     entry.humanRequestId = `humanreq_${randomBytes(12).toString('hex')}`;
     entry.humanReason = reason;
     delete entry.humanResultState;
@@ -1463,7 +2278,14 @@ export class BrowserController {
     entry.controlTimer = setTimeout(() => { void this.stopEntry(entry, 'expired'); }, Math.max(1, entry.controlExpiresAt - Date.now()));
     entry.controlTimer.unref();
     this.humanControlOperations.set(operationKey, entry.humanRequestId);
-    await this.waitForAgentOperations(entry);
+    try {
+      await this.options.beforeHumanControlRequest?.();
+      this.hideLiveViewerEntry(entry);
+      await this.waitForAgentOperations(entry);
+    } catch {
+      await this.stopEntry(entry);
+      fail('TIMEOUT', 'No se pudo preparar la intervención humana de forma segura.');
+    }
     if (entry.state !== 'running' || entry.controlState !== 'waiting_for_human' || entry.controlExpiresAt === undefined || Date.now() >= entry.controlExpiresAt) {
       if (entry.state === 'running') await this.stopEntry(entry, 'expired');
       fail('HUMAN_CONTROL_EXPIRED', 'La solicitud de control humano ya no está disponible.');
@@ -1520,6 +2342,8 @@ export class BrowserController {
       throw error;
     }
     // El usuario debe ver la ventana real, no un viewport emulado por el agente.
+    // Conservamos la selección lógica para reponerla cuando devuelva el control.
+    entry.agentViewportBeforeHuman = { ...entry.currentViewport };
     await this.clearViewportEmulation(entry);
     if (entry.state !== 'running' || entry.window.isDestroyed() || entry.content.webContents.isDestroyed() ||
         entry.controlState !== 'waiting_for_human' || entry.humanRequestId === undefined) {
@@ -1566,7 +2390,7 @@ export class BrowserController {
     entry.window.setIgnoreMouseEvents(false);
     entry.window.setFocusable(true);
     entry.window.setOpacity(1);
-    if (workArea !== undefined) this.positionLiveViewer(entry, workArea);
+    if (workArea !== undefined) entry.window.setBounds(workArea, false);
     else entry.window.center();
     entry.window.show();
     entry.window.focus();
@@ -1579,7 +2403,16 @@ export class BrowserController {
     if (entry === undefined || entry.state !== 'running' || entry.controlState !== 'human_control') return;
     entry.controlState = 'returning_to_agent';
     const handoffEpoch = entry.controlEpoch;
-    const confirmed = await (this.options.confirmHumanControlHandoff?.(entry.workspaceName) ?? Promise.resolve(true));
+    entry.window.setIgnoreMouseEvents(true);
+    entry.window.setFocusable(false);
+    let confirmed: boolean;
+    try {
+      confirmed = await (this.options.confirmHumanControlHandoff?.(entry.workspaceName) ?? Promise.resolve(true));
+    } catch {
+      await this.stopEntry(entry);
+      this.options.onActivityChange?.();
+      throw new DevelopmentBrokerError('INTERNAL_ERROR', 'No se pudo confirmar la devolución local.');
+    }
     if (!this.isCurrentHandoff(entry, handoffEpoch)) {
       if (entry.state === 'running') await this.stopEntry(entry, 'expired');
       return;
@@ -1635,6 +2468,10 @@ export class BrowserController {
     try {
       await this.restoreAgentShell(entry);
       entry.window.showInactive();
+      if (entry.agentViewportBeforeHuman !== undefined) {
+        entry.currentViewport = entry.agentViewportBeforeHuman;
+        delete entry.agentViewportBeforeHuman;
+      }
       await this.installDebugger(entry, entry.content.webContents);
     } catch {
       await this.stopEntry(entry);
@@ -1647,6 +2484,7 @@ export class BrowserController {
     }
     entry.controlState = 'agent_control';
     this.humanSessionId = undefined;
+    this.options.releaseHumanControl?.(sessionId);
     entry.postHumanExpiresAt ??= Date.now() + POST_HUMAN_SESSION_TTL_MS;
     delete entry.controlExpiresAt;
     entry.controlTimer = setTimeout(() => { void this.stopEntry(entry, 'expired'); }, Math.max(1, entry.postHumanExpiresAt - Date.now()));
@@ -1657,7 +2495,8 @@ export class BrowserController {
       const previousArea = entry.previousViewerWorkArea;
       delete entry.restoreLiveViewerAfterHuman;
       delete entry.previousViewerWorkArea;
-      await this.showLiveViewerLocally(sessionId, previousArea).catch(() => undefined);
+      await (this.options.restoreLiveViewerAfterHuman?.(sessionId, previousArea) ??
+        this.showLiveViewerLocally(sessionId, previousArea)).catch(() => undefined);
     }
     this.options.onActivityChange?.();
   }
@@ -1680,6 +2519,7 @@ export class BrowserController {
     entry.controlState = controlState;
     entry.controlEpoch += 1;
     if (this.humanSessionId === entry.sessionId) this.humanSessionId = undefined;
+    this.options.releaseHumanControl?.(entry.sessionId);
     if (entry.controlTimer !== undefined) clearTimeout(entry.controlTimer);
     entry.stopPromise = Promise.resolve().then(() => this.finishStoppingEntry(entry, controlState));
     await entry.stopPromise;
@@ -1694,7 +2534,8 @@ export class BrowserController {
       projectWebContents.debugger.detach();
     }
     if (!entry.window.isDestroyed()) {
-      try { entry.window.contentView.removeChildView(entry.content); } catch { /* ya desvinculada */ }
+      try { entry.frame.removeChildView(entry.content); } catch { /* ya desvinculada */ }
+      try { entry.window.contentView.removeChildView(entry.frame); } catch { /* ya desvinculada */ }
     }
     if (projectWebContents !== undefined && !projectWebContents.isDestroyed()) projectWebContents.close({ waitForBeforeUnload: false });
     if (!entry.window.isDestroyed()) entry.window.destroy();

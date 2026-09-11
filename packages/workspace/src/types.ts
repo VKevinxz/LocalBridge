@@ -115,7 +115,21 @@ export interface WorkspaceLimits {
   readonly maxFileBytes: number;
   readonly maxTreeEntries: number;
   readonly maxTreeDepth: number;
+  readonly largeArtifacts: LargeArtifactPolicy;
 }
+
+interface LargeArtifactPolicyCommon {
+  readonly reserve: {
+    readonly minimumFreeBytes: number;
+    readonly minimumFreePercent: number;
+  };
+  readonly maxConcurrentJobs: 1 | 2;
+}
+
+export type LargeArtifactPolicy =
+  | (LargeArtifactPolicyCommon & { readonly mode: "standard" })
+  | (LargeArtifactPolicyCommon & { readonly mode: "custom"; readonly customSourceBytes: number })
+  | (LargeArtifactPolicyCommon & { readonly mode: "adaptive" });
 
 export interface AuthorizedWorkspace {
   readonly id: string;
@@ -141,7 +155,7 @@ export interface AuthorizedWorkspace {
 }
 
 export interface WorkspaceRegistry {
-  readonly schemaVersion: 4;
+  readonly schemaVersion: 5;
   readonly workspaces: readonly AuthorizedWorkspace[];
   readonly applications: readonly LocalApplication[];
 }

@@ -4,7 +4,8 @@
  * límite de seguridad — perderlo no expone ni oculta ningún proyecto, solo
  * obliga a volver a escribir unas rutas — así que no necesita el mismo
  * tratamiento "fallar ruidoso ante corrupción" que `registry-store.ts`. Un
- * fichero ausente o roto simplemente vuelve a los valores por defecto.
+ * fichero ausente representa una instalación nueva; uno existente, roto o sin
+ * un campo de seguridad conserva el fallback compatible y restrictivo.
  */
 
 import { mkdir, readFile } from "node:fs/promises";
@@ -15,12 +16,15 @@ import { z } from "zod";
 
 import { atomicWrite } from "@localbridge/filesystem";
 import { GIT_APPROVAL_MODES, isEnoent, type GitApprovalMode } from "@localbridge/shared";
+import { defaultLargeArtifactPolicy, largeArtifactPolicySchema, type LargeArtifactPolicy } from "@localbridge/workspace";
 import { tunnelIdSchema } from "./tunnel-provisioner.js";
 
 export interface DesktopSettings {
   readonly onboardingStep: number;
   readonly onboardingCompleted: boolean;
   readonly minimizeToTray: boolean;
+  /** Preferencia que se copia a proyectos nuevos; no modifica proyectos ya autorizados. */
+  readonly largeArtifactPreference: LargeArtifactPolicy;
   /** Modo de aprobación para commit/push; se aplica al reconectar el túnel. */
   readonly gitApprovalMode: GitApprovalMode;
   readonly activeConnectionProfileId: string;
@@ -64,6 +68,7 @@ const desktopSettingsBaseSchema = z
     onboardingStep: z.number().int().min(0).max(4),
     onboardingCompleted: z.boolean(),
     minimizeToTray: z.boolean(),
+    largeArtifactPreference: largeArtifactPolicySchema,
     gitApprovalMode: z.enum(GIT_APPROVAL_MODES),
     activeConnectionProfileId: connectionProfileIdSchema,
     connectionProfiles: z.array(connectionProfileSchema).min(1).max(20),
@@ -90,7 +95,10 @@ export const DEFAULT_DESKTOP_SETTINGS: DesktopSettings = {
   onboardingStep: 0,
   onboardingCompleted: false,
   minimizeToTray: true,
-  gitApprovalMode: "mrtr",
+  largeArtifactPreference: defaultLargeArtifactPolicy(),
+  // La aplicación conecta ChatGPT por defecto. Instalaciones históricas sin
+  // este campo conservan MRTR explícitamente en readDesktopSettings.
+  gitApprovalMode: "host",
   activeConnectionProfileId: DEFAULT_CONNECTION_PROFILE.id,
   connectionProfiles: [DEFAULT_CONNECTION_PROFILE],
   tunnelId: "",
@@ -98,6 +106,11 @@ export const DEFAULT_DESKTOP_SETTINGS: DesktopSettings = {
   tunnelProfile: "local-stdio",
   tunnelProfileDir: "",
   serverCwd: "",
+};
+
+const SAFE_EXISTING_SETTINGS_FALLBACK: DesktopSettings = {
+  ...DEFAULT_DESKTOP_SETTINGS,
+  gitApprovalMode: "mrtr",
 };
 
 export function defaultDesktopSettingsPath(): string {
@@ -110,19 +123,24 @@ export async function readDesktopSettings(settingsPath: string): Promise<Desktop
     raw = await readFile(settingsPath, "utf8");
   } catch (error) {
     if (isEnoent(error)) return DEFAULT_DESKTOP_SETTINGS;
-    return DEFAULT_DESKTOP_SETTINGS;
+    return SAFE_EXISTING_SETTINGS_FALLBACK;
   }
 
   try {
     const partial = partialDesktopSettingsSchema.parse(JSON.parse(raw));
-    const merged = { ...DEFAULT_DESKTOP_SETTINGS, ...partial };
+    const merged = {
+      ...DEFAULT_DESKTOP_SETTINGS,
+      // No migrar silenciosamente instalaciones existentes al modo delegado.
+      gitApprovalMode: partial.gitApprovalMode ?? "mrtr",
+      ...partial,
+    };
     const legacyTunnelId = merged.tunnelId ?? "";
     if (partial.connectionProfiles === undefined && legacyTunnelId !== "") {
       merged.connectionProfiles = [{ ...DEFAULT_CONNECTION_PROFILE, tunnelId: legacyTunnelId }];
     }
     return desktopSettingsSchema.parse(merged);
   } catch {
-    return DEFAULT_DESKTOP_SETTINGS;
+    return SAFE_EXISTING_SETTINGS_FALLBACK;
   }
 }
 

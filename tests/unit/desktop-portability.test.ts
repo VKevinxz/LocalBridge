@@ -22,7 +22,7 @@ function workspace(): AuthorizedWorkspace {
     id: 'ws_local', name: 'Proyecto', rootPath: 'D:\\Privado\\Proyecto', enabled: true,
     createdAt: '2026-08-21T00:00:00.000Z',
     permissions: { read: true, write: false, overwrite: false, gitRead: false, validations: false, gitWrite: false },
-    limits: { maxFileBytes: 1024, maxTreeEntries: 30, maxTreeDepth: 2 },
+    limits: { maxFileBytes: 1024, maxTreeEntries: 30, maxTreeDepth: 2, largeArtifacts: { mode: 'standard', reserve: { minimumFreeBytes: 1024 * 1024 * 1024, minimumFreePercent: 10 }, maxConcurrentJobs: 1 } },
     denyPatterns: ['.env'], validationProfiles: {},
   };
 }
@@ -55,7 +55,7 @@ function application(): LocalApplication {
 }
 
 function registry(workspaces: AuthorizedWorkspace[], applications: LocalApplication[] = []): WorkspaceRegistry {
-  return { schemaVersion: 4, workspaces, applications };
+  return { schemaVersion: 5, workspaces, applications };
 }
 
 function project(): DevelopmentProject {

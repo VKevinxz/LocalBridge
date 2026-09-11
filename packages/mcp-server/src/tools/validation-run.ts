@@ -12,7 +12,7 @@ import { toolError, toolSuccess } from '../tool-result.js';
 const inputSchema = z.object({
   workspaceId: z.string().min(1),
   profile: z.string().min(1),
-});
+}).strict();
 
 const outputSchema = z.object({
   profile: z.string(),

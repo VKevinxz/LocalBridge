@@ -95,7 +95,16 @@ describe('loadWorkspaceRegistry — ADR-0012, fallo cerrado', () => {
     const { logger } = captureLogger();
     const [workspace] = await loadWorkspaceRegistry(configPath, logger);
 
-    expect(workspace?.limits).toEqual({ maxFileBytes: 1_048_576, maxTreeEntries: 300, maxTreeDepth: 3 });
+    expect(workspace?.limits).toEqual({
+      maxFileBytes: 1_048_576,
+      maxTreeEntries: 300,
+      maxTreeDepth: 3,
+      largeArtifacts: {
+        mode: 'standard',
+        reserve: { minimumFreeBytes: 1024 * 1024 * 1024, minimumFreePercent: 10 },
+        maxConcurrentJobs: 1,
+      },
+    });
     expect(workspace?.denyPatterns).toEqual(DEFAULT_DENY_PATTERNS);
     // Deny-by-default (ADR-0004): sin perfiles configurados, ninguno se puede
     // ejecutar — nunca "ejecuta lo que parezca razonable".
@@ -228,7 +237,7 @@ describe('registro global v4 — ADR-0032/0036', () => {
   it('migra una aplicación anidada a una entidad global revisada', () => {
     const owner = buildWorkspace({ id: 'ws_front', rootPath: 'C:\\front', processProfiles: { dev: processProfile } });
     const registry = parseWorkspaceRegistry({ workspaces: [{ ...owner, browserApplications: { CIP: legacyApplication(owner.id) } }] });
-    expect(registry.schemaVersion).toBe(4);
+    expect(registry.schemaVersion).toBe(5);
     expect(registry.workspaces[0]).not.toHaveProperty('browserApplications');
     expect(registry.applications[0]).toMatchObject({ name: 'CIP', reviewState: 'reviewed' });
     expect(registry.applications[0]?.services[0]).toMatchObject({ alias: 'frontend', workspaceId: owner.id });
@@ -255,5 +264,48 @@ describe('registro global v4 — ADR-0032/0036', () => {
     expect(registry.applications).toHaveLength(1);
     expect(registry.applications[0]).toMatchObject({ reviewState: 'conflict' });
     expect(registry.applications[0]?.conflictCandidates).toHaveLength(2);
+  });
+});
+
+describe('registro de artefactos grandes v5 — ADR-0057', () => {
+  it('migra v4 a standard sin ampliar permisos ni el límite de lectura ordinaria', () => {
+    const workspace = buildWorkspace({ rootPath: 'C:\\project' });
+    const { largeArtifacts: _policy, ...legacyLimits } = workspace.limits;
+    const migrated = parseWorkspaceRegistry({
+      schemaVersion: 4,
+      workspaces: [{ ...workspace, limits: legacyLimits }],
+      applications: [],
+    });
+    expect(migrated.schemaVersion).toBe(5);
+    expect(migrated.workspaces[0]?.limits.maxFileBytes).toBe(1_048_576);
+    expect(migrated.workspaces[0]?.limits.largeArtifacts.mode).toBe('standard');
+    expect(migrated.workspaces[0]?.permissions).toMatchObject(workspace.permissions);
+    expect(migrated.workspaces[0]?.permissions.browserRead).toBe(false);
+    expect(migrated.workspaces[0]?.permissions.processes).toBe(false);
+  });
+
+  it('acepta adaptive explícito y custom exige tamaño', () => {
+    const workspace = buildWorkspace({
+      rootPath: 'C:\\project',
+      limits: {
+        maxFileBytes: 1_048_576,
+        maxTreeEntries: 300,
+        maxTreeDepth: 3,
+        largeArtifacts: {
+          mode: 'adaptive',
+          reserve: { minimumFreeBytes: 2 * 1024 * 1024 * 1024, minimumFreePercent: 15 },
+          maxConcurrentJobs: 2,
+        },
+      },
+    });
+    const parsed = parseWorkspaceRegistry({ schemaVersion: 5, workspaces: [workspace], applications: [] });
+    expect(parsed.workspaces[0]?.limits.largeArtifacts.mode).toBe('adaptive');
+    expect(() => parseWorkspaceRegistry({
+      schemaVersion: 5,
+      workspaces: [{ ...workspace, limits: { ...workspace.limits, largeArtifacts: {
+        mode: 'custom', reserve: workspace.limits.largeArtifacts.reserve, maxConcurrentJobs: 1,
+      } } }],
+      applications: [],
+    })).toThrow();
   });
 });

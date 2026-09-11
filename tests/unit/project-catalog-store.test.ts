@@ -14,6 +14,7 @@ import {
   migrateDevelopmentProjectsToCatalog,
   removeProjectCatalogRecord,
   removeProjectScanRecord,
+  removeProjectTrustRecord,
   revokeProjectTrust,
   upsertProjectScanRecord,
   setProjectTrust,
@@ -56,7 +57,7 @@ describe("project catalog v1", () => {
   it("COMPAT1-004: migra referencias heredadas de forma determinista y sin autoridad", async () => {
     const workspace = buildWorkspace({ id: "ws_existing", rootPath: "D:\\Existing" });
     const legacy = buildNewDevelopmentProject({ name: "Existente", workspaceIds: [workspace.id], setupStatus: "ready" });
-    const registry = { schemaVersion: 4 as const, workspaces: [workspace], applications: [] };
+    const registry = { schemaVersion: 5 as const, workspaces: [workspace], applications: [] };
 
     const first = migrateDevelopmentProjectsToCatalog([legacy], registry);
     const second = migrateDevelopmentProjectsToCatalog([legacy], registry);
@@ -79,6 +80,16 @@ describe("project catalog v1", () => {
     });
     expect(decision).toMatchObject({ mode: "full-host", status: "active", acceptedRiskVersion: "1.0.0" });
     expect(await revokeProjectTrust(files.trust, project.id)).toMatchObject({ status: "revoked" });
+  });
+
+  it("elimina por completo la decisión de confianza de una ficha", async () => {
+    const files = await fixture();
+    const project = buildEmptyProjectCatalogRecord({ displayName: "Temporal", selectedRoot: "D:\\Temporal" });
+    await setProjectTrust(files.trust, { projectId: project.id, mode: "full-host", deviceBinding: "b".repeat(64) });
+
+    expect(await removeProjectTrustRecord(files.trust, project.id)).toBe(true);
+    expect(await removeProjectTrustRecord(files.trust, project.id)).toBe(false);
+    expect(await loadProjectTrustStore(files.trust)).toEqual({ schemaVersion: 1, decisions: [] });
   });
 
   it("TRUST-004: la identidad local es estable y no se hereda por el catálogo", async () => {
@@ -105,7 +116,7 @@ describe("project catalog v1", () => {
       buildWorkspace({ id: "ws_dos", rootPath: "D:\\Proyectos\\Dos" }),
     ];
     const project = buildNewDevelopmentProject({ name: "Multi", workspaceIds: ["ws_uno", "ws_dos"] });
-    const [migrated] = migrateDevelopmentProjectsToCatalog([project], { schemaVersion: 4, workspaces, applications: [] });
+    const [migrated] = migrateDevelopmentProjectsToCatalog([project], { schemaVersion: 5, workspaces, applications: [] });
     expect(migrated?.state).toBe("review");
   });
 

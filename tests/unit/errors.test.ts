@@ -23,6 +23,7 @@ describe('modelo de errores', () => {
       'FILE_NOT_FOUND',
       'FILE_ALREADY_EXISTS',
       'FILE_TOO_LARGE',
+      'INSUFFICIENT_DISK_SPACE',
       'NOT_A_FILE',
       'HASH_MISMATCH',
       'GIT_NOT_REPOSITORY',
@@ -34,6 +35,7 @@ describe('modelo de errores', () => {
       'APPROVAL_DECLINED',
       'APPROVAL_INVALID',
       'GIT_PUSH_REJECTED',
+      'GIT_PUSH_UNCERTAIN',
       'FEATURE_UNAVAILABLE',
       'PROFILE_NOT_FOUND',
       'PROFILE_SOURCE_MISSING',
@@ -77,6 +79,8 @@ describe('modelo de errores', () => {
       'LISTENER_NOT_FOUND',
       'SESSION_NOT_FOUND',
       'STALE_SNAPSHOT',
+      'ELEMENT_NOT_INTERACTABLE',
+      'ASSERTION_FAILED',
       'ORIGIN_BLOCKED',
       'SENSITIVE_INPUT_BLOCKED',
       'HUMAN_CONTROL_NOT_ALLOWED',
@@ -85,6 +89,37 @@ describe('modelo de errores', () => {
       'HUMAN_CONTROL_EXPIRED',
       'HUMAN_CONTROL_DECLINED',
       'HUMAN_CONTROL_BUSY',
+      'WEB_SESSION_NOT_FOUND',
+      'WEB_TAB_NOT_FOUND',
+      'WEB_DESTINATION_BLOCKED',
+      'WEB_NAVIGATION_FAILED',
+      'WEB_CAPTURE_FAILED',
+      'WEB_CAPTURE_TOO_LARGE',
+      'WEB_EFFECT_UNCERTAIN',
+      'MOTION_CAPTURE_UNAVAILABLE',
+      'MOTION_CAPTURE_INTERRUPTED',
+      'MOTION_EFFECT_UNCERTAIN',
+      'MOTION_LIMIT_EXCEEDED',
+      'MOTION_BUNDLE_INVALID',
+      'MOTION_BUNDLES_INCOMPATIBLE',
+      'WEB_RESOURCE_NOT_FOUND',
+      'WEB_DOWNLOAD_BLOCKED',
+      'WEB_DOWNLOAD_QUOTA_EXCEEDED',
+      'WEB_MEDIA_TYPE_UNSUPPORTED',
+      'WEB_MEDIA_TYPE_MISMATCH',
+      'WEB_DOWNLOAD_EMPTY',
+      'HUMAN_ACTION_REQUIRED',
+      'DOCUMENT_UNSUPPORTED',
+      'DOCUMENT_NO_TEXT',
+      'DOCUMENT_RENDER_FAILED',
+      'DOCUMENT_RENDER_TOO_LARGE',
+      'IMAGE_UNSUPPORTED',
+      'IMAGE_TOO_LARGE',
+      'ANALYSIS_JOB_NOT_FOUND',
+      'ANALYSIS_QUEUE_FULL',
+      'ANALYSIS_CANCELLED',
+      'ANALYSIS_INTERRUPTED',
+      'ANALYSIS_FAILED',
       'INTERNAL_ERROR',
     ]);
   });
@@ -138,6 +173,20 @@ describe('modelo de errores', () => {
     });
 
     expect(JSON.stringify(toErrorPayload(error))).not.toContain('secreto');
+  });
+
+  it('propaga únicamente un causeCode perteneciente al catálogo estable', () => {
+    const safe = toErrorPayload(new LocalBridgeError('MOTION_EFFECT_UNCERTAIN', {
+      causeCode: 'FILE_TOO_LARGE',
+      absolutePath: 'D:\\privado\\frame.png',
+    }));
+    const unsafe = toErrorPayload(new LocalBridgeError('MOTION_EFFECT_UNCERTAIN', {
+      causeCode: 'D:\\privado\\frame.png',
+    }));
+
+    expect(safe.error.causeCode).toBe('FILE_TOO_LARGE');
+    expect(JSON.stringify(safe)).not.toContain('privado');
+    expect(unsafe.error).not.toHaveProperty('causeCode');
   });
 
   it('colapsa valores lanzados que no son Error', () => {

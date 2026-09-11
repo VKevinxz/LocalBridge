@@ -44,13 +44,15 @@ describe('[SEC-011] archivo mayor que el límite del workspace', () => {
     expect(parsed['content']).toBeUndefined();
   });
 
-  it('file.metadata también lo rechaza, sin intentar hashearlo', async () => {
+  it('file.metadata obtiene el hash por streaming sin convertir el asset en respuesta de contenido', async () => {
     await writeFile(path.join(workspace.root, 'big.bin'), Buffer.alloc(4096, 'x'));
     await setUpHarness({ maxFileBytes: 1024, maxTreeEntries: 300, maxTreeDepth: 3 });
 
     const { isError, parsed } = await callToolJson(harness!.client, 'file.metadata', { workspaceId, path: 'big.bin' });
-    expect(isError).toBe(true);
-    expect((parsed['error'] as { code: string }).code).toBe('FILE_TOO_LARGE');
+    expect(isError).toBe(false);
+    expect(parsed).toMatchObject({ exists: true, type: 'file', size: 4096 });
+    expect(parsed['sha256']).toMatch(/^[a-f0-9]{64}$/);
+    expect(parsed['content']).toBeUndefined();
   });
 });
 

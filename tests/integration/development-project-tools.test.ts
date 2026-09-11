@@ -21,6 +21,7 @@ const project = {
   description: "Frontend y API",
   workspaceIds: ["ws_project"],
   setupStatus: "review-required" as const,
+  execution: { trustMode: "guided" as const, terminalAvailable: false, blockedReason: "guided-mode" as const },
 };
 const status = {
   project,

@@ -1,4 +1,18 @@
 export {
+  AnalysisJobSupervisor,
+  type AnalysisCoverage,
+  type AnalysisJobExecutionContext,
+  type AnalysisJobExecutionResult,
+  type AnalysisJobExecutor,
+  type AnalysisJobProgress,
+  type AnalysisJobRequest,
+  type AnalysisJobSnapshot,
+  type AnalysisJobState,
+  type AnalysisJobSupervisorOptions,
+  type AnalysisOperationKind,
+  type AnalysisResultItem,
+} from './analysis-job-supervisor.js';
+export {
   DevelopmentBrokerClient,
   DevelopmentBrokerError,
   startDevelopmentBroker,
@@ -21,9 +35,11 @@ export {
   encodeBrokerFrame,
   parseBrokerParams,
   validateBrokerEndpoint,
+  webTabSummarySchema,
   type BrokerMethod,
   type BrokerRequestEnvelope,
   type BrokerResponseEnvelope,
+  type WebTabSummary,
 } from './protocol.js';
 export {
   ApplicationSupervisor,
@@ -46,7 +62,9 @@ export {
 export {
   createDevelopmentRuntimeHandler,
   type BrowserApplicationListenerInput,
+  type BrowserCondition,
   type DevelopmentRuntimeHandlerOptions,
+  type WebWaitCondition,
 } from './runtime-handler.js';
 export {
   SetupSupervisor,

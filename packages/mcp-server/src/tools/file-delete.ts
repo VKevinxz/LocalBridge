@@ -2,9 +2,9 @@ import type { McpServer } from '@modelcontextprotocol/server';
 import { z } from 'zod';
 
 import { deleteWorkspaceFile } from '@localbridge/filesystem';
-import { requireAuthorizedWorkspace } from '@localbridge/permissions';
+import { requireAuthorizedWorkspace, withAuthorizedWorkspaceEffect } from '@localbridge/permissions';
 
-import { cacheResult, getCachedResult, idempotencyKey } from '../idempotency.js';
+import { getCachedResult, idempotencyFingerprint, idempotencyKey, runIdempotent } from '../idempotency.js';
 import type { ToolContext } from '../tool-context.js';
 import { toolError, toolSuccess } from '../tool-result.js';
 
@@ -16,8 +16,8 @@ const inputSchema = z.object({
   expectedSha256: z
     .string()
     .regex(/^[0-9a-f]{64}$/i, 'expectedSha256 must be a 64-character hex SHA-256 digest'),
-  operationId: z.string().min(1).optional(),
-});
+  operationId: z.string().regex(/^[A-Za-z0-9_-]{1,128}$/).optional(),
+}).strict();
 
 const outputSchema = z.object({
   path: z.string(),
@@ -61,19 +61,19 @@ export function registerFileDeleteTool(server: McpServer, ctx: ToolContext): voi
       };
       try {
         const key = operationId === undefined ? undefined : idempotencyKey('file.delete', workspaceId, operationId);
+        const fingerprint = idempotencyFingerprint(path, expectedSha256.toLowerCase());
+        const workspace = await requireAuthorizedWorkspace(ctx.workspaceConfigPath, ctx.logger, workspaceId, 'overwrite');
         if (key !== undefined) {
-          const cached = getCachedResult(key);
+          const cached = getCachedResult(key, fingerprint);
           if (cached !== undefined) {
             return toolSuccess(cached, { context: auditBase, logger: ctx.logger });
           }
         }
 
-        const workspace = await requireAuthorizedWorkspace(ctx.workspaceConfigPath, ctx.logger, workspaceId, 'overwrite');
-        const result = await deleteWorkspaceFile(workspace, path, expectedSha256.toLowerCase());
-
-        if (key !== undefined) {
-          cacheResult(key, result);
-        }
+        const mutate = () => deleteWorkspaceFile(workspace, path, expectedSha256.toLowerCase(), {
+          withAuthorizedEffect: (effect) => withAuthorizedWorkspaceEffect(ctx.workspaceConfigPath, ctx.logger, workspace, 'overwrite', effect),
+        });
+        const result = key === undefined ? await mutate() : await runIdempotent(key, fingerprint, mutate);
 
         return toolSuccess(result, { context: auditBase, logger: ctx.logger });
       } catch (error) {

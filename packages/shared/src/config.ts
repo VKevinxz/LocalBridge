@@ -12,7 +12,7 @@ import { LOG_LEVELS, type LogLevel } from './logger.js';
  * Debe coincidir con la versión de `package.json`; hay un test que lo comprueba
  * para que no se separen silenciosamente.
  */
-export const SERVER_VERSION = '1.2.1';
+export const SERVER_VERSION = '1.7.0';
 
 export const SERVER_NAME = 'localbridge-mcp';
 
@@ -48,6 +48,8 @@ export interface ServerConfig {
   /** Broker privado creado por Electron; ambos deben existir para habilitar runtime V0.3. */
   readonly developmentBrokerEndpoint?: string;
   readonly developmentBrokerToken?: string;
+  /** Worker PDF cerrado elegido por el proceso de escritorio, nunca por una tool. */
+  readonly documentWorkerPath?: string;
 }
 
 function parseLogLevel(raw: string | undefined): LogLevel {
@@ -84,6 +86,7 @@ export function defaultAuditDbPath(): string {
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
   const developmentBrokerEndpoint = env['LOCALBRIDGE_DEVELOPMENT_BROKER_ENDPOINT'];
   const developmentBrokerToken = env['LOCALBRIDGE_DEVELOPMENT_BROKER_TOKEN'];
+  const documentWorkerPath = env['LOCALBRIDGE_DOCUMENT_WORKER_PATH'];
   return {
     name: SERVER_NAME,
     version: SERVER_VERSION,
@@ -94,5 +97,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
     ...(developmentBrokerEndpoint === undefined || developmentBrokerToken === undefined
       ? {}
       : { developmentBrokerEndpoint, developmentBrokerToken }),
+    ...(documentWorkerPath !== undefined && path.isAbsolute(documentWorkerPath)
+      ? { documentWorkerPath: path.resolve(documentWorkerPath) }
+      : {}),
   };
 }

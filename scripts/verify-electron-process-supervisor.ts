@@ -5,10 +5,16 @@ import path from 'node:path';
 
 import { app } from 'electron';
 
+import { buildPublicResearchProfile, type WebProfile } from '@localbridge/desktop-core';
 import { ProcessSupervisor } from '@localbridge/development';
 import type { AuthorizedWorkspace } from '@localbridge/workspace';
 
 import { BrowserController } from '../apps/desktop/src/main/browser-controller.js';
+import { LiveViewerCoordinator } from '../apps/desktop/src/main/live-viewer-coordinator.js';
+import { WebController } from '../apps/desktop/src/main/web-controller.js';
+import { HumanControlCoordinator } from '../apps/desktop/src/main/human-control-coordinator.js';
+
+app.on('window-all-closed', () => { /* el navegador gestionado es deliberadamente invisible */ });
 
 for (const stream of [process.stdout, process.stderr]) {
   stream.on('error', (error: NodeJS.ErrnoException) => {
@@ -44,6 +50,7 @@ function workspace(rootPath: string): AuthorizedWorkspace {
       processes: true,
       browserRead: true,
       browserInteract: false,
+      browserHumanControl: true,
     },
     limits: { maxFileBytes: 1024, maxTreeEntries: 30, maxTreeDepth: 2 },
     denyPatterns: ['.env'],
@@ -107,6 +114,7 @@ async function main(): Promise<void> {
     parentPid: process.pid,
     loadWorkspace: async (workspaceId) => workspaceId === authorizedWorkspace.id ? authorizedWorkspace : undefined,
   });
+  const humanControlCoordinator = new HumanControlCoordinator();
   const controller = new BrowserController({
     loadWorkspace: async (workspaceId) => workspaceId === authorizedWorkspace.id ? authorizedWorkspace : undefined,
     resolveProcessListener: async (workspaceId, processId, listenerRef) => {
@@ -117,8 +125,29 @@ async function main(): Promise<void> {
         throw error;
       }
     },
+    reserveHumanControl: (sessionId) => humanControlCoordinator.reserve({ kind: 'development', sessionId }),
+    releaseHumanControl: (sessionId) => humanControlCoordinator.release({ kind: 'development', sessionId }),
+    confirmHumanControlHandoff: async () => true,
+  });
+  const webProfile: WebProfile = {
+    ...buildPublicResearchProfile(new Date('2026-09-06T00:00:00.000Z'), 'Coexistence fixture'),
+    enabled: true,
+  };
+  const webController = new WebController({
+    loadProfile: async (id) => id === webProfile.id ? webProfile : undefined,
+    listProfiles: async () => [webProfile],
+    reconciliationIntervalMs: 50,
+    reserveHumanControl: (sessionId) => humanControlCoordinator.reserve({ kind: 'web', sessionId }),
+    releaseHumanControl: (sessionId) => humanControlCoordinator.release({ kind: 'web', sessionId }),
+  });
+  const viewerCoordinator = new LiveViewerCoordinator({
+    hideDevelopment: (sessionId) => controller.hideLiveViewerLocally(sessionId),
+    hideWeb: (sessionId) => webController.hideLiveViewerLocally(sessionId),
+    hasHumanControl: () => humanControlCoordinator.current() !== undefined,
   });
   try {
+    const web = await webController.start(webProfile.id, 'coexistence_web_start_1');
+    stage('external-web-started');
     const started = await supervisor.start(authorizedWorkspace.id, 'dev', 'electron_process_start');
     stage(`process-started:${started.state}`);
     const listeners = await waitForListener(supervisor, authorizedWorkspace.id, started.processId);
@@ -145,6 +174,28 @@ async function main(): Promise<void> {
       throw error;
     });
     stage('browser-started');
+    const viewerArea = { x: 0, y: 0, width: 1920, height: 1080 };
+    await viewerCoordinator.show(
+      { kind: 'development', sessionId: browser.sessionId },
+      () => controller.showLiveViewerLocally(browser.sessionId, viewerArea),
+    );
+    if (controller.getLocalLiveViewerSessionId() !== browser.sessionId || webController.getLocalLiveViewerState().visible) {
+      throw new Error('el coordinador no presentó exclusivamente desarrollo');
+    }
+    await viewerCoordinator.show(
+      { kind: 'web', sessionId: web.session.sessionId },
+      () => webController.showLiveViewerLocally(web.session.sessionId, 'follow', viewerArea),
+    );
+    if (controller.getLocalLiveViewerSessionId() !== undefined || !webController.getLocalLiveViewerState().visible) {
+      throw new Error('el coordinador no alternó exclusivamente a investigación web');
+    }
+    await viewerCoordinator.show(
+      { kind: 'development', sessionId: browser.sessionId },
+      () => controller.showLiveViewerLocally(browser.sessionId, viewerArea),
+    );
+    if (controller.getLocalLiveViewerSessionId() !== browser.sessionId || webController.getLocalLiveViewerState().visible) {
+      throw new Error('el coordinador no volvió exclusivamente a desarrollo');
+    }
     await waitForConsole(controller, authorizedWorkspace.id, browser.sessionId, 'LOCALBRIDGE_HMR_VERSION_1');
     stage('hmr-version-1');
     await new Promise((resolve) => setTimeout(resolve, 750));
@@ -155,8 +206,30 @@ async function main(): Promise<void> {
     if (browserEvents.events.some((entry) => entry.message.toLowerCase().includes('failed to connect to websocket'))) {
       throw new Error(`Vite reported an HMR WebSocket failure: ${JSON.stringify(browserEvents.events)}`);
     }
-    process.stdout.write(`${JSON.stringify({ electronExecPath: process.execPath, nodeBinaryPath, bundledNodeLauncher: true, npmProfileStarted: true, verifiedListener: true, viteHmrRoundTrip: true, externalWebSocketBlockedByPolicyTest: true })}\n`);
+    await controller.takeHumanControlLocally(browser.sessionId);
+    let concurrentHumanControlBlocked = false;
+    try { await webController.takeHumanControlLocally(web.session.sessionId); }
+    catch (error) { concurrentHumanControlBlocked = error instanceof Error && 'code' in error && error.code === 'HUMAN_CONTROL_BUSY'; }
+    if (!concurrentHumanControlBlocked || humanControlCoordinator.current()?.kind !== 'development') {
+      throw new Error('la reserva humana global permitió una segunda intervención web');
+    }
+    await controller.completeHumanControlLocally(browser.sessionId);
+    if (humanControlCoordinator.current() !== undefined) throw new Error('la devolución local no liberó la reserva humana global');
+    await webController.stop(web.session.sessionId, 'coexistence_web_stop_1');
+    const developmentStillRunning = (await supervisor.list(authorizedWorkspace.id)).some((entry) => entry.processId === started.processId && entry.state === 'running') &&
+      (await controller.list(authorizedWorkspace.id)).some((entry) => entry.sessionId === browser.sessionId && entry.state === 'running');
+    if (!developmentStillRunning) throw new Error('detener web externo terminó recursos de desarrollo');
+
+    const secondWeb = await webController.start(webProfile.id, 'coexistence_web_start_2');
+    await controller.stop(authorizedWorkspace.id, browser.sessionId);
+    await supervisor.stop(authorizedWorkspace.id, started.processId);
+    if (!(await webController.list()).some((entry) => entry.sessionId === secondWeb.session.sessionId && entry.state === 'running')) {
+      throw new Error('detener desarrollo terminó la sesión web externa');
+    }
+    await webController.stop(secondWeb.session.sessionId, 'coexistence_web_stop_2');
+    process.stdout.write(`${JSON.stringify({ electronExecPath: process.execPath, nodeBinaryPath, bundledNodeLauncher: true, npmProfileStarted: true, verifiedListener: true, viteHmrRoundTrip: true, externalWebSocketBlockedByPolicyTest: true, externalWebAndDevelopmentCoexist: true, exclusiveLiveViewerCoexistence: true, globalHumanControlExclusive: true, independentStopScopes: true })}\n`);
   } finally {
+    await webController.close();
     await controller.close();
     await supervisor.close();
     await rm(rootPath, { recursive: true, force: true });

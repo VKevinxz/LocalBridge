@@ -29,11 +29,13 @@ describe('SEC-067 — la vista en vivo reutiliza el navegador aislado', () => {
   it('mueve la ventana existente sin crear otro BrowserWindow ni WebContentsView', async () => {
     const controller = await source('apps/desktop/src/main/browser-controller.ts');
     const show = method(controller, 'async showLiveViewerLocally', 'async hideLiveViewerLocally');
-    expect(show).toContain('this.positionLiveViewer(entry, workArea)');
+    expect(show).toContain('await this.positionLiveViewer(entry, workArea,');
     expect(show).toContain('entry.window.showInactive()');
     expect(show).not.toContain('new BrowserWindow');
     expect(show).not.toContain('new WebContentsView');
     expect(show).not.toContain('loadURL(entry.profile.origin)');
+    expect(controller).toContain('window.contentView.addChildView(frame)');
+    expect(controller).toContain('frame.addChildView(content)');
   });
 });
 

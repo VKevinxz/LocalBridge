@@ -10,7 +10,14 @@ $sensitivePathPattern = '(?i)(^|/)(\.env($|\.)|workspaces\.json$|desktop-setting
 $secretPattern = '(-----BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY-----|gh[pousr]_[A-Za-z0-9]{20,}|sk-[A-Za-z0-9_-]{20,}|AKIA[A-Z0-9]{16})'
 $knownSyntheticFixtureBlobs = @{
   # Contiene deliberadamente un encabezado ficticio para probar la denylist.
-  'tests/helpers/fixtures.ts' = '954e7af24d02cc8f37a884b0bca7e1642fede8ce'
+  # Cada entrada se autoriza por blob exacto: se conservan las revisiones
+  # históricas y la vigente para que añadir una nueva no invalide el escaneo
+  # de commits anteriores.
+  'tests/helpers/fixtures.ts' = @(
+    '4e380c0f33e886aab6565340aa2714caebfe1cc7',
+    '954e7af24d02cc8f37a884b0bca7e1642fede8ce',
+    'f9e72c79bdcaa9a12f47e54971d4b06b62c49dc4'
+  )
 }
 $findings = [Collections.Generic.List[string]]::new()
 $commits = @(git rev-list --all)
@@ -37,11 +44,11 @@ foreach ($commit in $commits) {
     foreach ($match in $rawMatches) {
       $separator = $match.IndexOf(':')
       $filePath = if ($separator -ge 0) { $match.Substring($separator + 1) } else { $match }
-      $allowedBlob = $knownSyntheticFixtureBlobs[$filePath]
-      if ($null -ne $allowedBlob) {
+      $allowedBlobs = $knownSyntheticFixtureBlobs[$filePath]
+      if ($null -ne $allowedBlobs) {
         $actualBlob = git rev-parse "$($commit):$filePath"
         if ($LASTEXITCODE -ne 0) { throw "Could not verify fixture blob in $short." }
-        if ($actualBlob -eq $allowedBlob) { continue }
+        if (@($allowedBlobs) -contains $actualBlob) { continue }
       }
       $filePath
     }

@@ -4,7 +4,7 @@ import { randomUUID } from 'node:crypto';
 import { afterEach, describe, expect, it } from 'vitest';
 
 import { createLogger, isLocalBridgeError } from '@localbridge/shared';
-import { requireAuthorizedWorkspace } from '@localbridge/permissions';
+import { requireAuthorizedWorkspace, requireCurrentWorkspaceAuthority } from '@localbridge/permissions';
 
 import { buildWorkspace, writeRegistryFile } from '../helpers/fixtures.js';
 
@@ -105,5 +105,46 @@ describe('[SEC-025] cambio de permisos en runtime', () => {
     await expect(requireAuthorizedWorkspace(configPath, logger, 'ws_toggle', 'read')).rejects.toMatchObject({
       code: 'WORKSPACE_DISABLED',
     });
+  });
+
+  it('una cuota de recursos cambia sin invalidar la misma autoridad de lectura/escritura', async () => {
+    configPath = tempConfigPath();
+    const workspace = buildWorkspace({
+      id: 'ws_resources', rootPath: 'C:\\anything',
+      permissions: { read: true, write: true, overwrite: false, gitRead: false, validations: false, gitWrite: false },
+    });
+    await writeRegistryFile(configPath, [workspace]);
+    const admitted = await requireAuthorizedWorkspace(configPath, logger, workspace.id, 'read');
+    await writeRegistryFile(configPath, [{
+      ...workspace,
+      limits: {
+        ...workspace.limits,
+        largeArtifacts: {
+          mode: 'adaptive' as const,
+          reserve: { minimumFreeBytes: 64 * 1024 * 1024, minimumFreePercent: 1 },
+          maxConcurrentJobs: 2 as const,
+        },
+      },
+    }]);
+
+    await expect(requireCurrentWorkspaceAuthority(configPath, logger, admitted, ['read', 'write']))
+      .resolves.toMatchObject({ limits: { largeArtifacts: { mode: 'adaptive' } } });
+  });
+
+  it('la revalidación por acción detecta una revocación aunque otros campos sigan iguales', async () => {
+    configPath = tempConfigPath();
+    const workspace = buildWorkspace({
+      id: 'ws_action_revoked', rootPath: 'C:\\anything',
+      permissions: { read: true, write: true, overwrite: false, gitRead: false, validations: false, gitWrite: false },
+    });
+    await writeRegistryFile(configPath, [workspace]);
+    const admitted = await requireAuthorizedWorkspace(configPath, logger, workspace.id, 'read');
+    await writeRegistryFile(configPath, [{
+      ...workspace,
+      permissions: { ...workspace.permissions, write: false },
+    }]);
+
+    await expect(requireCurrentWorkspaceAuthority(configPath, logger, admitted, ['read', 'write']))
+      .rejects.toMatchObject({ code: 'CAPABILITY_DISABLED' });
   });
 });

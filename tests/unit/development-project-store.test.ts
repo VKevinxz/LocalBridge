@@ -114,7 +114,7 @@ describe("development project store v1 — compatibilidad v0.8", () => {
     const raw = `${JSON.stringify({ schemaVersion: 1, projects: [project] }, null, 2)}\n`;
     await writeFile(projectsPath, raw);
 
-    const reconciled = await loadDevelopmentProjectStore(projectsPath, { schemaVersion: 4, workspaces: [], applications: [] });
+    const reconciled = await loadDevelopmentProjectStore(projectsPath, { schemaVersion: 5, workspaces: [], applications: [] });
 
     expect(reconciled.projects[0]?.setupStatus).toBe("interrupted");
     expect(await readFile(projectsPath, "utf8")).toBe(raw);

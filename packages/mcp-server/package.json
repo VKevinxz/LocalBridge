@@ -1,6 +1,6 @@
 {
   "name": "@localbridge/mcp-server",
-  "version": "1.2.1",
+  "version": "1.7.0",
   "private": true,
   "license": "UNLICENSED",
   "type": "module",
@@ -11,14 +11,22 @@
   },
   "dependencies": {
     "@localbridge/audit": "workspace:*",
-    "@localbridge/filesystem": "workspace:*",
     "@localbridge/development": "workspace:*",
+    "@localbridge/filesystem": "workspace:*",
     "@localbridge/git": "workspace:*",
     "@localbridge/permissions": "workspace:*",
     "@localbridge/shared": "workspace:*",
     "@localbridge/validation": "workspace:*",
     "@localbridge/workspace": "workspace:*",
     "@modelcontextprotocol/server": "^2.0.0",
+    "@napi-rs/canvas": "1.0.8",
+    "clawpdf": "0.3.2",
+    "pdfjs-dist": "6.3.289",
+    "pixelmatch": "7.1.0",
+    "pngjs": "7.0.0",
     "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/pngjs": "6.0.5"
   }
 }

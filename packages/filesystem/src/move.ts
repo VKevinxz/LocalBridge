@@ -11,14 +11,15 @@
  * llamada guardada por hash.
  */
 
-import { createHash } from "node:crypto";
-import { readFile, rename, stat } from "node:fs/promises";
+import { rename } from "node:fs/promises";
 import path from "node:path";
 
 import { LocalBridgeError } from "@localbridge/shared";
 import { isPathDenied, resolveWriteTarget, type AuthorizedWorkspace } from "@localbridge/workspace";
 
 import { mutationLockKey, withMutationLock } from "./mutex.js";
+import { hashResolvedFile } from './hash-file.js';
+import { runAuthorizedEffect, type MutationOptions } from "./mutation-options.js";
 
 export interface FileMoveResult {
   sourcePath: string;
@@ -32,13 +33,14 @@ export async function moveWorkspaceFile(
   sourceRelativePath: string,
   destRelativePath: string,
   expectedSha256: string,
+  options: MutationOptions = {},
 ): Promise<FileMoveResult> {
   const sourceInitial = await resolveWriteTarget(workspace.rootPath, sourceRelativePath, { createParentDirs: false });
   if (isPathDenied(sourceInitial.relativePath, workspace.denyPatterns)) {
     throw new LocalBridgeError("PATH_DENIED");
   }
 
-  const destInitial = await resolveWriteTarget(workspace.rootPath, destRelativePath, { createParentDirs: true });
+  const destInitial = await resolveWriteTarget(workspace.rootPath, destRelativePath, { createParentDirs: false });
   if (isPathDenied(destInitial.relativePath, workspace.denyPatterns)) {
     throw new LocalBridgeError("PATH_DENIED");
   }
@@ -60,6 +62,7 @@ export async function moveWorkspaceFile(
 
   return withMutationLock(firstKey, () =>
     withMutationLock(secondKey, async () => {
+      return runAuthorizedEffect(options, async () => {
       const source = await resolveWriteTarget(workspace.rootPath, sourceRelativePath, { createParentDirs: false });
       if (!source.exists) {
         throw new LocalBridgeError("FILE_NOT_FOUND");
@@ -70,26 +73,15 @@ export async function moveWorkspaceFile(
 
       const sourcePath = path.join(source.realParentDir, source.basename);
 
-      let stats;
-      try {
-        stats = await stat(sourcePath);
-      } catch {
-        throw new LocalBridgeError("INTERNAL_ERROR");
-      }
-      if (stats.size > workspace.limits.maxFileBytes) {
-        throw new LocalBridgeError("FILE_TOO_LARGE");
-      }
-
-      const buffer = await readFile(sourcePath);
-      const currentSha256 = createHash("sha256").update(buffer).digest("hex");
-      if (currentSha256 !== expectedSha256) {
+      const currentFile = await hashResolvedFile(sourcePath);
+      if (currentFile.sha256 !== expectedSha256) {
         throw new LocalBridgeError("HASH_MISMATCH");
       }
 
       // Revalidación del destino dentro del lock: pudo aparecer algo entre la
       // primera pasada y aquí. No se crean directorios en esta segunda pasada
       // (ya se crearon, si hacía falta, en la primera fuera del lock).
-      const dest = await resolveWriteTarget(workspace.rootPath, destRelativePath, { createParentDirs: false });
+      const dest = await resolveWriteTarget(workspace.rootPath, destRelativePath, { createParentDirs: true });
       if (dest.exists) {
         throw new LocalBridgeError("FILE_ALREADY_EXISTS");
       }
@@ -97,7 +89,8 @@ export async function moveWorkspaceFile(
       const destPath = path.join(dest.realParentDir, dest.basename);
       await rename(sourcePath, destPath);
 
-      return { sourcePath: source.relativePath, destPath: dest.relativePath, sha256: currentSha256, size: buffer.byteLength };
+      return { sourcePath: source.relativePath, destPath: dest.relativePath, sha256: currentFile.sha256, size: currentFile.size };
+      });
     }),
   );
 }

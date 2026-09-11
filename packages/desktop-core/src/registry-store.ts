@@ -13,9 +13,11 @@ import {
   parseWorkspaceRegistry,
   registryFileSchema,
   workspaceSchema,
+  withWorkspaceAuthorityLock,
   type AuthorizedWorkspace,
   type BrowserProfile,
   type LocalApplication,
+  type LargeArtifactPolicy,
   type ProcessProfile,
   type WorkspacePermissions,
   type WorkspaceRegistry,
@@ -34,7 +36,7 @@ interface ReadRegistryResult {
 }
 
 function emptyRegistry(): WorkspaceRegistry {
-  return { schemaVersion: 4, workspaces: [], applications: [] };
+  return { schemaVersion: 5, workspaces: [], applications: [] };
 }
 
 async function readRegistry(configPath: string): Promise<ReadRegistryResult> {
@@ -61,7 +63,7 @@ async function readRegistry(configPath: string): Promise<ReadRegistryResult> {
 
 async function preserveLegacyBackup(configPath: string, raw: string | undefined): Promise<void> {
   if (raw === undefined) return;
-  const backupPath = `${configPath}.pre-v4-backup.json`;
+  const backupPath = `${configPath}.pre-v5-backup.json`;
   try {
     await copyFile(configPath, backupPath, fsConstants.COPYFILE_EXCL);
   } catch (error) {
@@ -82,11 +84,13 @@ export async function loadRegistryDocument(configPath: string): Promise<Workspac
   return (await readRegistry(configPath)).registry;
 }
 
-/** Migra formatos anteriores en disco con backup exclusivo; es idempotente para v4. */
+/** Migra formatos anteriores en disco con backup exclusivo; es idempotente para v5. */
 export async function migrateRegistryFile(configPath: string): Promise<WorkspaceRegistry> {
-  const current = await readRegistry(configPath);
-  if (current.legacyRaw !== undefined) await writeRegistry(configPath, current.registry, current.legacyRaw);
-  return current.registry;
+  return withWorkspaceAuthorityLock(configPath, async () => {
+    const current = await readRegistry(configPath);
+    if (current.legacyRaw !== undefined) await writeRegistry(configPath, current.registry, current.legacyRaw);
+    return current.registry;
+  });
 }
 
 export async function listWorkspaces(configPath: string): Promise<AuthorizedWorkspace[]> {
@@ -101,6 +105,8 @@ export interface NewWorkspaceInput {
   readonly name: string;
   readonly rootPath: string;
   readonly permissions: WorkspacePermissions;
+  readonly maxFileBytes?: number;
+  readonly largeArtifacts?: LargeArtifactPolicy;
   readonly validationProfiles?: Readonly<Record<string, readonly string[]>>;
   readonly processProfiles?: Readonly<Record<string, ProcessProfile>>;
   readonly browserProfiles?: Readonly<Record<string, BrowserProfile>>;
@@ -117,7 +123,7 @@ export interface NewApplicationInput {
 }
 
 export function buildNewWorkspace(input: NewWorkspaceInput): AuthorizedWorkspace {
-  return workspaceSchema.parse({
+  const workspace = workspaceSchema.parse({
     id: `ws_${randomUUID().slice(0, 8)}`,
     name: input.name,
     rootPath: input.rootPath,
@@ -128,6 +134,13 @@ export function buildNewWorkspace(input: NewWorkspaceInput): AuthorizedWorkspace
     processProfiles: input.processProfiles ?? {},
     browserProfiles: input.browserProfiles ?? {},
     automationReviewRequired: input.automationReviewRequired ?? false,
+    ...(input.largeArtifacts === undefined ? {} : {
+      limits: { maxFileBytes: input.maxFileBytes ?? 1_048_576, maxTreeEntries: 300, maxTreeDepth: 3, largeArtifacts: input.largeArtifacts },
+    }),
+  });
+  return input.maxFileBytes === undefined || input.largeArtifacts !== undefined ? workspace : workspaceSchema.parse({
+    ...workspace,
+    limits: { ...workspace.limits, maxFileBytes: input.maxFileBytes },
   });
 }
 
@@ -146,7 +159,7 @@ export function buildNewApplication(input: NewApplicationInput): LocalApplicatio
     description: input.description ?? "",
     primaryServiceId: primary.id,
     services,
-    viewport: input.viewport ?? { width: 1280, height: 800 },
+    viewport: input.viewport ?? { width: 1920, height: 1080 },
     reviewState: input.reviewState ?? "needs-review",
     createdAt: now,
     updatedAt: now,
@@ -173,61 +186,112 @@ function reconcileForWorkspaceUpdate(
 }
 
 export async function upsertWorkspace(configPath: string, workspace: AuthorizedWorkspace): Promise<void> {
-  const validated = workspaceSchema.parse(workspace);
-  const current = await readRegistry(configPath);
-  const existingIndex = current.registry.workspaces.findIndex((entry) => entry.id === validated.id);
-  const previous = existingIndex === -1 ? undefined : current.registry.workspaces[existingIndex];
-  const workspaces = existingIndex === -1
-    ? [...current.registry.workspaces, validated]
-    : current.registry.workspaces.with(existingIndex, validated);
-  const applications = reconcileForWorkspaceUpdate(current.registry.applications, previous, validated);
-  await writeRegistry(configPath, { schemaVersion: 4, workspaces, applications }, current.legacyRaw);
+  await withWorkspaceAuthorityLock(configPath, async () => {
+    const validated = workspaceSchema.parse(workspace);
+    const current = await readRegistry(configPath);
+    const existingIndex = current.registry.workspaces.findIndex((entry) => entry.id === validated.id);
+    const previous = existingIndex === -1 ? undefined : current.registry.workspaces[existingIndex];
+    const workspaces = existingIndex === -1
+      ? [...current.registry.workspaces, validated]
+      : current.registry.workspaces.with(existingIndex, validated);
+    const applications = reconcileForWorkspaceUpdate(current.registry.applications, previous, validated);
+    await writeRegistry(configPath, { schemaVersion: 5, workspaces, applications }, current.legacyRaw);
+  });
 }
 
 export async function removeWorkspace(configPath: string, workspaceId: string): Promise<void> {
-  const current = await readRegistry(configPath);
-  const workspaces = current.registry.workspaces.filter((workspace) => workspace.id !== workspaceId);
-  if (workspaces.length === current.registry.workspaces.length) throw new RegistryStoreError(`Workspace no encontrado: ${workspaceId}`);
-  const now = new Date().toISOString();
-  const applications = current.registry.applications.map((application) =>
-    application.services.some((service) => service.workspaceId === workspaceId)
-      ? { ...application, reviewState: "needs-review" as const, updatedAt: now }
-      : application,
-  );
-  await writeRegistry(configPath, { schemaVersion: 4, workspaces, applications }, current.legacyRaw);
+  await withWorkspaceAuthorityLock(configPath, async () => {
+    const current = await readRegistry(configPath);
+    const workspaces = current.registry.workspaces.filter((workspace) => workspace.id !== workspaceId);
+    if (workspaces.length === current.registry.workspaces.length) throw new RegistryStoreError(`Workspace no encontrado: ${workspaceId}`);
+    const now = new Date().toISOString();
+    const applications = current.registry.applications.map((application) =>
+      application.services.some((service) => service.workspaceId === workspaceId)
+        ? { ...application, reviewState: "needs-review" as const, updatedAt: now }
+        : application,
+    );
+    await writeRegistry(configPath, { schemaVersion: 5, workspaces, applications }, current.legacyRaw);
+  });
 }
 
 export async function replaceWorkspaces(configPath: string, workspaces: readonly AuthorizedWorkspace[]): Promise<void> {
-  const current = await readRegistry(configPath);
-  await writeRegistry(configPath, {
-    schemaVersion: 4,
-    workspaces: workspaces.map((workspace) => workspaceSchema.parse(workspace)),
-    applications: current.registry.applications,
-  }, current.legacyRaw);
+  await withWorkspaceAuthorityLock(configPath, async () => {
+    const current = await readRegistry(configPath);
+    await writeRegistry(configPath, {
+      schemaVersion: 5,
+      workspaces: workspaces.map((workspace) => workspaceSchema.parse(workspace)),
+      applications: current.registry.applications,
+    }, current.legacyRaw);
+  });
 }
 
 export async function replaceRegistry(configPath: string, registry: WorkspaceRegistry): Promise<void> {
-  const current = await readRegistry(configPath);
-  await writeRegistry(configPath, registry, current.legacyRaw);
+  await withWorkspaceAuthorityLock(configPath, async () => {
+    const current = await readRegistry(configPath);
+    await writeRegistry(configPath, registry, current.legacyRaw);
+  });
+}
+
+export interface RegistryEntryRemovalResult {
+  readonly workspaceIds: readonly string[];
+  readonly applicationIds: readonly string[];
+}
+
+/**
+ * Retira entradas concretas sobre la revisión más reciente del registro. A diferencia de
+ * `replaceRegistry`, no puede sobrescribir altas concurrentes con un snapshot anterior.
+ */
+export async function removeRegistryEntriesIfPresent(
+  configPath: string,
+  input: { readonly workspaceIds: readonly string[]; readonly applicationIds: readonly string[] },
+): Promise<RegistryEntryRemovalResult> {
+  return withWorkspaceAuthorityLock(configPath, async () => {
+    const current = await readRegistry(configPath);
+    const requestedWorkspaces = new Set(input.workspaceIds);
+    const requestedApplications = new Set(input.applicationIds);
+    const applicationIds = current.registry.applications
+      .filter((application) => requestedApplications.has(application.id))
+      .map((application) => application.id);
+    const retainedApplications = current.registry.applications
+      .filter((application) => !requestedApplications.has(application.id));
+    const retainedApplicationWorkspaces = new Set(retainedApplications
+      .flatMap((application) => application.services.map((service) => service.workspaceId)));
+    const workspaceIds = current.registry.workspaces
+      .filter((workspace) => requestedWorkspaces.has(workspace.id) && !retainedApplicationWorkspaces.has(workspace.id))
+      .map((workspace) => workspace.id);
+    const removableWorkspaces = new Set(workspaceIds);
+    if (workspaceIds.length > 0 || applicationIds.length > 0) {
+      await writeRegistry(configPath, {
+        ...current.registry,
+        workspaces: current.registry.workspaces.filter((workspace) => !removableWorkspaces.has(workspace.id)),
+        applications: retainedApplications,
+      }, current.legacyRaw);
+    }
+    return { workspaceIds, applicationIds };
+  });
 }
 
 export async function upsertApplication(configPath: string, application: LocalApplication): Promise<LocalApplication> {
-  const validated = localApplicationSchema.parse(application);
-  const current = await readRegistry(configPath);
-  const duplicate = current.registry.applications.find((candidate) =>
-    candidate.id !== validated.id && applicationNameKey(candidate.name) === applicationNameKey(validated.name));
-  if (duplicate !== undefined) throw new RegistryStoreError(`Ya existe una aplicación llamada ${duplicate.name}.`);
-  const index = current.registry.applications.findIndex((candidate) => candidate.id === validated.id);
-  const applications = index === -1
-    ? [...current.registry.applications, validated]
-    : current.registry.applications.with(index, validated);
-  await writeRegistry(configPath, { ...current.registry, applications }, current.legacyRaw);
-  return validated;
+  return withWorkspaceAuthorityLock(configPath, async () => {
+    const validated = localApplicationSchema.parse(application);
+    const current = await readRegistry(configPath);
+    const duplicate = current.registry.applications.find((candidate) =>
+      candidate.id !== validated.id && applicationNameKey(candidate.name) === applicationNameKey(validated.name));
+    if (duplicate !== undefined) throw new RegistryStoreError(`Ya existe una aplicación llamada ${duplicate.name}.`);
+    const index = current.registry.applications.findIndex((candidate) => candidate.id === validated.id);
+    const applications = index === -1
+      ? [...current.registry.applications, validated]
+      : current.registry.applications.with(index, validated);
+    await writeRegistry(configPath, { ...current.registry, applications }, current.legacyRaw);
+    return validated;
+  });
 }
 
 export async function removeApplication(configPath: string, applicationId: string): Promise<void> {
-  const current = await readRegistry(configPath);
-  const applications = current.registry.applications.filter((application) => application.id !== applicationId);
-  if (applications.length === current.registry.applications.length) throw new RegistryStoreError("Aplicación no encontrada.");
-  await writeRegistry(configPath, { ...current.registry, applications }, current.legacyRaw);
+  await withWorkspaceAuthorityLock(configPath, async () => {
+    const current = await readRegistry(configPath);
+    const applications = current.registry.applications.filter((application) => application.id !== applicationId);
+    if (applications.length === current.registry.applications.length) throw new RegistryStoreError("Aplicación no encontrada.");
+    await writeRegistry(configPath, { ...current.registry, applications }, current.legacyRaw);
+  });
 }

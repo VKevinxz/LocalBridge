@@ -282,6 +282,35 @@ describe('git.commit — round-trip MRTR real', () => {
       await harness.close();
     }
   });
+
+  it('operationId: rechaza reutilizar el mismo commit después de cambiar el índice', async () => {
+    const seen: ElicitRequest[] = [];
+    const harness = await createHarness({
+      pinProtocol: TARGET_PROTOCOL_REVISION,
+      workspaceConfigPath: configPath,
+      auditDbPath,
+      elicitHandler: acceptHandler(seen),
+    });
+    try {
+      await writeFile(path.join(workspace.root, 'README.md'), '# primer estado\n');
+      await callToolJson(harness.client, 'git.stage', { workspaceId, paths: ['README.md'] });
+      const operationId = 'op_commit_estado_repo';
+      const first = await callToolJson(harness.client, 'git.commit', { workspaceId, message: 'mensaje estable', operationId });
+      expect(first.isError).toBe(false);
+      const firstHead = await headHash(workspace.root);
+
+      await writeFile(path.join(workspace.root, 'src', 'index.ts'), 'export const hello = "nuevo";\n');
+      await callToolJson(harness.client, 'git.stage', { workspaceId, paths: ['src/index.ts'] });
+      const replay = await callToolJson(harness.client, 'git.commit', { workspaceId, message: 'mensaje estable', operationId });
+
+      expect(replay.isError).toBe(true);
+      expect((replay.parsed['error'] as { code: string }).code).toBe('IDEMPOTENCY_CONFLICT');
+      expect(seen).toHaveLength(1);
+      expect(await headHash(workspace.root)).toBe(firstHead);
+    } finally {
+      await harness.close();
+    }
+  });
 });
 
 describe('git.push — round-trip MRTR real, contra un remoto real', () => {
@@ -339,7 +368,7 @@ describe('git.push — round-trip MRTR real, contra un remoto real', () => {
         // push se declina — si aprobar el commit "contagiara" al push, este
         // handler nunca se invocaría para el push.
         const message = (request.params as { message?: string }).message ?? '';
-        if (message.startsWith('Push to')) {
+        if (message.startsWith('Push repository')) {
           pushCalls += 1;
           return { action: 'decline' };
         }
@@ -362,6 +391,38 @@ describe('git.push — round-trip MRTR real, contra un remoto real', () => {
 
       const remoteHeadAfter = await run('git', ['rev-parse', 'main'], { cwd: remoteRoot });
       expect(remoteHeadAfter.stdout).toBe(remoteHeadBefore.stdout);
+    } finally {
+      await harness.close();
+    }
+  }, REAL_GIT_TEST_TIMEOUT_MS);
+
+  it('operationId: no reutiliza un push cacheado cuando HEAD cambió', async () => {
+    const seen: ElicitRequest[] = [];
+    const harness = await createHarness({
+      pinProtocol: TARGET_PROTOCOL_REVISION,
+      workspaceConfigPath: configPath,
+      auditDbPath,
+      elicitHandler: acceptHandler(seen),
+    });
+    try {
+      await writeFile(path.join(workspace.root, 'README.md'), '# push uno\n');
+      await callToolJson(harness.client, 'git.stage', { workspaceId, paths: ['README.md'] });
+      const firstCommit = await callToolJson(harness.client, 'git.commit', { workspaceId, message: 'push uno' });
+      const operationId = 'op_push_estado_repo';
+      const firstPush = await callToolJson(harness.client, 'git.push', { workspaceId, operationId });
+      expect(firstCommit.isError).toBe(false);
+      expect(firstPush.isError).toBe(false);
+      const publishedHash = firstPush.parsed['commitHash'] as string;
+
+      await writeFile(path.join(workspace.root, 'README.md'), '# push dos\n');
+      await callToolJson(harness.client, 'git.stage', { workspaceId, paths: ['README.md'] });
+      expect((await callToolJson(harness.client, 'git.commit', { workspaceId, message: 'push dos' })).isError).toBe(false);
+      const replay = await callToolJson(harness.client, 'git.push', { workspaceId, operationId });
+
+      expect(replay.isError).toBe(true);
+      expect((replay.parsed['error'] as { code: string }).code).toBe('IDEMPOTENCY_CONFLICT');
+      expect(seen).toHaveLength(3);
+      expect((await run('git', ['rev-parse', 'main'], { cwd: remoteRoot })).stdout.trim()).toBe(publishedHash);
     } finally {
       await harness.close();
     }

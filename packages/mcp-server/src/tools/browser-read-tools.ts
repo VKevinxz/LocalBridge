@@ -71,6 +71,7 @@ const sessionSummarySchema = z.object({
   controlExpiresAt: z.iso.datetime().optional(),
   postHumanExpiresAt: z.iso.datetime().optional(),
   humanReason: z.enum(['sign_in', 'file_selection', 'manual_step']).optional(),
+  viewport: z.object({ width: z.number().int(), height: z.number().int(), mobile: z.boolean() }).strict().optional(),
 });
 
 function client(ctx: ToolContext) {
@@ -169,7 +170,7 @@ export function registerBrowserListTool(server: McpServer, ctx: ToolContext): vo
   server.registerTool('browser.list', {
     title: 'List isolated browser sessions',
     description: 'Lists browser sessions managed by LocalBridge for one workspace. Requires browserRead.',
-    inputSchema: z.object({ workspaceId: workspaceIdSchema }),
+    inputSchema: z.object({ workspaceId: workspaceIdSchema }).strict(),
     outputSchema,
     annotations: { readOnlyHint: true, idempotentHint: true, destructiveHint: false, openWorldHint: false },
   }, async ({ workspaceId }) => {
@@ -188,7 +189,7 @@ export function registerBrowserNavigateTool(server: McpServer, ctx: ToolContext)
   server.registerTool('browser.navigate', {
     title: 'Navigate within approved local origins',
     description: 'Navigates an isolated session using a root-relative path. Absolute URLs and unapproved origins are rejected. Requires browserRead.',
-    inputSchema: z.object({ workspaceId: workspaceIdSchema, sessionId: sessionIdSchema, path: z.string().min(1).max(2048).regex(/^\/(?!\/)/), operationId: operationIdSchema }),
+    inputSchema: z.object({ workspaceId: workspaceIdSchema, sessionId: sessionIdSchema, path: z.string().min(1).max(2048).regex(/^\/(?!\/)/), operationId: operationIdSchema }).strict(),
     outputSchema: sessionSummarySchema,
     annotations: { readOnlyHint: false, idempotentHint: true, destructiveHint: false, openWorldHint: false },
   }, async ({ workspaceId, sessionId, path, operationId }) => {
@@ -214,12 +215,13 @@ export function registerBrowserSnapshotTool(server: McpServer, ctx: ToolContext)
       name: z.string(),
       value: z.string().optional(),
       elementRef: z.string().regex(/^element_[a-f0-9]{20}$/).optional(),
-    })),
-  });
+    }).strict()),
+    truncated: z.boolean(),
+  }).strict();
   server.registerTool('browser.snapshot', {
     title: 'Read an accessibility snapshot',
-    description: 'Returns a bounded accessibility tree and opaque references for interactive elements. References are valid only for this snapshot. Requires browserRead.',
-    inputSchema: z.object({ workspaceId: workspaceIdSchema, sessionId: sessionIdSchema, maxDepth: z.number().int().min(1).max(20).default(12), maxElements: z.number().int().min(1).max(1000).default(500) }),
+    description: 'Returns a bounded accessibility tree and opaque references for interactive elements. `truncated` is true when maxDepth or maxElements omitted accessible nodes. References are valid only for this snapshot. Requires browserRead.',
+    inputSchema: z.object({ workspaceId: workspaceIdSchema, sessionId: sessionIdSchema, maxDepth: z.number().int().min(1).max(20).default(12), maxElements: z.number().int().min(1).max(1000).default(500) }).strict(),
     outputSchema,
     annotations: { readOnlyHint: true, idempotentHint: false, destructiveHint: false, openWorldHint: false },
   }, async ({ workspaceId, sessionId, maxDepth, maxElements }) => {
@@ -244,7 +246,7 @@ export function registerBrowserViewportTool(server: McpServer, ctx: ToolContext)
   }).strict();
   server.registerTool('browser.viewport', {
     title: 'Resize the isolated local page for responsive testing',
-    description: 'Emulates a viewport size in an isolated LocalBridge browser session so responsive layouts and breakpoints can be verified, and optionally emulates a touch device. Width must be 320-3840 and height 320-2160. It does not resize the user window, navigate, change the allowed origin or grant any capability, and it invalidates the current snapshot because the layout changes. Take a new snapshot or screenshot afterwards. Requires browserRead.',
+    description: 'Emulates a viewport size in an isolated LocalBridge browser session so responsive layouts and breakpoints can be verified, and optionally emulates a touch device. The default desktop baseline is 1920x1080; common presets are 1440x900, 1024x768 and mobile 390x844. Width must be 320-3840 and height 320-2160. It does not resize the user window, navigate, change the allowed origin or grant any capability, and it invalidates the current snapshot because the layout changes. Take a new snapshot or screenshot afterwards. Requires browserRead.',
     inputSchema: z.object({
       workspaceId: workspaceIdSchema,
       sessionId: sessionIdSchema,
@@ -270,12 +272,12 @@ export function registerBrowserViewportTool(server: McpServer, ctx: ToolContext)
 }
 
 export function registerBrowserScreenshotTool(server: McpServer, ctx: ToolContext): void {
-  const outputSchema = z.object({ mimeType: z.literal('image/png'), width: z.number().int(), height: z.number().int() });
-  const brokerSchema = outputSchema.extend({ dataBase64: z.string() });
+  const brokerSchema = z.object({ mimeType: z.enum(['image/png', 'image/jpeg']), dataBase64: z.string(), width: z.number().int(), height: z.number().int(), fallbackUsed: z.boolean() }).strict();
+  const outputSchema = brokerSchema.omit({ dataBase64: true });
   server.registerTool('browser.screenshot', {
     title: 'Capture the isolated local page',
-    description: 'Captures the visible viewport of an isolated LocalBridge browser session as PNG. Requires browserRead.',
-    inputSchema: z.object({ workspaceId: workspaceIdSchema, sessionId: sessionIdSchema }),
+    description: 'Captures the rendered viewport of an isolated LocalBridge browser session as PNG, with bounded JPEG fallback only when PNG cannot fit the private broker frame. For visual fidelity work, set the same viewport on reference and candidate, capture both, and only claim high or pixel-level similarity when both captures are available and comparable. If either capture fails, explicitly report visual fidelity as unverified. Requires browserRead.',
+    inputSchema: z.object({ workspaceId: workspaceIdSchema, sessionId: sessionIdSchema }).strict(),
     outputSchema,
     annotations: { readOnlyHint: true, idempotentHint: true, destructiveHint: false, openWorldHint: false },
   }, async ({ workspaceId, sessionId }) => {
@@ -283,7 +285,12 @@ export function registerBrowserScreenshotTool(server: McpServer, ctx: ToolContex
     try {
       await requireRead(ctx, workspaceId);
       const brokerResult = brokerSchema.parse(await client(ctx).call('browser.screenshot', { workspaceId, sessionId }));
-      const metadata = outputSchema.parse(brokerResult);
+      const metadata = outputSchema.parse({
+        mimeType: brokerResult.mimeType,
+        width: brokerResult.width,
+        height: brokerResult.height,
+        fallbackUsed: brokerResult.fallbackUsed,
+      });
       const success = toolSuccess(metadata, { context: auditBase, logger: ctx.logger });
       return {
         ...success,
@@ -298,6 +305,46 @@ export function registerBrowserScreenshotTool(server: McpServer, ctx: ToolContex
   });
 }
 
+export function registerBrowserScreenshotSaveTool(server: McpServer, ctx: ToolContext): void {
+  const outputSchema = z.object({
+    sessionId: sessionIdSchema,
+    path: z.string(),
+    sha256: z.string().regex(/^[a-f0-9]{64}$/),
+    size: z.number().int().nonnegative(),
+    created: z.literal(true),
+    mimeType: z.literal('image/png'),
+    width: z.number().int().positive(),
+    height: z.number().int().positive(),
+    fallbackUsed: z.literal(false),
+    sourcePath: z.string(),
+  }).strict();
+  server.registerTool('browser.screenshot.save', {
+    title: 'Save local browser visual evidence',
+    description: 'Captures the current local project viewport and creates a new PNG in a write-enabled workspace with size and SHA-256 receipt. It accepts only workspaceId and a relative destination path and never overwrites. Use the same viewport as the reference before comparing visual fidelity. If FILE_TOO_LARGE is returned, ask the user to choose a larger per-file limit in the LocalBridge workspace settings. Requires browserRead and write.',
+    inputSchema: z.object({
+      workspaceId: workspaceIdSchema,
+      sessionId: sessionIdSchema,
+      path: z.string().min(1).max(4096).refine((value) => !/^(?:[A-Za-z]:[\\/]|[\\/])/.test(value), 'use a relative path'),
+      operationId: z.string().regex(/^[A-Za-z0-9_-]{1,128}$/),
+    }).strict(),
+    outputSchema,
+    annotations: { readOnlyHint: false, idempotentHint: true, destructiveHint: false, openWorldHint: false },
+  }, async ({ workspaceId, sessionId, path, operationId }) => {
+    const auditBase = audit(ctx, 'browser.screenshot.save', 'R3', workspaceId, `${sessionId}:${path}`, operationId);
+    try {
+      await requireRead(ctx, workspaceId);
+      await requireAuthorizedWorkspace(ctx.workspaceConfigPath, ctx.logger, workspaceId, 'write');
+      const result = outputSchema.parse(await client(ctx).call('browser.screenshot.save', { workspaceId, sessionId, path, operationId }));
+      return toolSuccess(result, {
+        context: { ...auditBase, resource: `${sessionId}:${path}:${result.width}x${result.height}:${result.size}` },
+        logger: ctx.logger,
+      });
+    } catch (error) {
+      return toolError(mapBrokerError(error), ctx.logger, { tool: 'browser.screenshot.save', workspaceId, sessionId }, auditBase);
+    }
+  });
+}
+
 export function registerBrowserEventsTool(server: McpServer, ctx: ToolContext): void {
   const outputSchema = z.object({
     events: z.array(z.object({ cursor: z.number().int().nonnegative(), type: z.enum(['console', 'network', 'error']), level: z.string(), message: z.string(), path: z.string().optional() })),
@@ -307,7 +354,7 @@ export function registerBrowserEventsTool(server: McpServer, ctx: ToolContext): 
   server.registerTool('browser.events', {
     title: 'Read browser console and network events',
     description: 'Reads bounded cursor-based console, network-status and page errors without response bodies, headers or secrets. Requires browserRead.',
-    inputSchema: z.object({ workspaceId: workspaceIdSchema, sessionId: sessionIdSchema, cursor: z.number().int().nonnegative().default(0), maxBytes: z.number().int().min(1).max(65_536).default(65_536) }),
+    inputSchema: z.object({ workspaceId: workspaceIdSchema, sessionId: sessionIdSchema, cursor: z.number().int().nonnegative().default(0), maxBytes: z.number().int().min(1).max(65_536).default(65_536) }).strict(),
     outputSchema,
     annotations: { readOnlyHint: true, idempotentHint: true, destructiveHint: false, openWorldHint: false },
   }, async ({ workspaceId, sessionId, cursor, maxBytes }) => {
@@ -326,7 +373,7 @@ export function registerBrowserStopTool(server: McpServer, ctx: ToolContext): vo
   server.registerTool('browser.stop', {
     title: 'Stop an isolated browser session',
     description: 'Stops one LocalBridge browser session and destroys its ephemeral storage partition. Requires browserRead.',
-    inputSchema: z.object({ workspaceId: workspaceIdSchema, sessionId: sessionIdSchema, operationId: operationIdSchema }),
+    inputSchema: z.object({ workspaceId: workspaceIdSchema, sessionId: sessionIdSchema, operationId: operationIdSchema }).strict(),
     outputSchema: sessionSummarySchema,
     annotations: { readOnlyHint: false, idempotentHint: true, destructiveHint: false, openWorldHint: false },
   }, async ({ workspaceId, sessionId, operationId }) => {

@@ -181,6 +181,14 @@ export async function revokeProjectTrust(filePath: string, projectId: string): P
   return revoked;
 }
 
+export async function removeProjectTrustRecord(filePath: string, projectId: string): Promise<boolean> {
+  const current = await loadProjectTrustStore(filePath);
+  const decisions = current.decisions.filter((candidate) => candidate.projectId !== projectId);
+  if (decisions.length === current.decisions.length) return false;
+  await writeJson(filePath, projectTrustStoreSchema.parse({ schemaVersion: 1, decisions }));
+  return true;
+}
+
 export function migrateDevelopmentProjectsToCatalog(
   projects: readonly DevelopmentProject[],
   registry: WorkspaceRegistry,

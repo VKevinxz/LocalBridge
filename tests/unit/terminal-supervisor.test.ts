@@ -14,7 +14,12 @@ afterEach(async () => {
   await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
 });
 
-async function fixture(mode: ProjectTrustRecord["mode"] = "full-host", onProjectActivity?: (projectId: string) => void) {
+async function fixture(
+  mode: ProjectTrustRecord["mode"] = "full-host",
+  onProjectActivity?: (projectId: string) => void,
+  additionalProjectId?: string,
+  withProjectSandbox = false,
+) {
   const root = await mkdtemp(path.join(os.tmpdir(), "localbridge-terminal-"));
   roots.push(root);
   const project: ProjectCatalogRecord = {
@@ -44,8 +49,14 @@ async function fixture(mode: ProjectTrustRecord["mode"] = "full-host", onProject
     helperPath: path.resolve("apps/desktop/vendor/process-host/localbridge-process-host.exe"),
     parentPid: process.pid,
     deviceBinding: "b".repeat(64),
-    loadProject: async (id) => id === project.id ? project : undefined,
-    loadTrust: async (id) => id === project.id ? trust : undefined,
+    loadProject: async (id) => id === project.id ? project : id === additionalProjectId ? { ...project, id } : undefined,
+    loadTrust: async (id) => id === project.id ? trust : id === additionalProjectId ? { ...trust, projectId: id } : undefined,
+    ...(withProjectSandbox ? {
+      projectSandbox: {
+        available: true as const,
+        command: async (_project: ProjectCatalogRecord, shell: string) => [shell],
+      },
+    } : {}),
     ...(onProjectActivity === undefined ? {} : { onProjectActivity }),
   });
   supervisors.push(supervisor);
@@ -72,6 +83,57 @@ describe.skipIf(process.platform !== "win32")("terminal supervisor Windows", () 
     const output = await waitForOutput(supervisor, project.id, session.sessionId, "TERMINAL_OK");
     expect(output.entries.map((entry) => entry.text).join("")).toContain("TERMINAL_OK");
     expect((await supervisor.stop(project.id, session.sessionId)).state).toBe("stopped");
+  });
+
+  it("TERM-013: lista solo las sesiones retenidas del proyecto autorizado", async () => {
+    const otherProjectId = "project_bbbbbbbbbbbbbbbbbbbbbbbb";
+    const { project, supervisor } = await fixture("full-host", undefined, otherProjectId);
+    const own = await supervisor.start(project.id, "list-own");
+    const other = await supervisor.start(otherProjectId, "list-other");
+
+    expect(await supervisor.list(project.id)).toEqual([expect.objectContaining({ sessionId: own.sessionId, projectId: project.id })]);
+    expect((await supervisor.list(project.id)).some((session) => session.sessionId === other.sessionId)).toBe(false);
+  });
+
+  it("TERM-014: oculta output retenido si cambia la aprobación de la sesión", async () => {
+    const { project, trust, supervisor } = await fixture("full-host", undefined, undefined, true);
+    const session = await supervisor.start(project.id, "retained-authority");
+    await supervisor.write(project.id, session.sessionId, "Write-Output OLD_AUTHORITY_OUTPUT\r\n", "retained-write");
+    await waitForOutput(supervisor, project.id, session.sessionId, "OLD_AUTHORITY_OUTPUT");
+    await supervisor.stop(project.id, session.sessionId);
+    Object.assign(trust, {
+      mode: "project-agent",
+      networkPolicy: "closed",
+      acceptedRiskVersion: null,
+      reviewedAt: new Date(Date.now() + 1_000).toISOString(),
+    });
+
+    expect(await supervisor.list(project.id)).toEqual([]);
+    await expect(supervisor.read(project.id, session.sessionId, 0, 65_536))
+      .rejects.toMatchObject({ code: "TERMINAL_NOT_AUTHORIZED" });
+    await expect(supervisor.status(project.id, session.sessionId))
+      .rejects.toMatchObject({ code: "TERMINAL_NOT_AUTHORIZED" });
+    expect((await supervisor.stop(project.id, session.sessionId)).state).toBe("stopped");
+  });
+
+  it("SEC-134: no detiene una sesión de otro proyecto", async () => {
+    const otherProjectId = "project_bbbbbbbbbbbbbbbbbbbbbbbb";
+    const { project, supervisor } = await fixture("full-host", undefined, otherProjectId);
+    const session = await supervisor.start(project.id, "cross-project-start");
+
+    await expect(supervisor.stop(otherProjectId, session.sessionId)).rejects.toMatchObject({ code: "TERMINAL_NOT_FOUND" });
+    expect((await supervisor.status(project.id, session.sessionId)).session.state).toBe("running");
+  });
+
+  it("TERM-012: respeta maxBytes incluso si el primer bloque es mayor", async () => {
+    const { project, supervisor } = await fixture();
+    const session = await supervisor.start(project.id, "bounded-read-start");
+    await supervisor.write(project.id, session.sessionId, "Write-Output BOUNDED_OUTPUT\r\n", "bounded-read-write");
+    await waitForOutput(supervisor, project.id, session.sessionId, "BOUNDED_OUTPUT");
+
+    const output = await supervisor.read(project.id, session.sessionId, 0, 1);
+    expect(output.entries.reduce((bytes, entry) => bytes + Buffer.byteLength(entry.text), 0)).toBeLessThanOrEqual(1);
+    expect(output.nextCursor).toBeLessThanOrEqual(1);
   });
 
   it("TRUST-001/SEC-124: guided y project-agent sin sandbox fallan cerrados", async () => {

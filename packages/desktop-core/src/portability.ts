@@ -372,7 +372,7 @@ export function applyPortableConfig(
   if (duplicateImportedProject !== undefined) throw new Error(`La importación contiene más de un proyecto llamado ${duplicateImportedProject.name}.`);
 
   const registry = registryFileSchema.parse({
-    schemaVersion: 4,
+    schemaVersion: 5,
     workspaces: [...currentRegistry.workspaces, ...importedWorkspaces],
     applications: [...currentRegistry.applications, ...importedApplications],
   });

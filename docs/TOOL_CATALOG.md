@@ -1,9 +1,9 @@
-# TOOL CATALOG — LocalBridge MCP v1
+# TOOL CATALOG — contrato vigente de LocalBridge MCP
 
-**Versión:** 1.0 · **Fecha:** 19 de agosto de 2026
+**Versión de producto:** 1.7.0 · **Actualizado:** 9 de septiembre de 2026
 
-Contrato de cada tool MCP expuesta por el servidor (v1 más las ampliaciones de v2 ya
-implementadas — marcadas explícitamente como tales en su sección). Este catálogo es
+Contrato de cada tool MCP expuesta por el árbol vigente, incluidas las ampliaciones
+aceptadas por ADR. Este catálogo es
 normativo: una tool que no está aquí no se implementa, y una tool que está aquí no cambia
 de forma sin actualizar este documento.
 
@@ -82,7 +82,7 @@ crucialmente — la conectividad remota antes de que exista código de filesyste
 ```json
 {
   "status": "ready",
-  "version": "1.1.0",
+  "version": "1.4.0",
   "protocolRevision": "2026-07-28"
 }
 ```
@@ -112,14 +112,23 @@ rutas del disco ni el `rootPath` absoluto.
         "read": true, "write": true, "overwrite": false,
         "gitRead": true, "validations": true
       },
-      "limits": { "maxFileBytes": 1048576, "maxTreeEntries": 300, "maxTreeDepth": 3 }
+      "limits": { "maxFileBytes": 1048576, "maxTreeEntries": 300, "maxTreeDepth": 3 },
+      "validationProfiles": ["test"],
+      "processProfiles": ["dev"],
+      "browserProfiles": ["web"],
+      "profileAvailability": {
+        "validations": [{ "name": "test", "available": true }],
+        "processes": [{ "name": "dev", "available": false, "blockedReason": "automation-review-required" }],
+        "browser": [{ "name": "web", "available": false, "blockedReason": "automation-review-required" }]
+      }
     }
   ]
 }
 ```
 
-Exponer los permisos permite al agente **no intentar** operaciones que fallarán, lo que
-reduce ruido y llamadas denegadas.
+Exponer los permisos y `profileAvailability` permite al agente **no intentar** operaciones
+que fallarán. Los motivos acotados distinguen una capacidad apagada de una automatización
+que requiere revisión local, sin conceder ninguna de ellas.
 
 **Errores:** ninguno específico.
 
@@ -226,8 +235,8 @@ que `file.read`/`FILE_TOO_LARGE`, pero aquí se omiten en vez de fallar, porque 
 búsqueda recorre muchos archivos y uno grande no debe abortar el resto) · timeout duro de
 5s sobre el recorrido completo.
 
-`truncated: true` cuando se alcanzó `maxResults` o el timeout — resultados parciales,
-nunca hay que asumir que se vieron todas las coincidencias.
+`truncated: true` cuando se alcanzó `maxResults`. Si vence el timeout, la operación se
+detiene de forma cooperativa y devuelve `TIMEOUT`; no continúa recorriendo en segundo plano.
 
 **Errores:** `WORKSPACE_NOT_FOUND`, `WORKSPACE_DISABLED`, `CAPABILITY_DISABLED`,
 `PATH_OUTSIDE_WORKSPACE`, `ABSOLUTE_PATH_FORBIDDEN`, `SYMLINK_ESCAPE`, `FILE_NOT_FOUND`,
@@ -242,7 +251,7 @@ nunca hay que asumir que se vieron todas las coincidencias.
 **Entrada:**
 
 ```json
-{ "workspaceId": "ws_7f3a91", "path": "src/index.ts", "maxBytes": 65536 }
+{ "workspaceId": "ws_7f3a91", "path": "src/index.ts", "maxBytes": 65536, "startLine": 120, "endLine": 220 }
 ```
 
 **Salida:**
@@ -254,7 +263,8 @@ nunca hay que asumir que se vieron todas las coincidencias.
   "sha256": "a3f1...",
   "size": 1234,
   "truncated": false,
-  "modifiedAt": "2026-08-19T10:22:31.000Z"
+  "modifiedAt": "2026-08-19T10:22:31.000Z",
+  "lineRange": { "startLine": 120, "endLine": 220, "totalLines": 870, "hasMoreBefore": true, "hasMoreAfter": true }
 }
 ```
 
@@ -262,8 +272,10 @@ nunca hay que asumir que se vieron todas las coincidencias.
 devuelto.** Es la pieza que hace posible la escritura guardada; si se calculara sobre el
 contenido truncado, una escritura posterior compararía contra un valor sin significado.
 
-Si el archivo se trunca, el agente **no debe** usar ese contenido como base de un
-reemplazo total. Documentarlo en la descripción de la tool.
+`startLine`/`endLine` son opcionales y seleccionan como máximo 2.000 líneas. Si solo se
+indica `startLine`, se devuelven hasta 500 líneas. `lineRange` describe la cobertura real.
+`maxBytes` sigue aplicándose al fragmento seleccionado. Si el resultado se trunca, el agente
+**no debe** usar ese contenido como base de un reemplazo total.
 
 **Errores:** `FILE_NOT_FOUND`, `FILE_TOO_LARGE`, `NOT_A_FILE`, `PATH_DENIED`, más los de
 workspace y ruta.
@@ -412,6 +424,24 @@ comprobación ocurre **antes** de leer el archivo para comparar el hash, así qu
 primera ejecución exitosa sin volver a aplicar la mutación (`SEC-022`). Solo se cachean
 éxitos — un intento fallido con un `operationId` dado puede reintentarse con normalidad.
 
+### 8.1 `file.patch_guarded`
+
+**Riesgo:** R3 · **Permisos:** `read` + `overwrite` · **ADR:** 0044
+
+Aplica una lista ordenada de ediciones exactas `{ oldText, newText,
+expectedOccurrences? }` sobre un archivo existente. `oldText` debe aparecer exactamente el
+número declarado, uno por defecto, en el contenido resultante de las ediciones anteriores.
+Si falta o es ambiguo, devuelve `INVALID_INPUT` y no escribe. `expectedSha256` sigue siendo
+obligatorio y se verifica otra vez inmediatamente antes del reemplazo atómico; un cambio
+concurrente devuelve `HASH_MISMATCH`.
+
+La tool acepta rutas relativas, hasta 100 ediciones y `operationId?`. Su resultado incluye
+hash anterior/nuevo, tamaño, número de ediciones y reemplazos. No aplica parcialmente un
+archivo. Rechaza texto que no sea UTF-8 válido y calcula el tamaño proyectado antes de
+materializar cada reemplazo. Un reintento cacheado vuelve a comprobar la autoridad exacta y
+que el archivo conserve el hash posterior al parche; un root o estado distinto produce
+`IDEMPOTENCY_CONFLICT`. No existe todavía una transacción de parches multiarchivo.
+
 ---
 
 ## 9. `file.delete` / `file.move` (v2.4)
@@ -499,6 +529,13 @@ no nombró.
 workspace**, igual que en `file.read` y `workspace.tree` — un único espacio de rutas
 coherente en todas las tools.
 
+Las siete tools `git.*` aceptan `repositoryPath` con valor predeterminado `.`. En un
+proyecto multi-repo, el agente usa el `relativePath` del nodo `repository` devuelto por
+`project.list`, por ejemplo `CIP-FRONTEND`. El valor pasa por el sandbox de workspace:
+una ruta absoluta, traversal o junction externa se rechaza y nunca crea un root nuevo.
+Las rutas de archivos continúan expresándose respecto al workspace padre; por ejemplo,
+`paths: ["CIP-FRONTEND/README.md"]` junto a `repositoryPath: "CIP-FRONTEND"`.
+
 Esto exige dos traducciones cuando el workspace autorizado es un **subdirectorio** de un
 repositorio mayor (caso normal), verificadas en la Fase 4:
 
@@ -522,7 +559,7 @@ quedarse colgado hasta el timeout.
 
 ### 8.1 `git.status`
 
-**Entrada:** `{ "workspaceId": "ws_7f3a91" }`
+**Entrada:** `{ "workspaceId": "ws_7f3a91", "repositoryPath": "CIP-FRONTEND" }`
 
 **Salida:** rama actual, upstream, adelanto/retraso y lista de archivos con su estado
 (rutas relativas).
@@ -532,7 +569,7 @@ quedarse colgado hasta el timeout.
 **Entrada:**
 
 ```json
-{ "workspaceId": "ws_7f3a91", "filePath": "src/index.ts", "staged": false, "maxBytes": 65536 }
+{ "workspaceId": "ws_7f3a91", "repositoryPath": "CIP-FRONTEND", "filePath": "CIP-FRONTEND/src/index.ts", "staged": false, "maxBytes": 65536 }
 ```
 
 `filePath` opcional; si se omite, diff del working tree completo. Salida truncada con
@@ -540,13 +577,14 @@ quedarse colgado hasta el timeout.
 
 ### 8.3 `git.log`
 
-**Entrada:** `{ "workspaceId": "ws_7f3a91", "maxCount": 20, "filePath": "src/index.ts" }`
+**Entrada:** `{ "workspaceId": "ws_7f3a91", "repositoryPath": "CIP-FRONTEND", "maxCount": 20, "filePath": "CIP-FRONTEND/src/index.ts" }`
 
 `maxCount` acotado (máximo 100). Salida: hash corto, autor, fecha ISO y asunto.
 
 ### 8.4 `git.branch`
 
-**Entrada:** `{ "workspaceId": "ws_7f3a91" }` — lista de ramas locales y cuál es la actual.
+**Entrada:** `{ "workspaceId": "ws_7f3a91", "repositoryPath": "CIP-FRONTEND" }` — lista
+de ramas locales y cuál es la actual.
 
 **Errores de las cuatro:** `GIT_NOT_REPOSITORY`, `CAPABILITY_DISABLED`, `TIMEOUT`, más los
 de workspace. `git.diff` y `git.log` añaden los de ruta (`PATH_DENIED`,
@@ -572,8 +610,8 @@ cadena Git ni un flag. **Nunca hay forma de forzar nada**: no existe un parámet
 en ninguna de las tres, ni `--force`, ni `--force-with-lease`, ni `reset --hard`, ni `clean`
 destructivo — es una ausencia en el código, no una validación en tiempo de ejecución.
 
-`git.commit` y `git.push` exigen **aprobación humana**. El modo predeterminado usa el
-protocolo multi-round-trip (MRTR, revisión 2026-07-28): la primera llamada devuelve un resultado `input_required` con
+`git.commit` y `git.push` exigen **aprobación humana**. El modo MRTR (revisión 2026-07-28)
+hace que la primera llamada devuelva un resultado `input_required` con
 el contenido real de lo que se va a hacer (mensaje del commit, archivos, diff; o remoto,
 rama y los commits que se publicarían), el cliente MCP se lo muestra al humano, y solo si
 acepta se reintenta la llamada y se aplica la mutación. La aprobación está atada
@@ -582,12 +620,15 @@ criptográficamente (HMAC, `createRequestStateCodec` del SDK) al contenido exact
 `git.push`, ni para otro workspace; si algo cambia entre pedir la aprobación y reintentar,
 falla con `APPROVAL_INVALID` en vez de ejecutarse con datos obsoletos.
 
-El modo explícito `host` para ChatGPT permite que el cliente muestre
-su cuadro nativo antes de invocar y LocalBridge no añade una segunda ronda MRTR. No es una
-aprobación inferida: `mrtr` sigue siendo el valor predeterminado y todo valor inválido cae
-a él. El modo `host` conserva el permiso `gitWrite`, el estado exacto, el hardening y las
-aprobaciones separadas de commit/push; su límite es que LocalBridge no recibe prueba
-criptográfica del botón del host.
+Una instalación nueva de la app de escritorio guarda explícitamente el modo `host` para
+ChatGPT. El cliente aplica su política de aprobación antes de entregar la llamada; una
+petición explícita del usuario puede autorizarla sin mostrar un cuadro adicional. Una vez
+recibida, LocalBridge ejecuta una sola vez y no añade una segunda ronda MRTR. No es una
+aprobación inferida por el servidor: una instancia sin la preferencia de escritorio, un
+archivo existente sin el campo y todo valor inválido caen a `mrtr`. Cambiar la preferencia
+exige reconectar; la UI muestra valor guardado y efectivo. El modo `host` conserva el permiso
+`gitWrite`, el estado exacto y el hardening; su límite es que LocalBridge no recibe prueba
+criptográfica de cómo autorizó la llamada el host.
 
 En modo MRTR, mientras esa primera ronda espera, LocalBridge muestra **“Esperando aprobación en
 ChatGPT”** durante cinco minutos desde la última primera ronda. Los reintentos
@@ -601,9 +642,13 @@ no hace commit ni push.
 
 **Sin aprobación** — local y reversible con un `git reset` corriente.
 
-**Entrada:** `{ "workspaceId": "ws_7f3a91", "paths": ["src/index.ts", "README.md"] }`
+**Entrada:**
 
-**Salida:** `{ "staged": ["src/index.ts", "README.md"] }`
+```json
+{ "workspaceId": "ws_7f3a91", "repositoryPath": "CIP-FRONTEND", "paths": ["CIP-FRONTEND/src/index.ts", "CIP-FRONTEND/README.md"] }
+```
+
+**Salida:** `{ "staged": ["CIP-FRONTEND/src/index.ts", "CIP-FRONTEND/README.md"] }`
 
 Cada ruta pasa por el mismo sandbox que `file.read` (debe existir, resolver dentro del
 workspace, no ser un symlink de escape) y por la denylist de secretos antes de llegar a
@@ -623,7 +668,7 @@ ejecuta programas implícitos definidos por el repositorio.
 **Con aprobación**, siempre: MRTR firmado o cuadro nativo del host según la configuración
 local explícita.
 
-**Entrada:** `{ "workspaceId": "ws_7f3a91", "message": "fix: ...", "operationId": "op_a91f3c" }`
+**Entrada:** `{ "workspaceId": "ws_7f3a91", "repositoryPath": "CIP-FRONTEND", "message": "fix: ...", "operationId": "op_a91f3c" }`
 
 **Salida:** `{ "commitHash": "7cf5dbd1..." }`
 
@@ -633,10 +678,10 @@ Tras aprobar se crea ese objeto con `commit-tree` y la rama avanza con un compar
 de `update-ref`; si otro proceso movió la rama, devuelve `APPROVAL_INVALID`. Nunca ejecuta
 hooks de commit, `reference-transaction` ni firma GPG, y nunca usa `--amend`.
 
-El workspace debe coincidir con la raíz del repositorio. Un subdirectorio autorizado no
-puede commitear porque el índice Git es global y podría contener cambios externos. Una
-ruta staged que coincida con la denylist también bloquea el commit aunque otro programa
-la haya añadido al índice.
+El sub-scope elegido por `repositoryPath` debe coincidir con la raíz del repositorio y
+permanecer dentro del workspace autorizado. Su índice completo queda entonces dentro de la
+autoridad original. Una ruta staged que coincida con la denylist también bloquea el commit
+aunque otro programa la haya añadido al índice.
 
 El mensaje está limitado a 4096 caracteres. `operationId` es opcional y actúa igual que en `file.create`/`file.write_guarded`: repetir
 el mismo valor tras una conexión rota devuelve el resultado ya aplicado en vez de crear un
@@ -651,7 +696,7 @@ segundo commit — y no obliga a pedir aprobación otra vez.
 publicar. Aprobar un commit no aprueba su push: son efectos distintos, uno local y uno
 fuera de la máquina.
 
-**Entrada:** `{ "workspaceId": "ws_7f3a91", "remote": "origin", "branch": "main", "operationId": "op_a91f3c" }`
+**Entrada:** `{ "workspaceId": "ws_7f3a91", "repositoryPath": "CIP-FRONTEND", "remote": "origin", "branch": "main", "operationId": "op_a91f3c" }`
 
 `remote`/`branch` se proporcionan juntos o se omiten juntos; al omitirlos LocalBridge
 resuelve el upstream configurado antes de pedir aprobación. Esta queda atada a remoto,
@@ -689,11 +734,11 @@ Un rechazo del remoto (rama no fast-forward, protegida, etc.) es `GIT_PUSH_REJEC
 
 El push desactiva hooks y `core.fsmonitor`, ignora helpers de credenciales locales al repo,
 restaura solo helpers de sistema/usuario y rechaza remote helpers, protocolos desconocidos,
-múltiples push URLs y reescrituras URL locales. El workspace también debe ser la raíz del
-repo. La salida nunca devuelve la URL ni el texto crudo de Git. El hash publicado se
+múltiples push URLs y reescrituras URL locales. El sub-scope seleccionado también debe ser
+la raíz del repo. La salida nunca devuelve la URL ni el texto crudo de Git. El hash publicado se
 registra también como recurso de auditoría.
 
-**Errores:** `APPROVAL_DECLINED`, `APPROVAL_INVALID`, `GIT_PUSH_REJECTED`, más
+**Errores:** `APPROVAL_DECLINED`, `APPROVAL_INVALID`, `GIT_PUSH_REJECTED`, `GIT_PUSH_UNCERTAIN`, más
 `GIT_NOT_REPOSITORY`, `CAPABILITY_DISABLED` y los de workspace.
 
 ---
@@ -831,7 +876,8 @@ Errores: `APPLICATION_PROFILE_NOT_FOUND`, `APPLICATION_REVIEW_REQUIRED`,
 | `browser.list` | R2 | — | sesiones del workspace |
 | `browser.navigate` | R3 | `sessionId`, `path`, `operationId?` | estado y ruta relativa |
 | `browser.snapshot` | R2 | `sessionId`, límites | árbol de accesibilidad y refs opacas |
-| `browser.screenshot` | R2 | `sessionId` | imagen PNG + dimensiones |
+| `browser.screenshot` | R2 | `sessionId` | PNG efímero o JPEG acotado de transporte, dimensiones y fallback |
+| `browser.screenshot.save` | R3 | `sessionId`, workspace, ruta `.png` relativa, `operationId` | PNG nuevo con hash, tamaño y dimensiones |
 | `browser.viewport` | R2 | `sessionId`, `width` 320-3840, `height` 320-2160, `mobile?`, `operationId?` | viewport aplicado |
 | `browser.events` | R2 | `sessionId`, cursor/límite | consola y estado de red sin cuerpos/cabeceras |
 | `browser.stop` | R3 | `sessionId`, `operationId?` | estado final |
@@ -850,8 +896,16 @@ WebSocket; `wss`, credenciales y cualquier autoridad distinta se deniegan.
 redimensiona la ventana del usuario, no navega, no cambia el origen permitido y no altera el
 agente de usuario ni la escala del dispositivo. Acepta únicamente dimensiones enteras dentro
 del rango indicado y una bandera táctil. Invalida el snapshot vigente, porque tras el
-recálculo del diseño las referencias de elementos dejan de ser válidas; el tamaño se
-restablece cuando el usuario toma el control local.
+recálculo del diseño las referencias de elementos dejan de ser válidas. El control humano
+usa el tamaño físico de su ventana; al devolverlo se reaplica el viewport lógico anterior.
+Los navegadores nacidos de un listener de proceso o terminal usan 1920×1080 por defecto;
+un perfil configurado explícitamente conserva su valor.
+
+`browser.screenshot.save` exige `browserRead` y `write`. Un único lock de autoridad confirma
+el mismo workspace observado antes de capturar y cubre la creación del PNG. Solo acepta una
+ruta relativa nueva y devuelve SHA-256 sin exponer la ruta absoluta ni los bytes por el
+broker. La captura inline usa JPEG únicamente si el PNG excedería el frame privado; la
+evidencia guardada conserva PNG sin pérdida.
 
 Una aplicación multiservicio contiene entre 1 y 8 aliases configurados localmente. En el
 flujo `v0.5.0`, MCP aporta únicamente `applicationId` + `runId`; Electron recupera las refs
@@ -870,12 +924,23 @@ cookies ni cuerpos.
 | `browser.click` | R4 | `sessionId`, `snapshotId`, `elementRef`, `operationId?` |
 | `browser.fill` | R4 | lo anterior + `text` |
 | `browser.press` | R4 | lo anterior + una tecla de allowlist |
+| `browser.hover` | R4 | referencia opaca visible y `operationId?` |
+| `browser.scroll` | R4 | dirección, cantidad acotada y `operationId?` |
+| `browser.select` | R4 | referencia de `select`, valor y `operationId?` |
+| `browser.drag` | R4 | dos referencias del mismo snapshot y `operationId?` |
+| `browser.dialog` | R4 | `accept` o `dismiss`, `operationId?` |
+| `browser.assert` | R2 | condición tipada |
+| `browser.wait` | R2 | condición tipada y timeout de hasta 30 s |
 
 **Permisos:** `browserRead` + `browserInteract`. No existen selectores CSS/XPath,
 coordenadas, JavaScript aportado por el modelo ni secuencias de teclas arbitrarias. Las referencias
 solo son válidas para el snapshot vigente y se invalidan después de cada acción. `fill`
 rechaza password, file, hidden, OTP, tokens y campos de pago; su texto no se registra en
-auditoría. Los `operationId` hacen idempotente un reintento de transporte.
+auditoría. Los `operationId` hacen idempotente un reintento de transporte. Click, hover y
+drag validan visibilidad, estado y oclusión antes de actuar. Assert/wait aceptan solo
+condiciones cerradas de ruta, título, texto, elemento, respuesta, errores de consola o
+diálogo; nunca selectores o JavaScript aportados por MCP. `browser.snapshot` devuelve
+`truncated` cuando sus límites omiten parte del árbol.
 
 Errores específicos: `FEATURE_UNAVAILABLE`, `PROFILE_NOT_FOUND`,
 `PROFILE_SOURCE_MISSING`, `PROFILE_SOURCE_INVALID`, `PROFILE_STALE`,
@@ -929,13 +994,16 @@ descubrir las tools vigentes.
 
 | Tool | Riesgo | Entrada | Resultado acotado |
 |---|---:|---|---|
-| `project.list` | R1 | `{}` | IDs opacos, nombre, estado, cobertura del escaneo y cantidades |
+| `project.list` | R1 | `{}` | IDs opacos, estado, cobertura y disponibilidad efectiva de terminal |
 | `project.status` | R1 | `projectId` | topología/estado, cantidades y recuperación sugerida |
 | `project.setup.refresh` | R2 | `projectId` | nuevo análisis local y estado, sin ejecutar |
 
 Las salidas nunca contienen roots, rutas absolutas, comandos, argumentos, entorno,
 manifiestos, lockfiles, paquetes, dependencias, URLs, puertos ni huellas de toolchain.
-Los campos desconocidos se rechazan.
+Los campos desconocidos se rechazan. `execution` informa el modo de confianza efectivo,
+`terminalAvailable` y un motivo acotado cuando está bloqueada: proyecto no listo, confianza
+ausente/revocada, otro equipo, modo guiado o sandbox no disponible. Es diagnóstico, no una
+concesión de autoridad.
 
 `state` y `scanCoverage` describen la ficha local. `scanCoverage: "partial"` significa que
 la estructura reportada está incompleta porque el recorrido local agotó su presupuesto;
@@ -973,9 +1041,15 @@ La terminal general se expresa mediante una máquina de sesiones y no mediante u
 `shell.execute`. El nivel de confianza, root, shell, entorno y sandbox se resuelven
 localmente desde el proyecto. MCP solo usa IDs opacos.
 
+La terminal no se usa como sustituto de una tool estructurada. En particular, status,
+diff, log, ramas, stage, commit y push siempre pasan por `git.*`; los proyectos multi-repo
+usan `repositoryPath`. Esto conserva los límites, el hardening y la auditoría específica de
+Git incluso cuando el proyecto tiene confianza `full-host`.
+
 | Tool | Entrada principal | Resultado | Riesgo |
 |---|---|---|---|
 | `terminal.start` | `projectId`, `operationId` | sesión, estado y confianza efectiva | R6 |
+| `terminal.list` | `projectId` | sesiones retenidas de ese proyecto | R1 |
 | `terminal.write` | `projectId`, `sessionId`, texto/teclas, `operationId` | cursor aceptado | R6 |
 | `terminal.read` | `projectId`, `sessionId`, cursor, límite | salida incremental acotada | R1 |
 | `terminal.status` | `projectId`, `sessionId` | estado y exit code | R1 |
@@ -990,10 +1064,14 @@ ejecutables, variables de entorno completas ni un trust mode en parámetros.
 Concurrencia: hasta **8 sesiones por proyecto y 16 en total**; superarlo responde
 `RATE_LIMITED`. El techo es fijo y ninguna tool puede elevarlo. Una sesión terminada conserva
 su salida final durante 30 minutos o hasta que haya 24 sesiones cerradas retenidas; después,
-`terminal.read` responde `TERMINAL_NOT_FOUND`. Cerrar cada terminal al acabar sigue siendo
+`terminal.read` responde `TERMINAL_NOT_FOUND`. `terminal.list` vuelve a comprobar la
+confianza local y permite que un cliente reconectado redescubra esas sesiones sin PID, root,
+entorno ni historial de comandos. El listado, la lectura, el estado y los listeners quedan
+ligados al root y a la aprobación exactos con los que nació la sesión; una revisión o cambio
+de confianza oculta el output retenido. Cerrar cada terminal al acabar sigue siendo
 responsabilidad del cliente.
 
-### 14.1 `browser.start` desde un proyecto multiservicio
+### 15.1 `browser.start` desde un proyecto multiservicio
 
 La variante terminal admite un listener principal y hasta siete secundarios:
 
@@ -1020,12 +1098,257 @@ Errores específicos: `PROJECT_BROWSER_LISTENER_MISMATCH`,
 `PROJECT_BROWSER_ORIGIN_CONFLICT`, `PROJECT_BROWSER_PRIMARY_UNAVAILABLE`,
 `LOCALHOST_ATTESTATION_FAILED`, `MANAGED_WILDCARD_NOT_APPROVED` y `LISTENER_STALE`.
 
-## 16. Tools explícitamente no incluidas
+## 16. Navegador de Internet aislado (`v1.4.0`)
+
+Esta familia es independiente de `browser.*`: usa perfiles web creados y habilitados en la
+UI local, no permisos de un proyecto. Los IDs empiezan por `webprofile_`, `websession_`,
+`webtab_`, `websnapshot_`, `webelement_` o `webresource_` y no pueden cruzarse con los del
+navegador de desarrollo. El catálogo completo tiene **84 tools**: las 57 anteriores,
+`browser.screenshot.save`, 24 `web.*`, `document.read` y `visual.compare`.
+
+| Tool | Riesgo | Entrada | Resultado acotado |
+|---|---:|---|---|
+| `web.profiles` | R1 | `{}` | perfiles y capacidades efectivas; no crea autoridad |
+| `web.start` | R3 | `webProfileId`, `operationId?` | sesión y pestaña inicial efímeras |
+| `web.list` | R1 | `{}` | sesiones activas redescubribles |
+| `web.stop` | R3 | `sessionId`, `operationId?` | sesión cerrada y almacenamiento limpiado |
+| `web.tabs` | R2 | `sessionId` | pestañas activas, viewport y contadores de efectos nativos bloqueados |
+| `web.open` | R3 | `sessionId`, URL HTTPS, `operationId?` | pestaña administrada nueva |
+| `web.close` | R2 | sesión, pestaña, `operationId?` | pestaña cerrada |
+| `web.navigate` | R3 | sesión, pestaña, URL HTTPS, `operationId?` | destino final y estado |
+| `web.back` | R2 | sesión, pestaña, `operationId?` | estado tras volver |
+| `web.snapshot` | R2 | sesión, pestaña, profundidad/elementos | accesibilidad y refs opacas vigentes |
+| `web.screenshot` | R2 | sesión, pestaña | PNG efímero o JPEG acotado de transporte, dimensiones y fallback |
+| `web.screenshot.save` | R4 | sesión, pestaña, workspace, ruta `.png` relativa, `operationId` | PNG nuevo con hash, fuente y dimensiones |
+| `web.extract` | R2 | sesión, pestaña, `maxChars` | texto, fuente, consulta, truncado y refs de recursos |
+| `web.assets` | R2 | sesión, pestaña, `maxAssets` | refs opacas de imágenes, vídeos, posters, fuentes y CSS |
+| `web.viewport` | R2 | sesión, pestaña, dimensiones, `mobile?`, `operationId?` | viewport lógico aplicado |
+| `web.download` | R4 | sesión, pestaña, `resourceRef`, workspace, ruta relativa, `operationId` | archivo nuevo, hash, MIME y fuente |
+| `web.click` | R4 | sesión, pestaña, snapshot/ref, `operationId?` | efecto observado o `effect_pending` e invalidación |
+| `web.fill` | R4 | sesión, pestaña, snapshot/ref, texto, `operationId?` | efecto; campos sensibles bloqueados |
+| `web.select` | R4 | sesión, pestaña, snapshot/ref, valor, `operationId?` | selección e invalidación |
+| `web.scroll` | R2 | sesión, pestaña, dirección/cantidad, `operationId?` | desplazamiento e invalidación |
+| `web.press` | R4 | sesión, pestaña, snapshot/ref, tecla de enum, `operationId?` | tecla e invalidación |
+| `web.wait` | R2 | sesión, pestaña, condición tipada, timeout | condición satisfecha o `TIMEOUT` |
+| `web.human.request` | R5 | sesión, `sign_in | file_selection | manual_step`, `operationId` | reserva opaca y caducidad |
+| `web.human.status` | R2 | sesión | estado de la transferencia |
+
+`public-research` solo navega HTTPS público. `site-account` limita navegación a destinos
+locales y permite autenticación humana. Toda conexión pasa por proxy CONNECT con DNS/IP y
+revisión revalidados; HTTP, IP literal, red privada, metadata, puertos alternativos,
+descarga directa de página y permisos Chromium se deniegan. Los popups permitidos se
+transforman en pestañas administradas.
+
+Snapshots y recursos caducan al navegar o actuar. Cada pestaña admite un escritor. Un
+reintento con el mismo `operationId` y misma intención devuelve el resultado anterior; una
+colisión devuelve `IDEMPOTENCY_CONFLICT`; si el efecto pudo ocurrir sin respuesta devuelve
+`WEB_EFFECT_UNCERTAIN` y no se repite. Durante la transferencia humana, todas las tools de
+observación y acción fallan con `HUMAN_CONTROL_ACTIVE`; solo status y stop siguen accesibles.
+
+Si el intervalo acotado no permite demostrar navegación, diálogo o descarga, `web.click`
+devuelve `effect_pending`: confirma el despacho, no el resultado remoto. El agente debe
+observar con `web.wait`, `web.tabs` o un snapshot nuevo antes de decidir. `web.tabs` publica
+contadores acumulados de descargas, selectores de archivo y diálogos bloqueados, incluidos
+los que aparecen después de la respuesta inicial.
+
+`web.download` no acepta URL. Solo una referencia emitida por `web.extract` o `web.assets`,
+un tipo documental, imagen, vídeo, fuente o CSS admitido y un workspace con `write`.
+Verifica extensión, MIME, firma, cuota, redirects y ambas autoridades, crea exclusivamente
+y nunca abre o ejecuta el archivo. SVG se deniega por completo. Las URLs visibles de
+recursos omiten consulta y fragmento, y solo se materializa una descarga pesada a la vez.
+Cada redirect HTTPS se valida antes de seguirlo; una respuesta de Electron sin URL final
+usa la URL observada cuando no hubo redirect. El audit conserva workspace, destino relativo,
+MIME y tamaño, nunca bytes, query ni contenido.
+
+Toda pestaña nace con render 1920×1080. `web.viewport` puede cambiarlo dentro de 320×320 a
+3840×2160 y la selección sobrevive a una intervención humana. El visor físico se ajusta al
+monitor sin modificar el render. `web.screenshot.save` siempre conserva PNG sin pérdida;
+el fallback JPEG existe únicamente para transportar una captura inline que excedería el
+frame privado. Los rechazos deterministas al crear el PNG, incluido `FILE_TOO_LARGE`,
+conservan su código al cruzar el broker. En la aplicación, `maxFileBytes` sigue en 1 MiB de
+forma predeterminada para operaciones ordinarias. La descarga web usa otra autoridad
+local: los perfiles nuevos proponen 1 GiB por asset y 10 GiB acumulados; los existentes
+conservan su selección. Los bytes llegan por chunks a staging y solo se publican después de validar
+tipo, firma y hash.
+
+Errores específicos: `WEB_SESSION_NOT_FOUND`, `WEB_TAB_NOT_FOUND`,
+`WEB_DESTINATION_BLOCKED`, `WEB_NAVIGATION_FAILED`, `WEB_RESOURCE_NOT_FOUND`,
+`WEB_DOWNLOAD_BLOCKED`, `WEB_DOWNLOAD_QUOTA_EXCEEDED`, `WEB_MEDIA_TYPE_UNSUPPORTED`,
+`WEB_MEDIA_TYPE_MISMATCH`, `WEB_DOWNLOAD_EMPTY`, `WEB_CAPTURE_FAILED`, `WEB_CAPTURE_TOO_LARGE`,
+`HUMAN_ACTION_REQUIRED`, `WEB_EFFECT_UNCERTAIN`, `ELEMENT_NOT_INTERACTABLE`,
+`STALE_SNAPSHOT`, `PROFILE_REVIEW_REQUIRED` y los errores de control humano.
+
+### 16.1 Vista local de actividad web (`v1.4.1`)
+
+La aplicación puede mostrar la misma pestaña administrada en una ventana nativa pasiva,
+seguir la última acción, fijar una pestaña y moverla a un monitor elegido. Es una función
+de la UI local: no añade tools, permisos ni campos a los contratos anteriores. Observar usa
+el permiso `read` efectivo del perfil. Ocultar o cerrar la ventana visual no ejecuta
+`web.close` ni `web.stop`; el control humano la retira y la devolución la deja oculta.
+
+### 16.2 Actividad y continuidad (`v1.5.0`)
+
+La UI local muestra `browser.*` y `web.*` en una sola Actividad, sin convertir una familia
+en la otra. Tomar, cambiar pestaña, devolver, recordar hostname y alternar visores son IPC
+locales, no tools MCP. Una sesión pública devuelta puede informar opcionalmente
+`delegatedSite` y `delegatedExpiresAt`; ambos describen una concesión exacta en memoria y no
+un permiso nuevo del perfil. El broker privado usa revisión 15 y el catálogo contiene
+**84 tools**.
+
+Para continuar trabajo, el agente consulta `web.list` y después `web.tabs` antes de
+`web.start`. `web.stop` se usa ante petición explícita, política o limpieza inequívoca; no
+es el cierre rutinario de cada respuesta cuando la continuación sea razonable. Una petición
+de conservar localhost también conserva la aplicación o terminal propietaria de su listener.
+
+## 17. Lectura documental (`v1.4.0`)
+
+| Tool | Riesgo | Entrada | Resultado |
+|---|---:|---|---|
+| `document.read` | R2 | `workspaceId`, ruta PDF relativa, `pages?`, `maxChars?` | ruta, SHA-256, tamaño, mtime, páginas, texto, truncado y advertencias |
+
+Requiere `read`. El archivo pasa por los mismos guards de ruta y denylist que `file.read`,
+con máximo 25 MiB. El worker PDF no recibe una ruta ni tiene filesystem/red; admite hasta
+50 páginas y 200.000 caracteres, tiene timeout y límites de memoria, no ejecuta JavaScript,
+abre adjuntos, sigue enlaces ni aplica OCR. PDFs cifrados, activos, malformados o sin texto
+útil fallan de forma explícita.
+
+## 18. Comparación visual (`v1.5.0`)
+
+| Tool | Riesgo | Entrada | Resultado |
+|---|---:|---|---|
+| `visual.compare` | R3 | workspace, PNG de referencia, PNG candidato, ruta `.png` de diff, `operationId` | hashes, dimensiones, píxeles distintos, proporción y diff nuevo |
+
+Requiere `read` y `write` en el mismo workspace. Las tres rutas son relativas; las dos
+entradas deben ser PNG válidos de igual tamaño y no superar 2560×1440. Solo se ejecuta una
+comparación a la vez. Un lock de autoridad común cubre las dos lecturas, el cálculo y la
+creación exclusiva del diff; una revocación o cambio de root no puede intercalarse.
+
+## 19. Movimiento y comparación temporal (`v1.6.0`)
+
+El catálogo completo contiene **89 tools** y el broker privado usa revisión **16**. Las
+cinco tools son aditivas y conservan separadas las autoridades de Internet, desarrollo y
+filesystem.
+
+| Tool | Riesgo | Entrada | Resultado acotado |
+|---|---:|---|---|
+| `web.motion.inspect` | R2 | sesión web, pestaña, máximo de animaciones | viewport, scroll, capacidades, animaciones sanitizadas, sticky y omisiones |
+| `browser.motion.inspect` | R2 | workspace, sesión local, máximo de animaciones | el mismo inventario bajo `browserRead` |
+| `web.motion.capture` | R4 | sesión/pestaña, workspace, ruta `.lbmotion`, trayectoria, modo, `operationId` | manifiesto, 3–24 frames, hoja de contacto y recibo; exige `download` web + `write` |
+| `browser.motion.capture` | R4 | workspace/sesión, ruta `.lbmotion`, trayectoria, modo, `operationId` | bundle equivalente bajo `browserRead` + `write` |
+| `visual.motion.compare` | R3 | workspace, dos `manifest.json`, salida `.lbmotion`, umbral, `operationId` | diff por frame, promedio, máximo, peor muestra, hoja y reporte |
+
+La trayectoria solo admite scroll vertical del documento, 250–10.000 ms y 3–24 muestras.
+No acepta URL, selector, XPath, JavaScript, root ni ruta absoluta. `stepped` se declara
+`sampled`; `screencast` usa scroll continuo, ack inmediato y descarte contabilizado. Los
+frames se escriben uno a uno en staging, nunca cruzan MCP/broker, y el destino aparece
+completo mediante rename o no aparece. La comparación exige viewport y vector de progreso
+idénticos y valida cada hash antes de decodificar.
+
+El modo local **Encajar | 1:1**, sus métricas, pan y cancelación son IPC de la UI; no
+añaden tools ni permisos. El selector vive en Actividad para conservar pasiva y no
+interactiva la barra de la ventana observada.
+
+### 19.1 Corrección de fiabilidad (`v1.6.1`)
+
+El broker privado usa revisión **17** y puede transportar un `causeCode` opcional únicamente
+si pertenece al catálogo estable. La captura temporal hace preflight de frame, hoja y total
+estimado antes de desplazar. `web.navigate` devuelve códigos web estables y registra un
+diagnóstico sin URL ni contenido.
+
+`web.download` conserva su entrada MCP: referencia opaca, workspace y ruta relativa. Las
+cuotas solo se editan localmente; no forman parte del schema de la tool. El guardado por
+chunks conserva una descarga pesada global, timeout, reserva de disco, doble autoridad,
+creación exclusiva y rollback.
+
+### 19.2 Pulido de contratos y assets (`v1.6.2`)
+
+El broker privado usa revisión **18**. `web.tabs`, `web.open`, `web.navigate` y
+`web.close` validan el mismo resumen compartido, incluidos el progreso/recibo temporal y
+la presentación Encajar/1:1. El catálogo conserva **89 tools**.
+
+El límite de texto no limita assets administrados. Descarga, metadata, move, delete y
+stage procesan binarios mediante rutas resueltas y streaming, con techo interno de 1 GiB;
+lectura, creación y parche ordinarios conservan `maxFileBytes`. Los bundles temporales
+reservan capacidad antes del scroll, admiten hasta 1 GiB total, 256 MiB por archivo y
+guardan 512 MiB libres.
+
+`web.assets` puede informar el MIME observado y sugerir la extensión verificada.
+`web.download` admite AVIF y MOV, normaliza solo el nombre final y devuelve la ruta que
+realmente creó. Puede devolver `WEB_DOWNLOAD_QUOTA_EXCEEDED`,
+`WEB_MEDIA_TYPE_UNSUPPORTED`, `WEB_MEDIA_TYPE_MISMATCH`, `WEB_DOWNLOAD_EMPTY` o
+`WEB_RESOURCE_NOT_FOUND`; todos son recuperables sin relajar rutas, firmas ni permisos.
+Movimiento usa 60 segundos internos y 75 segundos de transporte; descarga dispone de
+diez minutos de red y 10,5 minutos en el broker. Ningún timeout es configurable por MCP.
+
+### 19.3 Lectura visual de documentos (`v1.6.3`)
+
+El catálogo contiene **91 tools**. Las dos nuevas operaciones son de solo lectura y no
+alteran el broker privado revisión 18.
+
+| Tool | Riesgo | Entrada | Resultado acotado |
+|---|---:|---|---|
+| `document.render` | R2 | workspace, PDF relativo, 1–4 páginas, detalle, `expectedSha256?` | bloques `text/image` en orden, hash, páginas, dimensiones, MIME, renderer, fallback y advertencias |
+| `image.read` | R2 | workspace, PNG/JPEG/WebP relativo, detalle, `expectedSha256?` | bloque `image`, hash, dimensiones, MIME fuente/salida y fallback |
+
+`document.read` añade, sin cambiar entradas, `pageSummaries`, `recommendedMode`,
+`hasMorePages` y `nextPage`. Procesa hasta 50 páginas por llamada; una página sin capa de
+texto conduce a `document.render`. Los PDF usan rangos y hash streaming hasta 250 MiB.
+Standard limita el lado largo a 1600 px/8 MP y High a 2400 px/12 MP; cada imagen queda
+bajo 2 MiB y una respuesta bajo 6 MiB. El worker no recibe rutas ni ejecuta contenido
+activo. PNG, JPEG y WebP están demostrados; AVIF, GIF, SVG, Office y video no forman parte
+de estas dos tools.
+
+Desde la corrección de v1.7.0, `document.render` usa PDFium para fuentes de hasta 64 MiB y
+declara `renderer: pdfium`. Si PDFium falla o la fuente es mayor, usa PDF.js por rangos,
+declara `renderer: pdfjs` y añade `pdfium-render-fallback` cuando hubo un fallo. Este cambio
+no altera la entrada MCP, la autorización ni el máximo fuente.
+
+`web.download` devuelve `analysisRequired` y, para formatos compatibles,
+`suggestedTool`. Guardar un recurso no significa haberlo procesado. Las instrucciones del
+servidor exigen reconciliar cada archivo, citar página y declarar muestras o fallos sin
+usar terminal como conversor de formatos admitidos.
+
+### 19.4 Trabajos y artefactos grandes (`v1.7.0`)
+
+El catálogo contiene **100 tools** y el broker privado usa revisión **19**. Las nueve
+operaciones son aditivas; las 91 anteriores conservan orden, entrada y salida.
+
+| Tool | Riesgo | Entrada | Resultado |
+|---|---:|---|---|
+| `analysis.list` | R1 | workspace, cursor y límite | trabajos recientes recuperables del workspace |
+| `analysis.status` | R1 | workspace, `jobId`, cursor y máximo de elementos | etapa, progreso, cobertura, efecto, recuperación y página acotada |
+| `analysis.cancel` | R3 | workspace y `jobId` | recibo del trabajo objetivo; no detiene recursos ajenos |
+| `artifact.inspect` | R2 | workspace, ruta relativa y `operationId` | firma, tipo, tamaño e inspector recomendado |
+| `artifact.hash` | R2 | workspace, ruta relativa y `operationId` | SHA-256 incremental y cobertura completa |
+| `artifact.text.read` | R2 | workspace, ruta, `operationId`, cursor firmado y caracteres | texto UTF-8/UTF-16 acotado y próximo cursor |
+| `binary.inspect` | R2 | workspace, ruta, `operationId` y profundidad | PE pasivo: headers, secciones, imports, exports, mitigaciones, strings, firma presente y hashes opcionales |
+| `document.process` | R2 | workspace, PDF relativo, `operationId` y modo read/render | texto o hasta cuatro imágenes con cobertura por páginas |
+| `web.download.start` | R4 | sesión/pestaña/recurso opacos, workspace, ruta relativa y `operationId` | job de descarga y recibo de publicación atómica |
+
+Los trabajos se admiten con recibo rápido, se ejecutan con concurrencia global y por
+workspace acotadas y se redescubren tras reconectar. Diez llamadas con el mismo
+`operationId` e intención producen un solo job; reutilizarlo con otra intención devuelve
+`IDEMPOTENCY_CONFLICT`. Tras un crash, un efecto iniciado queda `uncertain` y nunca se
+repite automáticamente; un efecto aplicado conserva su recibo.
+
+El journal privado guarda exclusivamente metadata, progreso, cobertura y recibos. Texto,
+imágenes y binarios permanecen en memoria acotada mientras Desktop vive. Al reiniciar,
+`analysis.status` indica si corresponde reiniciar el análisis o consultar solo el recibo.
+
+La política local `largeArtifacts` admite `standard`, `custom` y `adaptive`. Adaptive no
+impone un techo fijo al tamaño de la fuente, pero mantiene límites de rango, memoria,
+respuesta, worker, concurrencia, tiempo y reserva de disco. Esa política nunca forma parte
+de una entrada MCP. La transferencia web usa una política local separada y cambiar una
+cuota de consumo no cambia la autoridad ni cierra sesiones activas.
+
+## 20. Tools explícitamente no incluidas
 
 | Tool | Motivo |
 |---|---|
 | `claim.*` | Coordinación multiagente no disponible |
 | `agent.*` | Ciclo de vida de agentes no disponible |
+| `web.upload` | Las subidas requieren otro contrato de transmisión y autoridad |
+| `desktop.*`, control global de teclado/ratón | Control de aplicaciones Windows aplazado |
 | `workspace.add`, `workspace.setPermissions` | **Nunca vía MCP.** El modelo no amplía su propio acceso |
 
 La última fila es la más importante: la autorización de workspaces y la concesión de

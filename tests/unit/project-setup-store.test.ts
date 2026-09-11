@@ -8,6 +8,7 @@ import {
   createProjectSetupSession,
   interruptProjectSetupSessions,
   listProjectSetupSessions,
+  removeProjectSetupSessions,
   updateProjectSetupSession,
 } from "@localbridge/desktop-core";
 
@@ -39,5 +40,17 @@ describe("project setup store v1", () => {
 
     expect(interrupted?.phase).toBe("interrupted");
     expect(interrupted?.errorCode).toBe("SETUP_INTERRUPTED");
+  });
+
+  it("elimina todas las sesiones de una ficha y conserva las demás", async () => {
+    const file = await storePath();
+    const target = `project_${"c".repeat(24)}`;
+    const survivor = `project_${"d".repeat(24)}`;
+    await createProjectSetupSession(file, target, "ws_target", "restricted");
+    await createProjectSetupSession(file, survivor, "ws_survivor", "restricted");
+
+    expect(await removeProjectSetupSessions(file, target)).toBe(1);
+    expect(await removeProjectSetupSessions(file, target)).toBe(0);
+    expect((await listProjectSetupSessions(file)).map((session) => session.projectId)).toEqual([survivor]);
   });
 });

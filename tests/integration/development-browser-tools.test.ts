@@ -367,10 +367,10 @@ describe('tools web de solo lectura vía broker privado', () => {
     broker = await startDevelopmentBroker({
       handler: async ({ method }) => {
         if (method === 'browser.snapshot') {
-          return { snapshotId: 'snapshot_aaaaaaaaaaaaaaaaaaaa', title: 'App', path: '/', nodes: [{ depth: 1, role: 'button', name: 'Guardar', elementRef: 'element_aaaaaaaaaaaaaaaaaaaa' }] };
+          return { snapshotId: 'snapshot_aaaaaaaaaaaaaaaaaaaa', title: 'App', path: '/', nodes: [{ depth: 1, role: 'button', name: 'Guardar', elementRef: 'element_aaaaaaaaaaaaaaaaaaaa' }], truncated: false };
         }
         if (method === 'browser.screenshot') {
-          return { mimeType: 'image/png', dataBase64: Buffer.from('png-test').toString('base64'), width: 800, height: 600 };
+          return { mimeType: 'image/png', dataBase64: Buffer.from('png-test').toString('base64'), width: 800, height: 600, fallbackUsed: false };
         }
         return {};
       },
@@ -397,6 +397,58 @@ describe('tools web de solo lectura vía broker privado', () => {
     expect(screenshot.isError).not.toBe(true);
     expect(screenshot.content.some((item) => item.type === 'image')).toBe(true);
     expect(JSON.stringify(screenshot.structuredContent)).not.toContain('dataBase64');
+  });
+
+  it('guarda evidencia PNG solo con lectura de navegador y escritura autorizada', async () => {
+    const root = path.join(os.tmpdir(), `localbridge-browser-save-${randomUUID()}`);
+    const configPath = path.join(root, 'workspaces.json');
+    const auditDbPath = path.join(root, 'audit.db');
+    const basePermissions = {
+      read: true, overwrite: false, gitRead: false, validations: false, gitWrite: false, browserRead: true,
+    };
+    await writeRegistryFile(configPath, [
+      buildWorkspace({ id: 'ws_save', rootPath: root, permissions: { ...basePermissions, write: true } }),
+      buildWorkspace({ id: 'ws_no_write', rootPath: root, permissions: { ...basePermissions, write: false } }),
+    ]);
+    const calls: Array<{ method: string; params: unknown }> = [];
+    broker = await startDevelopmentBroker({ handler: async (request) => {
+      calls.push(request);
+      return {
+        sessionId: 'session_aaaaaaaaaaaaaaaaaaaaaaaa', path: 'evidence/local.png', sha256: 'a'.repeat(64),
+        size: 1234, created: true, mimeType: 'image/png', width: 1920, height: 1080, fallbackUsed: false, sourcePath: '/',
+      };
+    } });
+    harness = await createHarness({
+      pinProtocol: TARGET_PROTOCOL_REVISION,
+      workspaceConfigPath: configPath,
+      auditDbPath,
+      developmentBrokerEndpoint: broker.endpoint,
+      developmentBrokerToken: broker.token,
+    });
+
+    const saved = await callToolJson(harness.client, 'browser.screenshot.save', {
+      workspaceId: 'ws_save', sessionId: 'session_aaaaaaaaaaaaaaaaaaaaaaaa', path: 'evidence/local.png', operationId: 'save_local_1',
+    });
+    expect(saved.isError).toBe(false);
+    expect(saved.parsed).toMatchObject({ path: 'evidence/local.png', width: 1920, height: 1080, created: true });
+    expect(calls).toEqual([expect.objectContaining({ method: 'browser.screenshot.save' })]);
+    expect(queryAuditEvents(auditDbPath, { action: 'browser.screenshot.save' })).toEqual([
+      expect.objectContaining({
+        workspaceId: 'ws_save', outcome: 'success',
+        resource: expect.stringContaining('evidence/local.png:1920x1080:1234'),
+      }),
+    ]);
+
+    const denied = await callToolJson(harness.client, 'browser.screenshot.save', {
+      workspaceId: 'ws_no_write', sessionId: 'session_aaaaaaaaaaaaaaaaaaaaaaaa', path: 'evidence/local.png', operationId: 'save_local_2',
+    });
+    expect(denied.isError).toBe(true);
+    expect(denied.parsed['error']).toMatchObject({ code: 'CAPABILITY_DISABLED' });
+    const absolute = await harness.client.callTool({ name: 'browser.screenshot.save', arguments: {
+      workspaceId: 'ws_save', sessionId: 'session_aaaaaaaaaaaaaaaaaaaaaaaa', path: 'C:\\private\\local.png', operationId: 'save_local_3',
+    } });
+    expect(absolute.isError).toBe(true);
+    expect(calls).toHaveLength(1);
   });
 
   it('deniega navegación sin browserRead antes de contactar el broker', async () => {
@@ -461,5 +513,53 @@ describe('tools web de solo lectura vía broker privado', () => {
     expect(result.isError).toBe(false);
     expect(result.parsed).toMatchObject({ applied: true, snapshotInvalidated: true });
     expect(JSON.stringify(queryAuditEvents(auditDbPath, { action: 'browser.fill' }))).not.toContain(secretLikeText);
+  });
+
+  it('expone QA tipado sin selectores, JavaScript ni coordenadas del modelo', async () => {
+    const configPath = path.join(os.tmpdir(), `localbridge-browser-qa-${randomUUID()}`, 'workspaces.json');
+    await writeRegistryFile(configPath, [buildWorkspace({
+      id: 'ws_qa', rootPath: os.tmpdir(),
+      permissions: {
+        read: true, write: false, overwrite: false, gitRead: false, validations: false, gitWrite: false,
+        browserRead: true, browserInteract: true,
+      },
+    })]);
+    const calls: Array<{ method: string; params: Record<string, unknown> }> = [];
+    broker = await startDevelopmentBroker({ handler: async (request) => {
+      calls.push(request as { method: string; params: Record<string, unknown> });
+      if (request.method === 'browser.assert' || request.method === 'browser.wait') {
+        return { sessionId: 'session_aaaaaaaaaaaaaaaaaaaaaaaa', satisfied: true, conditionKind: 'text', ...(request.method === 'browser.wait' ? { waitedMs: 20 } : {}) };
+      }
+      return { sessionId: 'session_aaaaaaaaaaaaaaaaaaaaaaaa', applied: true, snapshotInvalidated: true };
+    } });
+    harness = await createHarness({ pinProtocol: TARGET_PROTOCOL_REVISION, workspaceConfigPath: configPath, developmentBrokerEndpoint: broker.endpoint, developmentBrokerToken: broker.token });
+    const common = {
+      workspaceId: 'ws_qa', sessionId: 'session_aaaaaaaaaaaaaaaaaaaaaaaa',
+      snapshotId: 'snapshot_aaaaaaaaaaaaaaaaaaaa', elementRef: 'element_aaaaaaaaaaaaaaaaaaaa',
+    };
+
+    for (const [name, args] of [
+      ['browser.assert', { workspaceId: common.workspaceId, sessionId: common.sessionId, condition: { kind: 'text', value: 'Ready', state: 'present' } }],
+      ['browser.wait', { workspaceId: common.workspaceId, sessionId: common.sessionId, condition: { kind: 'text', value: 'Ready', state: 'present' }, timeoutMs: 500 }],
+      ['browser.hover', { ...common, operationId: 'hover_1' }],
+      ['browser.scroll', { workspaceId: common.workspaceId, sessionId: common.sessionId, direction: 'down', amount: 400, operationId: 'scroll_1' }],
+      ['browser.select', { ...common, value: 'green', operationId: 'select_1' }],
+      ['browser.drag', { ...common, targetElementRef: 'element_bbbbbbbbbbbbbbbbbbbb', operationId: 'drag_1' }],
+      ['browser.dialog', { workspaceId: common.workspaceId, sessionId: common.sessionId, action: 'dismiss', operationId: 'dialog_1' }],
+    ] as const) {
+      const result = await callToolJson(harness.client, name, args);
+      expect(result.isError, name).toBe(false);
+    }
+    expect(calls.map((call) => call.method)).toEqual([
+      'browser.assert', 'browser.wait', 'browser.hover', 'browser.scroll', 'browser.select', 'browser.drag', 'browser.dialog',
+    ]);
+
+    const injection = await harness.client.callTool({
+      name: 'browser.wait',
+      arguments: { workspaceId: common.workspaceId, sessionId: common.sessionId, condition: { kind: 'text', value: 'Ready', javascript: 'document.body.innerText' } },
+    });
+    expect(injection.isError).toBe(true);
+    expect(calls).toHaveLength(7);
+    expect(JSON.stringify(calls)).not.toMatch(/selector|javascript|coordinate|\b[xy]\b/i);
   });
 });
