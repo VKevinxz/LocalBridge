@@ -136,7 +136,7 @@ describe("SEC-199..212 — navegación y control humano unificados", () => {
     const protocol = await source("packages/development/src/protocol.ts");
     expect(tools).toContain("delegatedSite");
     expect(tools).toContain("delegatedExpiresAt");
-    expect(protocol).toContain("DEVELOPMENT_BROKER_PROTOCOL = 19 as const");
+    expect(protocol).toContain("DEVELOPMENT_BROKER_PROTOCOL = 22 as const");
     expect(server).not.toContain("web.human.take");
   });
 });

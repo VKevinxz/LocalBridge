@@ -1,6 +1,6 @@
 # TOOL CATALOG — contrato vigente de LocalBridge MCP
 
-**Versión de producto:** 1.7.0 · **Actualizado:** 9 de septiembre de 2026
+**Versión de producto:** 1.8.0 · **Actualizado:** 12 de septiembre de 2026
 
 Contrato de cada tool MCP expuesta por el árbol vigente, incluidas las ampliaciones
 aceptadas por ADR. Este catálogo es
@@ -1340,6 +1340,52 @@ impone un techo fijo al tamaño de la fuente, pero mantiene límites de rango, m
 respuesta, worker, concurrencia, tiempo y reserva de disco. Esa política nunca forma parte
 de una entrada MCP. La transferencia web usa una política local separada y cambiar una
 cuota de consumo no cambia la autoridad ni cierra sesiones activas.
+
+### 19.5 Coordinación y QA ampliado (`v1.8.0`)
+
+El catálogo contiene **113 tools** y el broker privado usa revisión **22**. Los contratos
+de 1.7.0 permanecen disponibles. Las ampliaciones de navegador añaden inspección de CSS,
+secuencias de teclado, acción con captura y recarga; espera, consola, eventos, terminal,
+motion y comparación visual conservan sus nombres y amplían resultados de forma compatible.
+
+| Tool | Riesgo | Entrada | Resultado |
+|---|---:|---|---|
+| `browser.inspect` | R2 | workspace, sesión, target cerrado y propiedades/variables permitidas | geometría, estado accesible y estilos calculados acotados |
+| `web.inspect` | R2 | sesión/pestaña, target cerrado y propiedades/variables permitidas | evidencia equivalente bajo la autoridad web vigente |
+| `browser.keyboard.sequence` | R4 | snapshot/ref, 1–16 teclas permitidas, intención | progreso de la secuencia y causa segura de detención |
+| `web.keyboard.sequence` | R4 | sesión/pestaña, snapshot/ref, teclas permitidas, intención | progreso e incertidumbre sin reenfocar entre teclas |
+| `browser.action.capture` | R4 | click/hover/tecla, espera cerrada, salida inline o PNG nuevo | estado separado de acción, captura y persistencia |
+| `web.action.capture` | R4 | acción equivalente, espera, salida y autoridad web | recibo recuperable sin repetir efectos inciertos |
+| `browser.reload` | R3 | sesión, `normal | ignore-cache`, intención | navegación nueva y estado observable |
+| `web.reload` | R3 | sesión/pestaña, modo e intención | recarga idempotente bajo el perfil existente |
+
+| Tool | Riesgo | Entrada | Resultado |
+|---|---:|---|---|
+| `task.runMany` | R4 | workspace, intención estable, 1–24 hijos cerrados, dependencias y política de fallo | recibo durable del lote e hijos; no espera su finalización |
+| `task.list` | R1 | workspace y página | lotes recientes autorizados para retomar desde otro chat |
+| `task.statusMany` | R1 | workspace, lote, filtro/página de hijos | progreso, espera, efecto, cobertura, tiempos y resultado retenido cuando corresponda |
+| `task.waitMany` | R1 | workspace, lote, revisión, condición y hasta 20 s | revisión nueva o deadline; separa espera del cliente |
+| `task.cancelMany` | R3 | workspace, lote, hijos opcionales e intención estable | solicitud/estado de cancelación sin cerrar recursos reutilizados |
+
+`task.runMany` admite seis adaptadores de análisis existentes y `validation.run`. No acepta
+comandos, URLs libres, roots, permisos o niveles de confianza. Todo el lote se prevalida
+antes de persistir el recibo; cada hijo vuelve a comprobar autoridad al empezar y al
+entregar. Dos clientes con la misma intención recuperan el mismo lote. Otra intención con
+el mismo ID falla; un reinicio nunca reproduce parámetros que no se guardan.
+
+Los límites son de trabajo en vuelo: 24 hijos por lote, 32 lotes y 256 hijos no terminales,
+20 hijos por página, 32 esperas y 20 segundos por espera. Se conservan hasta 512 lotes
+durante un máximo de siete días; al alcanzar el tope se elimina primero la metadata terminal
+más antigua. El journal guarda huellas, estados, tiempos, cobertura y recibos, nunca
+parámetros, texto, imágenes, stdout/stderr o URLs sensibles. Los resultados de análisis
+permanecen en su supervisor; los de validación usan 2 MiB por hijo y 16 MiB agregados en memoria.
+
+La cola de análisis conserva cuatro jobs globales y uno/dos por workspace. Validaciones del
+mismo workspace usan el mutex previo; workspaces distintos pueden progresar. Navegador
+local se coordina por sesión, navegador web por sesión/partición y captura motion de forma
+global. El control humano y cierre tienen prioridad. La matriz y el benchmark están en
+la evidencia reproducible del candidato 1.8.0; las capacidades publicadas arriba son las
+que conserva 1.8.1.
 
 ## 20. Tools explícitamente no incluidas
 

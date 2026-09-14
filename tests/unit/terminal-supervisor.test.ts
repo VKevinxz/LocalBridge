@@ -75,6 +75,18 @@ async function waitForOutput(supervisor: TerminalSupervisor, projectId: string, 
   throw new Error(`No apareció ${expected}; salida=${JSON.stringify(observed)}`);
 }
 
+async function quietTerminalCursor(supervisor: TerminalSupervisor, projectId: string, sessionId: string): Promise<number> {
+  let cursor = (await supervisor.read(projectId, sessionId, 0, 65_536)).nextCursor;
+  let consecutiveDeadlines = 0;
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    const result = await supervisor.read(projectId, sessionId, cursor, 65_536, 250);
+    cursor = result.nextCursor;
+    consecutiveDeadlines = result.waitOutcome === "deadline" ? consecutiveDeadlines + 1 : 0;
+    if (consecutiveDeadlines === 2) return cursor;
+  }
+  return cursor;
+}
+
 describe.skipIf(process.platform !== "win32")("terminal supervisor Windows", () => {
   it("TERM-001/003: inicia ConPTY, acepta stdin y detiene el árbol", async () => {
     const { project, supervisor } = await fixture();
@@ -134,6 +146,46 @@ describe.skipIf(process.platform !== "win32")("terminal supervisor Windows", () 
     const output = await supervisor.read(project.id, session.sessionId, 0, 1);
     expect(output.entries.reduce((bytes, entry) => bytes + Buffer.byteLength(entry.text), 0)).toBeLessThanOrEqual(1);
     expect(output.nextCursor).toBeLessThanOrEqual(1);
+  });
+
+  it("TERM-015: espera salida sin consumir cursores de otros clientes y distingue deadline", async () => {
+    const { project, supervisor } = await fixture();
+    const session = await supervisor.start(project.id, "long-poll-start");
+    const cursor = await quietTerminalCursor(supervisor, project.id, session.sessionId);
+    const firstClient = supervisor.read(project.id, session.sessionId, cursor, 65_536, 3_000);
+    const secondClient = supervisor.read(project.id, session.sessionId, cursor, 65_536, 3_000);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    await supervisor.write(project.id, session.sessionId, "Write-Output LONG_POLL_OK\r\n", "long-poll-write");
+    const [first, second] = await Promise.all([firstClient, secondClient]);
+    expect(first.waitOutcome).toBe("output");
+    expect(second.waitOutcome).toBe("output");
+    expect(first.nextCursor).toBe(second.nextCursor);
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    const firstObserved = await supervisor.read(project.id, session.sessionId, cursor, 65_536);
+    const secondObserved = await supervisor.read(project.id, session.sessionId, cursor, 65_536);
+    expect(firstObserved.entries.map((entry) => entry.text).join("")).toContain("LONG_POLL_OK");
+    expect(secondObserved.entries).toEqual(firstObserved.entries);
+
+    const quietCursor = await quietTerminalCursor(supervisor, project.id, session.sessionId);
+    const deadline = await supervisor.read(project.id, session.sessionId, quietCursor, 65_536, 100);
+    expect(deadline.waitOutcome).toBe("deadline");
+    expect(deadline.session.state).toBe("running");
+    expect(deadline.entries).toEqual([]);
+    expect(deadline.waitedMs).toBeGreaterThanOrEqual(75);
+  });
+
+  it("TERM-016: despierta por cierre y acota suscripciones por sesión", async () => {
+    const { project, supervisor } = await fixture();
+    const session = await supervisor.start(project.id, "long-poll-capacity");
+    const quietCursor = await quietTerminalCursor(supervisor, project.id, session.sessionId);
+    const waits = Array.from({ length: 8 }, () => supervisor.read(project.id, session.sessionId, quietCursor, 65_536, 3_000));
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    await expect(supervisor.read(project.id, session.sessionId, quietCursor, 65_536, 3_000))
+      .rejects.toMatchObject({ code: "RATE_LIMITED" });
+    await supervisor.stop(project.id, session.sessionId);
+    const results = await Promise.all(waits);
+    expect(results.every((result) => result.session.state === "stopped")).toBe(true);
+    expect(results.every((result) => result.waitOutcome === "terminal-ended" || result.waitOutcome === "output")).toBe(true);
   });
 
   it("TRUST-001/SEC-124: guided y project-agent sin sandbox fallan cerrados", async () => {

@@ -189,6 +189,29 @@ describe('modelo de errores', () => {
     expect(unsafe.error).not.toHaveProperty('causeCode');
   });
 
+  it('expone solo metadata cerrada para recuperar un RATE_LIMITED', () => {
+    const safe = toErrorPayload(new LocalBridgeError('RATE_LIMITED', {
+      rateLimit: {
+        resource: 'local-browser-sessions', scope: 'global', capacity: 4,
+        recoveryTool: 'browser.list', action: 'list-and-reuse',
+      },
+      privatePath: 'D:\\privado\\sesiones.json',
+    }));
+    const unsafe = toErrorPayload(new LocalBridgeError('RATE_LIMITED', {
+      rateLimit: {
+        resource: 'D:\\privado', scope: 'global', capacity: 4,
+        recoveryTool: 'browser.list', action: 'list-and-reuse',
+      },
+    }));
+
+    expect(safe.error.rateLimit).toEqual({
+      resource: 'local-browser-sessions', scope: 'global', capacity: 4,
+      recoveryTool: 'browser.list', action: 'list-and-reuse',
+    });
+    expect(JSON.stringify(safe)).not.toContain('privado');
+    expect(unsafe.error).not.toHaveProperty('rateLimit');
+  });
+
   it('colapsa valores lanzados que no son Error', () => {
     expect(toErrorPayload('boom').error.code).toBe('INTERNAL_ERROR');
     expect(toErrorPayload(undefined).error.code).toBe('INTERNAL_ERROR');

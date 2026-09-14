@@ -6,6 +6,7 @@ import { BrowserWindow, WebContentsView, app, webContents } from 'electron';
 
 import { BrowserController } from '../apps/desktop/src/main/browser-controller.js';
 import type { AuthorizedWorkspace, LocalApplication } from '@localbridge/workspace';
+import { LocalBridgeError } from '@localbridge/shared';
 
 for (const stream of [process.stdout, process.stderr]) {
   stream.on('error', (error: NodeJS.ErrnoException) => {
@@ -37,12 +38,19 @@ let projectTerminalListenersAllowed = true;
 let handoffConfirmation: () => Promise<boolean> = async () => true;
 let savedBrowserEvidence = 0;
 let savedMotionBundles = 0;
+let reloadAssetVersion = 1;
 const pageSockets = new Set<Socket>();
 const applicationSockets = new Set<Socket>();
 const stage = (name: string): void => { process.stderr.write(`[browser-test] ${name}\n`); };
 app.on('window-all-closed', () => { /* el verificador crea varias sesiones secuenciales */ });
 
 const pageServer = http.createServer((request, response) => {
+  if (request.url?.startsWith('/reload-resource.js') === true) {
+    response.setHeader('content-type', 'text/javascript; charset=utf-8');
+    response.setHeader('cache-control', 'public, max-age=3600');
+    response.end(`window.__resourceVersion=${reloadAssetVersion};`);
+    return;
+  }
   if (request.url?.startsWith('/sw.js') === true) {
     response.setHeader('content-type', 'text/javascript; charset=utf-8');
     response.end("self.addEventListener('fetch',()=>{});");
@@ -59,11 +67,13 @@ const pageServer = http.createServer((request, response) => {
     response.end();
     return;
   }
+  if (request.url?.startsWith('/missing') === true) response.statusCode = 404;
   response.setHeader('content-type', 'text/html; charset=utf-8');
   response.end(`<!doctype html><html><head><title>Local test</title><style>
+    :root{--fixture-accent:#12a4b8}
     @keyframes pulse-fixture { from { opacity:.35; transform:translateY(8px) } to { opacity:1; transform:translateY(0) } }
     #motion-css{animation:pulse-fixture 800ms ease-in-out infinite alternate}.sticky-fixture{position:sticky;top:0;background:#fff}
-    #transition-fixture{opacity:.3;transition:opacity 2s ease}#transition-fixture.active{opacity:1}
+    #transition-fixture{opacity:.3;transition:opacity 150ms ease}#transition-fixture.active{opacity:1}#stable-target{transform:translateX(0);transition:transform 450ms ease}#stable-target.active{transform:translateX(40px)}
   </style></head><body>
     <h1>${request.url === '/next' ? 'Next page' : 'Development page'}</h1>
     <div id="motion-css">CSS animation fixture</div><div class="sticky-fixture">Sticky fixture</div>
@@ -74,11 +84,12 @@ const pageServer = http.createServer((request, response) => {
     <button id="open-fixture">Choose fixture indirectly</button><span id="upload-state">No fixture</span>
     <button id="action">Run action</button>
     <label>Theme <select id="theme"><option value="blue">Blue</option><option value="green">Green</option></select></label>
-    <button id="hover">Hover target</button><button id="async">Run async</button><button id="dialog">Open dialog</button>
-    <button id="disabled" disabled>Disabled action</button>
+    <button id="hover">Hover target</button><button id="toast">Show toast</button><div id="toast-state" aria-live="polite"></div><button id="async">Run async</button><button id="dialog">Open dialog</button>
+    <button id="disabled" disabled>Disabled action</button><div id="non-focusable" role="button">Non focusable action</div><button id="stable-target">Stable target</button>
+    <div role="menu" aria-label="Fixture menu"><button role="menuitem" id="menu-one">Menu one</button><button role="menuitem" id="menu-two">Menu two</button></div>
     <button id="drag-source">Drag source</button><button id="drag-target">Drag target</button>
-    <output id="qa-state" aria-live="polite">QA idle</output><div style="height:1400px">Scrollable fixture</div>
-    <script>document.addEventListener('mousedown',(event)=>console.log('SYNTHETIC_MOUSE_DOWN',event.clientX,event.clientY,event.target.id),true);document.querySelector('#action').onclick=()=>{document.querySelector('h1').textContent='Applied: '+document.querySelector('#query').value};document.querySelector('#fixture').addEventListener('change',(event)=>{document.querySelector('#upload-state').textContent=event.target.files.length+' fixture(s) selected'});document.querySelector('#open-fixture').onclick=()=>document.querySelector('#fixture').click();document.querySelector('#password').addEventListener('input',(event)=>{const value=event.target.value;document.title='leak:'+value;document.body.dataset.leak=value;console.log('HOSTILE_PASSWORD_ECHO',value)});document.querySelector('#theme').onchange=(event)=>document.querySelector('#qa-state').textContent='Theme: '+event.target.value;document.querySelector('#hover').onmouseenter=()=>document.querySelector('#qa-state').textContent='Hovered';document.querySelector('#async').onclick=()=>setTimeout(async()=>{await fetch('/qa-response');document.querySelector('#qa-state').textContent='Async ready'},250);document.querySelector('#dialog').onclick=()=>confirm('Synthetic dialog');let dragging=false;document.querySelector('#drag-source').onmousedown=()=>{dragging=true};document.querySelector('#drag-target').onmouseup=()=>{if(dragging)document.querySelector('#qa-state').textContent='Dragged';dragging=false};document.querySelector('#transition-fixture').classList.add('active');document.querySelector('#motion-css').animate([{filter:'brightness(.7)'},{filter:'brightness(1)'}],{duration:900,iterations:Infinity,direction:'alternate'});const motionContext=document.querySelector('#motion-canvas').getContext('2d');motionContext.fillStyle='#0cf';motionContext.fillRect(0,0,64,32);setTimeout(()=>document.body.dataset.lazyReady='true',120);console.log('LOCALBRIDGE_BROWSER_READY');fetch('http://127.0.0.1:${blockedPort}/blocked').catch(()=>{});const hmr=new WebSocket('ws://127.0.0.1:${pagePort}/hmr');hmr.addEventListener('open',()=>console.log('LOCALBRIDGE_HMR_SOCKET_OPEN'));new WebSocket('ws://127.0.0.1:${blockedPort}/blocked');</script>
+    <output id="qa-state" aria-live="polite">QA idle</output><output id="reload-version"></output><div style="height:1400px">Scrollable fixture</div>
+    <script src="/reload-resource.js"></script><script>document.querySelector('#reload-version').textContent='Resource '+window.__resourceVersion;document.addEventListener('keydown',(event)=>{document.body.dataset.lastKey=event.key},true);document.addEventListener('mousedown',(event)=>console.log('SYNTHETIC_MOUSE_DOWN',event.clientX,event.clientY,event.target.id),true);document.querySelector('#action').onclick=()=>{document.querySelector('h1').textContent='Applied: '+document.querySelector('#query').value};document.querySelector('#fixture').addEventListener('change',(event)=>{document.querySelector('#upload-state').textContent=event.target.files.length+' fixture(s) selected'});document.querySelector('#open-fixture').onclick=()=>document.querySelector('#fixture').click();document.querySelector('#password').addEventListener('input',(event)=>{const value=event.target.value;document.title='leak:'+value;document.body.dataset.leak=value;console.log('HOSTILE_PASSWORD_ECHO',value)});document.querySelector('#theme').onchange=(event)=>document.querySelector('#qa-state').textContent='Theme: '+event.target.value;document.querySelector('#menu-one').onkeydown=(event)=>{if(event.key==='ArrowDown')document.querySelector('#menu-two').focus();if(event.key==='ArrowRight')document.querySelector('#password').focus()};document.querySelector('#menu-two').onkeydown=(event)=>{if(event.key==='Enter')document.querySelector('#qa-state').textContent='Menu activated'};document.querySelector('#hover').onmouseenter=()=>document.querySelector('#qa-state').textContent='Hovered';window.__toastClicks=0;document.querySelector('#toast').onclick=()=>{window.__toastClicks+=1;document.querySelector('#toast-state').textContent='Toast visible';setTimeout(()=>document.querySelector('#toast-state').textContent='',5000)};document.querySelector('#async').onclick=()=>setTimeout(async()=>{await fetch('/qa-response');document.querySelector('#qa-state').textContent='Async ready'},250);document.querySelector('#dialog').onclick=()=>confirm('Synthetic dialog');let dragging=false;document.querySelector('#drag-source').onmousedown=()=>{dragging=true};document.querySelector('#drag-target').onmouseup=()=>{if(dragging)document.querySelector('#qa-state').textContent='Dragged';dragging=false};document.querySelector('#transition-fixture').classList.add('active');document.querySelector('#motion-css').animate([{filter:'brightness(.7)'},{filter:'brightness(1)'}],{duration:900,iterations:Infinity,direction:'alternate'});const motionContext=document.querySelector('#motion-canvas').getContext('2d');motionContext.fillStyle='#0cf';motionContext.fillRect(0,0,64,32);setTimeout(()=>document.body.dataset.lazyReady='true',120);console.log('LOCALBRIDGE_BROWSER_READY');fetch('http://127.0.0.1:${blockedPort}/blocked').catch(()=>{});const hmr=new WebSocket('ws://127.0.0.1:${pagePort}/hmr');hmr.addEventListener('open',()=>console.log('LOCALBRIDGE_HMR_SOCKET_OPEN'));new WebSocket('ws://127.0.0.1:${blockedPort}/blocked');</script>
   </body></html>`);
 });
 pageServer.on('upgrade', (request, socket) => {
@@ -319,8 +330,12 @@ const controller = new BrowserController({
     throw new Error('project terminal listener mismatch');
   },
   confirmHumanControlHandoff: async () => handoffConfirmation(),
+  preflightScreenshot: async ({ path: destinationPath }) => {
+    if (destinationPath === 'evidence/preflight-fail.png') throw new LocalBridgeError('FILE_ALREADY_EXISTS');
+  },
   saveScreenshot: async ({ path: destinationPath, bytes }) => {
-    if (destinationPath !== 'evidence/local.png' || !Buffer.from(bytes).subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) {
+    if (destinationPath === 'evidence/disk-fail.png') throw new LocalBridgeError('INTERNAL_ERROR');
+    if (!destinationPath.startsWith('evidence/') || !Buffer.from(bytes).subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) {
       throw new Error('invalid browser evidence fixture');
     }
     savedBrowserEvidence += 1;
@@ -360,6 +375,18 @@ try {
   stage('session-started');
   const repeated = await controller.start('ws_browser', 'app', 'browser_start_1');
   if (started.sessionId !== repeated.sessionId) throw new Error('browser start was not idempotent');
+  const capacitySessions = [];
+  for (let index = 0; index < 3; index += 1) {
+    capacitySessions.push(await controller.start('ws_browser', 'app', `browser_capacity_${index}`));
+  }
+  let browserCapacityRejected = false;
+  try {
+    await controller.start('ws_browser', 'app', 'browser_capacity_overflow');
+  } catch (error) {
+    browserCapacityRejected = error instanceof Error && 'code' in error && error.code === 'RATE_LIMITED';
+  }
+  if (!browserCapacityRejected) throw new Error('fifth concurrent browser session did not return RATE_LIMITED');
+  for (const session of capacitySessions) await controller.stop('ws_browser', session.sessionId);
   const viewport = await controller.setViewport('ws_browser', started.sessionId, 980, 680, false, 'viewport_replay');
   const viewportReplay = await controller.setViewport('ws_browser', started.sessionId, 980, 680, false, 'viewport_replay');
   if (JSON.stringify(viewportReplay) !== JSON.stringify(viewport)) throw new Error('viewport replay changed its result');
@@ -401,6 +428,13 @@ try {
     sensitiveRejected = error instanceof Error && 'code' in error && error.code === 'SENSITIVE_INPUT_BLOCKED';
   }
   if (!sensitiveRejected) throw new Error('password field was not rejected');
+  let sensitiveInspectionRejected = false;
+  try {
+    await controller.inspect('ws_browser', started.sessionId, 'element', interactionSnapshot.snapshotId, currentPassword, ['color'], []);
+  } catch (error) {
+    sensitiveInspectionRejected = error instanceof Error && 'code' in error && error.code === 'SENSITIVE_INPUT_BLOCKED';
+  }
+  if (!sensitiveInspectionRejected) throw new Error('password field was exposed through CSS inspection');
   await controller.click('ws_browser', started.sessionId, interactionSnapshot.snapshotId, currentButton, 'click_1');
   await controller.click('ws_browser', started.sessionId, interactionSnapshot.snapshotId, currentButton, 'click_1');
   const appliedSnapshot = await controller.snapshot('ws_browser', started.sessionId, 12, 500);
@@ -429,6 +463,86 @@ try {
   await controller.select('ws_browser', started.sessionId, selectSnapshot.snapshotId, theme, 'green', 'select_qa');
   await controller.assert('ws_browser', started.sessionId, { kind: 'text', value: 'Theme: green', state: 'present' });
   stage('select-qa-passed');
+
+  const pressSnapshot = await controller.snapshot('ws_browser', started.sessionId, 12, 500);
+  const pressTheme = pressSnapshot.nodes.find((node) => node['role'] === 'combobox' && node['name'] === 'Theme')?.['elementRef'];
+  const pressDisabled = pressSnapshot.nodes.find((node) => node['role'] === 'button' && node['name'] === 'Disabled action')?.['elementRef'];
+  const nonFocusable = pressSnapshot.nodes.find((node) => node['role'] === 'button' && node['name'] === 'Non focusable action')?.['elementRef'];
+  if (typeof pressTheme !== 'string' || typeof pressDisabled !== 'string' || typeof nonFocusable !== 'string') {
+    throw new Error(`keyboard fixture references missing: ${JSON.stringify(pressSnapshot.nodes)}`);
+  }
+  const pressed = await controller.press('ws_browser', started.sessionId, pressSnapshot.snapshotId, pressTheme, 'ArrowUp', 'press_qa');
+  const pressedReplay = await controller.press('ws_browser', started.sessionId, pressSnapshot.snapshotId, pressTheme, 'ArrowUp', 'press_qa');
+  if (JSON.stringify(pressedReplay) !== JSON.stringify(pressed)) throw new Error('keyboard operationId replay changed its result');
+  const activeInspection = await controller.inspect('ws_browser', started.sessionId, 'active', undefined, undefined,
+    ['color', 'background-color', 'font-family'], ['--fixture-accent']);
+  if (!activeInspection.state.active || activeInspection.state.role !== 'combobox' ||
+      activeInspection.variables['--fixture-accent'] !== '#12a4b8' || activeInspection.rect.width <= 0) {
+    throw new Error(`active element inspection is incomplete: ${JSON.stringify(activeInspection)}`);
+  }
+  const afterPressSnapshot = await controller.snapshot('ws_browser', started.sessionId, 12, 500);
+  const afterPressDisabled = afterPressSnapshot.nodes.find((node) => node['role'] === 'button' && node['name'] === 'Disabled action')?.['elementRef'];
+  const afterPressNonFocusable = afterPressSnapshot.nodes.find((node) => node['role'] === 'button' && node['name'] === 'Non focusable action')?.['elementRef'];
+  if (typeof afterPressDisabled !== 'string' || typeof afterPressNonFocusable !== 'string') throw new Error('keyboard rejection references missing');
+  let disabledPressRejected = false;
+  try {
+    await controller.press('ws_browser', started.sessionId, afterPressSnapshot.snapshotId, afterPressDisabled, 'Enter', 'press_disabled');
+  } catch (error) {
+    disabledPressRejected = error instanceof Error && 'code' in error && error.code === 'ELEMENT_NOT_INTERACTABLE';
+  }
+  if (!disabledPressRejected) throw new Error('disabled element accepted a keyboard press');
+  let nonFocusableRejected = false;
+  try {
+    await controller.press('ws_browser', started.sessionId, afterPressSnapshot.snapshotId, afterPressNonFocusable, 'Enter', 'press_non_focusable');
+  } catch (error) {
+    nonFocusableRejected = error instanceof Error && 'code' in error && error.code === 'ELEMENT_NOT_INTERACTABLE';
+  }
+  if (!nonFocusableRejected) throw new Error('non-focusable element accepted a keyboard press');
+  stage('press-qa-passed');
+
+  const selectSequenceSnapshot = await controller.snapshot('ws_browser', started.sessionId, 12, 500);
+  const sequenceTheme = selectSequenceSnapshot.nodes.find((node) => node['role'] === 'combobox' && node['name'] === 'Theme')?.['elementRef'];
+  if (typeof sequenceTheme !== 'string') throw new Error('select sequence reference missing');
+  const selectSequence = await controller.keyboardSequence('ws_browser', started.sessionId, selectSequenceSnapshot.snapshotId,
+    sequenceTheme, ['ArrowDown', 'Enter'], 'keyboard_select_sequence');
+  if (selectSequence.actionState !== 'complete' || selectSequence.keysSent !== 2) throw new Error('select keyboard sequence did not complete');
+  const sequenceContents = webContents.getAllWebContents().find((candidate) => candidate.getURL().startsWith(`http://127.0.0.1:${pagePort}`));
+  if (sequenceContents === undefined || await sequenceContents.executeJavaScript("document.querySelector('#theme').value", true) !== 'green') {
+    throw new Error('select keyboard sequence did not move the native selection');
+  }
+  stage('select-sequence-passed');
+
+  const menuSequenceSnapshot = await controller.snapshot('ws_browser', started.sessionId, 12, 500);
+  const menuOne = menuSequenceSnapshot.nodes.find((node) => node['role'] === 'menuitem' && node['name'] === 'Menu one')?.['elementRef'];
+  if (typeof menuOne !== 'string') throw new Error('menu sequence reference missing');
+  const menuSequence = await controller.keyboardSequence('ws_browser', started.sessionId, menuSequenceSnapshot.snapshotId,
+    menuOne, ['ArrowDown', 'Enter'], 'keyboard_menu_sequence');
+  if (menuSequence.actionState !== 'complete' || menuSequence.keysSent !== 2) throw new Error('moving-focus menu sequence did not complete');
+  stage('menu-sequence-applied');
+  const menuState = await sequenceContents.executeJavaScript("({active:document.activeElement?.id,state:document.querySelector('#qa-state').textContent,lastKey:document.body.dataset.lastKey})", true) as { active?: string; state?: string; lastKey?: string };
+  if (menuState.active !== 'menu-two' || menuState.state !== 'Menu activated') throw new Error(`moving-focus menu sequence failed: ${JSON.stringify(menuState)}`);
+
+  const sensitiveSequenceSnapshot = await controller.snapshot('ws_browser', started.sessionId, 12, 500);
+  const sensitiveMenuOne = sensitiveSequenceSnapshot.nodes.find((node) => node['role'] === 'menuitem' && node['name'] === 'Menu one')?.['elementRef'];
+  if (typeof sensitiveMenuOne !== 'string') throw new Error('sensitive sequence reference missing');
+  const sensitiveSequence = await controller.keyboardSequence('ws_browser', started.sessionId, sensitiveSequenceSnapshot.snapshotId,
+    sensitiveMenuOne, ['ArrowRight', 'Enter'], 'keyboard_sensitive_sequence');
+  if (sensitiveSequence.actionState !== 'partial' || sensitiveSequence.keysSent !== 1 || sensitiveSequence.stoppedReason !== 'sensitive_focus') {
+    throw new Error(`keyboard sequence did not stop before sensitive focus: ${JSON.stringify(sensitiveSequence)}`);
+  }
+  stage('keyboard-sequences-passed');
+
+  const stableSnapshot = await controller.snapshot('ws_browser', started.sessionId, 12, 500);
+  const stableRef = stableSnapshot.nodes.find((node) => node['role'] === 'button' && node['name'] === 'Stable target')?.['elementRef'];
+  if (typeof stableRef !== 'string') throw new Error('stable target reference missing');
+  const stableContents = webContents.getAllWebContents().find((candidate) => candidate.getURL().startsWith(`http://127.0.0.1:${pagePort}`));
+  if (stableContents === undefined) throw new Error('controlled web contents missing for stable wait');
+  await stableContents.executeJavaScript("document.querySelector('#stable-target').classList.add('active')", true);
+  const stableWait = await controller.wait('ws_browser', started.sessionId, {
+    kind: 'stable', snapshotId: stableSnapshot.snapshotId, elementRef: stableRef, intervalMs: 150, tolerancePx: 0.25,
+  }, 2_000);
+  if (stableWait.waitedMs < 150) throw new Error('stable wait returned before the required interval');
+  stage('stable-wait-passed');
 
   const asyncSnapshot = await controller.snapshot('ws_browser', started.sessionId, 12, 500);
   const asyncButton = asyncSnapshot.nodes.find((node) => node['role'] === 'button' && node['name'] === 'Run async')?.['elementRef'];
@@ -471,7 +585,9 @@ try {
   await controller.dialog('ws_browser', started.sessionId, 'dismiss', 'dialog_dismiss');
   await controller.assert('ws_browser', started.sessionId, { kind: 'dialog', state: 'closed' });
   stage('typed-qa-passed');
-  const screenshot = await controller.screenshot('ws_browser', started.sessionId);
+  const settledScreenshotStartedAt = Date.now();
+  const screenshot = await controller.screenshot('ws_browser', started.sessionId, 150);
+  if (Date.now() - settledScreenshotStartedAt < 130) throw new Error('screenshot ignored settleMs');
   stage('screenshot');
   if (Buffer.from(screenshot.dataBase64, 'base64').length < 1000) throw new Error('screenshot is unexpectedly empty');
   const savedScreenshot = await controller.saveScreenshot('ws_browser', started.sessionId, 'evidence/local.png', 'save_local_1');
@@ -480,6 +596,67 @@ try {
       JSON.stringify(savedScreenshotReplay) !== JSON.stringify(savedScreenshot)) {
     throw new Error('browser.screenshot.save no guardó una sola captura PNG verificable');
   }
+  const preflightActionSnapshot = await controller.snapshot('ws_browser', started.sessionId, 12, 500);
+  const preflightToastRef = preflightActionSnapshot.nodes.find((node) => node['name'] === 'Show toast')?.['elementRef'];
+  if (typeof preflightToastRef !== 'string') throw new Error('toast action reference missing');
+  let actionPreflightRejected = false;
+  try {
+    await controller.actionCapture('ws_browser', started.sessionId, preflightActionSnapshot.snapshotId, preflightToastRef,
+      { kind: 'click' }, { kind: 'delay', settleMs: 50 }, { kind: 'save', workspaceId: 'ws_browser', path: 'evidence/preflight-fail.png' }, 'action_preflight_fail');
+  } catch (error) {
+    actionPreflightRejected = error instanceof Error && 'code' in error && error.code === 'FILE_ALREADY_EXISTS';
+  }
+  const clicksAfterPreflight = await stableContents.executeJavaScript('window.__toastClicks', true) as number;
+  if (!actionPreflightRejected || clicksAfterPreflight !== 0) {
+    throw new Error(`action.capture clicked before destination preflight succeeded: ${JSON.stringify({ actionPreflightRejected, clicksAfterPreflight })}`);
+  }
+  const actionSnapshot = await controller.snapshot('ws_browser', started.sessionId, 12, 500);
+  const toastRef = actionSnapshot.nodes.find((node) => node['name'] === 'Show toast')?.['elementRef'];
+  if (typeof toastRef !== 'string') throw new Error('toast action reference missing after preflight');
+  const actionArgs = ['ws_browser', started.sessionId, actionSnapshot.snapshotId, toastRef,
+    { kind: 'click' as const }, { kind: 'delay' as const, settleMs: 180 }, { kind: 'inline' as const }, 'action_capture_once'] as const;
+  const [actionCapture, actionCaptureConcurrent] = await Promise.all([
+    controller.actionCapture(...actionArgs), controller.actionCapture(...actionArgs),
+  ]);
+  if (JSON.stringify(actionCapture) !== JSON.stringify(actionCaptureConcurrent) || actionCapture.captureState !== 'complete' ||
+      typeof actionCapture.dataBase64 !== 'string' || await stableContents.executeJavaScript('window.__toastClicks', true) !== 1 ||
+      await stableContents.executeJavaScript("document.querySelector('#toast-state').textContent", true) !== 'Toast visible') {
+    throw new Error('action.capture did not coalesce or preserve the five-second toast evidence');
+  }
+  const diskActionSnapshot = await controller.snapshot('ws_browser', started.sessionId, 12, 500);
+  const diskToastRef = diskActionSnapshot.nodes.find((node) => node['name'] === 'Show toast')?.['elementRef'];
+  if (typeof diskToastRef !== 'string') throw new Error('disk failure toast reference missing');
+  const diskFailure = await controller.actionCapture('ws_browser', started.sessionId, diskActionSnapshot.snapshotId, diskToastRef,
+    { kind: 'click' }, { kind: 'delay', settleMs: 20 }, { kind: 'save', workspaceId: 'ws_browser', path: 'evidence/disk-fail.png' }, 'action_disk_fail');
+  const diskFailureReplay = await controller.actionCapture('ws_browser', started.sessionId, diskActionSnapshot.snapshotId, diskToastRef,
+    { kind: 'click' }, { kind: 'delay', settleMs: 20 }, { kind: 'save', workspaceId: 'ws_browser', path: 'evidence/disk-fail.png' }, 'action_disk_fail');
+  if (diskFailure.captureState !== 'failed' || diskFailure.failureCode !== 'INTERNAL_ERROR' || JSON.stringify(diskFailure) !== JSON.stringify(diskFailureReplay) ||
+      await stableContents.executeJavaScript('window.__toastClicks', true) !== 2) throw new Error('failed action capture was replayed or hid its write failure');
+  let toastEvidenceRuns = 0;
+  for (let index = 0; index < 20; index += 1) {
+    const toastSnapshot = await controller.snapshot('ws_browser', started.sessionId, 12, 500);
+    const currentToastRef = toastSnapshot.nodes.find((node) => node['name'] === 'Show toast')?.['elementRef'];
+    if (typeof currentToastRef !== 'string') throw new Error(`toast reference missing on run ${index + 1}`);
+    const evidence = await controller.actionCapture(
+      'ws_browser', started.sessionId, toastSnapshot.snapshotId, currentToastRef,
+      { kind: 'click' }, { kind: 'delay', settleMs: 20 }, { kind: 'inline' }, `toast_evidence_${index}`,
+    );
+    const visible = await stableContents.executeJavaScript("document.querySelector('#toast-state').textContent", true);
+    if (evidence.captureState !== 'complete' || typeof evidence.dataBase64 !== 'string' || visible !== 'Toast visible') {
+      throw new Error(`five-second toast evidence missing on run ${index + 1}`);
+    }
+    toastEvidenceRuns += 1;
+  }
+  if (toastEvidenceRuns !== 20) throw new Error(`toast evidence completed ${toastEvidenceRuns}/20 runs`);
+  const hoverCaptureSnapshot = await controller.snapshot('ws_browser', started.sessionId, 12, 500);
+  const hoverCaptureRef = hoverCaptureSnapshot.nodes.find((node) => node['name'] === 'Hover target')?.['elementRef'];
+  if (typeof hoverCaptureRef !== 'string') throw new Error('hover capture reference missing');
+  const hoverCapture = await controller.actionCapture('ws_browser', started.sessionId, hoverCaptureSnapshot.snapshotId, hoverCaptureRef,
+    { kind: 'hover' }, { kind: 'delay', settleMs: 20 }, { kind: 'inline' }, 'action_hover_capture');
+  if (hoverCapture.captureState !== 'complete' || await stableContents.executeJavaScript("document.querySelector('#qa-state').textContent", true) !== 'Hovered') {
+    throw new Error('hover action capture did not preserve tooltip evidence');
+  }
+  stage('action-capture-passed');
   const motionInspection = await controller.inspectMotion('ws_browser', started.sessionId, 100) as {
     capabilities?: { screencast?: boolean }; viewport?: { width?: number; height?: number };
     animations?: Array<{ source?: string }>; stickyCandidates?: unknown[];
@@ -550,6 +727,56 @@ try {
   if (!events.events.some((event) => event.type === 'console' && event.message.includes('LOCALBRIDGE_HMR_SOCKET_OPEN'))) {
     throw new Error('same-origin HMR WebSocket was blocked');
   }
+  await activeContents.executeJavaScript(`(() => {
+    const root = { nested: { value: 3 }, huge: 9007199254740993n, error: new Error('fixture') };
+    root.self = root;
+    Object.defineProperty(root, 'danger', { enumerable: true, get() { throw new Error('getter must not run'); } });
+    console.log('STRUCTURED_EVENT', root);
+  })()`, true);
+  let structuredEvents = await controller.events('ws_browser', started.sessionId, 0, 65_536, 'current-navigation');
+  const structuredDeadline = Date.now() + 3_000;
+  while (!structuredEvents.events.some((event) => event.type === 'console' && event.message.includes('STRUCTURED_EVENT')) && Date.now() < structuredDeadline) {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    structuredEvents = await controller.events('ws_browser', started.sessionId, 0, 65_536, 'current-navigation');
+  }
+  const structured = structuredEvents.events.find((event) => event.type === 'console' && event.message.includes('STRUCTURED_EVENT'));
+  const structuredText = JSON.stringify(structured);
+  if (structured === undefined || !structuredText.includes('nested') || !structuredText.includes('9007199254740993n') ||
+      !structuredText.includes('"kind":"accessor"') || !structuredText.includes('"kind":"reference"')) {
+    throw new Error(`structured console arguments were not safely preserved: ${structuredText}`);
+  }
+  const historyBeforeReload = await controller.events('ws_browser', started.sessionId, 0, 65_536, 'history');
+  if (structuredEvents.events.some((event) => event.navigationEpoch !== structuredEvents.navigationEpoch) ||
+      !historyBeforeReload.events.some((event) => event.navigationEpoch < historyBeforeReload.navigationEpoch)) {
+    throw new Error('navigation epoch filtering did not separate current document from history');
+  }
+  await activeContents.executeJavaScript("document.cookie='reload_auth=retained; SameSite=Lax';localStorage.setItem('reload_auth','retained')", true);
+  reloadAssetVersion = 2;
+  const beforeReloadViewport = (await controller.list('ws_browser')).find((item) => item.sessionId === started.sessionId)?.viewport;
+  const reloaded = await controller.reload('ws_browser', started.sessionId, 'ignore-cache', 'reload_browser_1');
+  const reloadReplay = await controller.reload('ws_browser', started.sessionId, 'ignore-cache', 'reload_browser_1');
+  if (JSON.stringify(reloaded) !== JSON.stringify(reloadReplay)) throw new Error('browser.reload was not idempotent');
+  let reloadConflict = false;
+  try { await controller.reload('ws_browser', started.sessionId, 'normal', 'reload_browser_1'); }
+  catch (error) { reloadConflict = error instanceof Error && 'code' in error && error.code === 'IDEMPOTENCY_CONFLICT'; }
+  if (!reloadConflict) throw new Error('browser.reload operationId accepted another cache mode');
+  const reloadState = await activeContents.executeJavaScript(`({
+    resource: document.querySelector('#reload-version')?.textContent,
+    cookie: document.cookie,
+    local: localStorage.getItem('reload_auth')
+  })`, true) as { resource?: string; cookie: string; local: string | null };
+  const afterReloadViewport = (await controller.list('ws_browser')).find((item) => item.sessionId === started.sessionId)?.viewport;
+  if (reloadState.resource !== 'Resource 2' || !reloadState.cookie.includes('reload_auth=retained') || reloadState.local !== 'retained' ||
+      JSON.stringify(beforeReloadViewport) !== JSON.stringify(afterReloadViewport)) {
+    throw new Error(`browser.reload did not preserve session/viewport or refresh resources: ${JSON.stringify({ reloadState, beforeReloadViewport, afterReloadViewport })}`);
+  }
+  await controller.navigate('ws_browser', started.sessionId, '/missing', 'navigate_404');
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  const notFoundEvents = await controller.events('ws_browser', started.sessionId, 0, 65_536, 'current-navigation');
+  if (!notFoundEvents.events.some((event) => event.type === 'network' && event.message === 'HTTP 404')) {
+    throw new Error(`browser.events did not preserve a 404 response in the current navigation: ${JSON.stringify(notFoundEvents.events)}`);
+  }
+  await controller.navigate('ws_browser', started.sessionId, '/next', 'navigate_after_404');
   if (sameOriginWebSockets === 0) throw new Error('same-origin WebSocket did not reach the approved listener');
   if (blockedRequests !== 0) throw new Error('request escaped the approved origin');
   if (blockedWebSockets !== 0) throw new Error('WebSocket escaped to an unapproved origin');
@@ -894,11 +1121,11 @@ try {
   dynamicListenerAllowed = false;
   let dynamicRequestBlocked = false;
   try {
-    await controller.navigate('ws_browser', dynamic.sessionId, '/next');
+    await controller.reload('ws_browser', dynamic.sessionId, 'normal', 'reload_listener_lost');
   } catch (error) {
-    dynamicRequestBlocked = error instanceof Error && 'code' in error && error.code === 'FEATURE_UNAVAILABLE';
+    dynamicRequestBlocked = error instanceof Error && 'code' in error && error.code === 'LISTENER_NOT_FOUND';
   }
-  if (!dynamicRequestBlocked) throw new Error('dynamic request survived listener ownership loss');
+  if (!dynamicRequestBlocked) throw new Error('browser.reload survived listener ownership loss');
   await controller.reconcile();
   const dynamicAfterListenerLoss = await controller.list('ws_browser');
   if (dynamicAfterListenerLoss.find((entry) => entry.sessionId === dynamic.sessionId)?.state !== 'stopped') {
@@ -921,12 +1148,18 @@ try {
     accessibilityNodes: snapshot.nodes.length,
     screenshotBytes: Buffer.from(screenshot.dataBase64, 'base64').length,
     consoleCaptured: true,
+    structuredConsoleArguments: true,
+    navigationEpochFiltering: true,
+    browserCapacityLimit: true,
+    reloadPreservesStorageViewportAndRefreshesResources: true,
+    reloadRevalidatesListener: true,
     sameOriginWebSocketAllowed: true,
     externalOriginBlocked: true,
     externalWebSocketBlocked: true,
     navigation: true,
     controlledInteraction: true,
     typedWaitsAndAssertions: true,
+    toastEvidenceRuns,
     pointerHitTesting: true,
     hoverScrollSelectDragDialog: true,
     interactionIdempotencyConflict: true,

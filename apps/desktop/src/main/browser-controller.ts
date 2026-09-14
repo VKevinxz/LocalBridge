@@ -16,6 +16,9 @@ import { isSensitiveInput } from '@localbridge/desktop-core';
 import { ERROR_CODES, LocalBridgeError } from '@localbridge/shared';
 
 import { isAllowedBrowserRequest } from './browser-network-policy.js';
+import { serializeBrowserConsoleArguments, type BrowserConsoleValue } from './browser-console-serialization.js';
+import { reloadManagedWebContents, type BrowserReloadMode } from './browser-reload.js';
+import { dispatchBoundedBrowserKey, inspectActiveBrowserKeyboardTarget, inspectResolvedBrowserElement, sampleResolvedBrowserElement, visualSamplesEqual, waitForResolvedBrowserElementStability } from './browser-element-inspection.js';
 import { resolveViewerPresentation, type ViewerPresentationMode } from './live-viewer-presentation.js';
 import {
   capturePageMotion,
@@ -54,10 +57,13 @@ const INTERACTIVE_ROLES = new Set([
 
 interface BrowserEventEntry {
   readonly cursor: number;
-  readonly type: 'console' | 'network' | 'error';
+  readonly type: 'console' | 'network' | 'error' | 'navigation';
   readonly level: string;
   readonly message: string;
   readonly path?: string;
+  readonly navigationEpoch: number;
+  readonly arguments?: readonly BrowserConsoleValue[];
+  readonly argumentsTruncated?: boolean;
 }
 
 interface ElementBinding {
@@ -105,6 +111,8 @@ interface ManagedBrowserSession {
   snapshot?: SnapshotBinding;
   eventBytes: number;
   nextEventCursor: number;
+  navigationEpoch: number;
+  mainFrameId?: string;
   controlState: BrowserControlState;
   humanRequestId?: string;
   humanReason?: BrowserHumanReason;
@@ -248,6 +256,11 @@ export interface BrowserControllerOptions {
     readonly path: string;
     readonly bytes: Uint8Array;
   }) => Promise<{ path: string; sha256: string; size: number; created: true }>;
+  readonly preflightScreenshot?: (input: {
+    readonly workspaceId: string;
+    readonly expectedWorkspace: AuthorizedWorkspace;
+    readonly path: string;
+  }) => Promise<void>;
   readonly saveMotionBundle?: (input: {
     readonly workspaceId: string;
     readonly expectedWorkspace: AuthorizedWorkspace;
@@ -279,6 +292,14 @@ interface MotionOperationRecord {
   state: 'pending' | 'complete' | 'uncertain';
   result?: unknown;
   causeCode?: string;
+}
+
+interface CompositeOperationRecord {
+  readonly fingerprint: string;
+  readonly sessionId: string;
+  state: 'pending' | 'complete' | 'uncertain';
+  result?: unknown;
+  completion?: Promise<unknown>;
 }
 
 interface AppliedInteractionResult {
@@ -451,6 +472,7 @@ export class BrowserController {
   private readonly humanControlOperations = new Map<string, string>();
   private readonly interactionOperations = new Map<string, InteractionOperationRecord>();
   private readonly motionOperations = new Map<string, MotionOperationRecord>();
+  private readonly compositeOperations = new Map<string, CompositeOperationRecord>();
   private readonly reconciliationTimer: NodeJS.Timeout;
   private humanSessionId: string | undefined;
   private liveViewerSessionId: string | undefined;
@@ -951,6 +973,7 @@ export class BrowserController {
       return !entry.events.some((event) => event.cursor >= condition.afterCursor &&
         (event.type === 'error' || (event.type === 'console' && ['error', 'assert'].includes(event.level))));
     }
+    if (condition.kind === 'stable') return false;
     return condition.state === (entry.dialogOpen ? 'open' : 'closed');
   }
 
@@ -974,12 +997,13 @@ export class BrowserController {
     }
   }
 
-  private addEvent(entry: ManagedBrowserSession, event: Omit<BrowserEventEntry, 'cursor'>): void {
+  private addEvent(entry: ManagedBrowserSession, event: Omit<BrowserEventEntry, 'cursor' | 'navigationEpoch'> & { readonly navigationEpoch?: number }): void {
     if (entry.controlState !== 'agent_control') return;
-    const bytes = Buffer.byteLength(JSON.stringify(event));
+    const complete = { navigationEpoch: event.navigationEpoch ?? entry.navigationEpoch, ...event };
+    const bytes = Buffer.byteLength(JSON.stringify(complete));
     const cursor = entry.nextEventCursor;
     entry.nextEventCursor += bytes;
-    entry.events.push({ cursor, ...event });
+    entry.events.push({ cursor, ...complete });
     entry.eventBytes += bytes;
     while (entry.eventBytes > MAX_EVENT_BYTES && entry.events.length > 1) {
       const removed = entry.events.shift();
@@ -993,16 +1017,55 @@ export class BrowserController {
       webContents.debugger.on('message', (_event, method, parameters: unknown) => {
         if (entry.controlState !== 'agent_control') return;
         const data = parameters as Record<string, unknown>;
-        if (method === 'DOM.documentUpdated' || method === 'Page.frameNavigated') {
-          entry.generation += 1;
-          delete entry.snapshot;
+        if (method === 'DOM.documentUpdated') {
+          this.invalidateSnapshot(entry);
+        } else if (method === 'Page.frameNavigated') {
+          const frame = data['frame'] as Record<string, unknown> | undefined;
+          const frameId = stringValue(frame?.['id']);
+          const parentId = stringValue(frame?.['parentId']);
+          const mainFrame = parentId === '';
+          this.invalidateSnapshot(entry);
+          if (mainFrame) {
+            entry.navigationEpoch += 1;
+            entry.mainFrameId = frameId;
+          }
+          this.addEvent(entry, {
+            type: 'navigation', level: mainFrame ? 'document' : 'frame',
+            message: mainFrame ? 'Main document navigated' : 'Child frame navigated',
+            path: safePathFromUrl(stringValue(frame?.['url'])),
+          });
+        } else if (method === 'Page.navigatedWithinDocument') {
+          this.invalidateSnapshot(entry);
+          const frameId = stringValue(data['frameId']);
+          this.addEvent(entry, {
+            type: 'navigation', level: frameId !== '' && frameId === entry.mainFrameId ? 'same-document' : 'frame-same-document',
+            message: frameId !== '' && frameId === entry.mainFrameId ? 'Main document route changed' : 'Child frame route changed',
+            path: safePathFromUrl(stringValue(data['url'])),
+          });
+        } else if (method === 'Page.loadEventFired') {
+          this.addEvent(entry, { type: 'navigation', level: 'load', message: 'Main document load event', path: safePathFromUrl(webContents.getURL()) });
         } else if (method === 'Runtime.consoleAPICalled') {
           const args = Array.isArray(data['args']) ? data['args'] as Array<Record<string, unknown>> : [];
           const message = args.map((arg) => stringValue(arg['value'] ?? arg['description'])).join(' ').slice(0, 4096);
-          this.addEvent(entry, { type: 'console', level: stringValue(data['type']) || 'log', message });
+          const navigationEpoch = entry.navigationEpoch;
+          const level = stringValue(data['type']) || 'log';
+          void serializeBrowserConsoleArguments(args, (command, params) => webContents.debugger.sendCommand(command, params))
+            .then((serialized) => this.addEvent(entry, {
+              type: 'console', level, message, navigationEpoch,
+              arguments: serialized.arguments,
+              ...(serialized.truncated ? { argumentsTruncated: true } : {}),
+            }))
+            .catch(() => this.addEvent(entry, { type: 'console', level, message, navigationEpoch, argumentsTruncated: true }));
         } else if (method === 'Network.responseReceived') {
           const response = data['response'] as Record<string, unknown> | undefined;
-          this.addEvent(entry, { type: 'network', level: 'response', message: `HTTP ${stringValue(response?.['status'])}`, path: safePathFromUrl(stringValue(response?.['url'])) });
+          const frameId = stringValue(data['frameId']);
+          const mainDocumentResponse = stringValue(data['type']) === 'Document' &&
+            (entry.mainFrameId === undefined || frameId === '' || frameId === entry.mainFrameId);
+          this.addEvent(entry, {
+            type: 'network', level: 'response', message: `HTTP ${stringValue(response?.['status'])}`,
+            path: safePathFromUrl(stringValue(response?.['url'])),
+            ...(mainDocumentResponse ? { navigationEpoch: entry.navigationEpoch + 1 } : {}),
+          });
         } else if (method === 'Network.loadingFailed') {
           this.addEvent(entry, { type: 'error', level: 'network', message: stringValue(data['errorText']).slice(0, 1024) });
         } else if (method === 'Page.fileChooserOpened') {
@@ -1133,6 +1196,7 @@ export class BrowserController {
       generation: 0,
       eventBytes: 0,
       nextEventCursor: 0,
+      navigationEpoch: 0,
       controlState: 'agent_control',
       debuggerListenerInstalled: false,
       controlEpoch: 0,
@@ -1525,6 +1589,57 @@ export class BrowserController {
     });
   }
 
+  async reload(workspaceId: string, sessionId: string, mode: BrowserReloadMode, operationId: string): Promise<BrowserSessionSummary> {
+    const operationKey = `${workspaceId}:${sessionId}:${operationId}`;
+    const fingerprint = interactionFingerprint(['browser.reload', mode]);
+    const existing = this.compositeOperations.get(operationKey);
+    if (existing !== undefined) {
+      if (existing.fingerprint !== fingerprint) fail('IDEMPOTENCY_CONFLICT', 'El operationId ya representa otra operación de navegador.');
+      if (existing.state === 'complete') return existing.result as BrowserSessionSummary;
+      if (existing.completion !== undefined) return existing.completion as Promise<BrowserSessionSummary>;
+      fail('WEB_EFFECT_UNCERTAIN', 'La recarga anterior no tiene un recibo recuperable.');
+    }
+    const entry = await this.requireSession(workspaceId, sessionId);
+    const record: CompositeOperationRecord = { fingerprint, sessionId, state: 'pending' };
+    this.compositeOperations.set(operationKey, record);
+    while (this.compositeOperations.size > MAX_INTERACTION_OPERATIONS) this.compositeOperations.delete(this.compositeOperations.keys().next().value as string);
+    let effectStarted = false;
+    const run = this.withAgentOperation(entry, async () => {
+      if (entry.listenerBindings !== undefined) {
+        for (const binding of entry.listenerBindings) {
+          if (!(await this.verifyListenerBinding(entry.browserSession, binding))) {
+            await this.stopEntry(entry);
+            fail('LISTENER_NOT_FOUND', 'El listener perdió su autoridad antes de recargar el navegador.');
+          }
+        }
+      }
+      let current: URL;
+      try { current = new URL(entry.content.webContents.getURL()); }
+      catch { fail('ORIGIN_BLOCKED', 'La página actual no pertenece al origen aprobado.'); }
+      if (!entry.profile.allowedOrigins.includes(current.origin)) fail('ORIGIN_BLOCKED', 'La página actual no pertenece al origen aprobado.');
+      try {
+        effectStarted = true;
+        await reloadManagedWebContents(entry.content.webContents, mode);
+      } catch {
+        record.state = 'uncertain';
+        fail('WEB_EFFECT_UNCERTAIN', 'La recarga pudo completarse antes del fallo; vuelve a observar la página.');
+      }
+      this.invalidateSnapshot(entry);
+      const result = summary(entry);
+      record.state = 'complete';
+      record.result = result;
+      return result;
+    });
+    record.completion = run;
+    try { return await run; }
+    catch (error) {
+      if (!effectStarted) this.compositeOperations.delete(operationKey);
+      throw error;
+    } finally {
+      delete record.completion;
+    }
+  }
+
   async snapshot(workspaceId: string, sessionId: string, maxDepth: number, maxElements: number) {
     const entry = await this.requireSession(workspaceId, sessionId);
     return this.withAgentOperation(entry, async () => {
@@ -1615,17 +1730,21 @@ export class BrowserController {
     fail('WEB_CAPTURE_TOO_LARGE', 'La captura local supera el presupuesto seguro del broker.');
   }
 
-  async screenshot(workspaceId: string, sessionId: string) {
+  async screenshot(workspaceId: string, sessionId: string, settleMs = 0) {
     const entry = await this.requireSession(workspaceId, sessionId);
-    return this.withAgentOperation(entry, () => this.captureScreenshotData(entry));
+    return this.withAgentOperation(entry, async () => {
+      if (settleMs > 0) await new Promise((resolve) => setTimeout(resolve, settleMs));
+      this.ensureAgentControl(entry);
+      return this.captureScreenshotData(entry);
+    });
   }
 
-  async saveScreenshot(workspaceId: string, sessionId: string, destinationPath: string, operationId: string) {
+  async saveScreenshot(workspaceId: string, sessionId: string, destinationPath: string, operationId: string, settleMs = 0) {
     const entry = await this.requireSession(workspaceId, sessionId);
     const expectedWorkspace = await this.requireWorkspace(workspaceId);
     if (this.options.saveScreenshot === undefined) fail('FEATURE_UNAVAILABLE', 'El guardado de evidencia visual no está disponible.');
     const operationKey = `${workspaceId}:${sessionId}:${operationId}`;
-    const fingerprint = interactionFingerprint(['browser.screenshot.save', destinationPath]);
+    const fingerprint = interactionFingerprint(['browser.screenshot.save', destinationPath, settleMs]);
     const previous = this.previousInteraction<{
       readonly sessionId: string; readonly path: string; readonly sha256: string; readonly size: number; readonly created: true;
       readonly mimeType: 'image/png'; readonly width: number; readonly height: number; readonly fallbackUsed: false; readonly sourcePath: string;
@@ -1633,6 +1752,8 @@ export class BrowserController {
     if (previous !== undefined) return previous;
     return this.withAgentOperation(entry, async () => {
       if (!destinationPath.toLowerCase().endsWith('.png')) fail('INVALID_INPUT', 'La evidencia de navegador local debe guardarse como PNG.');
+      if (settleMs > 0) await new Promise((resolve) => setTimeout(resolve, settleMs));
+      this.ensureAgentControl(entry);
       const captured = await this.captureScreenshotData(entry, false);
       const bytes = Buffer.from(captured.dataBase64, 'base64');
       const saved = await this.options.saveScreenshot!({ workspaceId, expectedWorkspace, path: destinationPath, bytes });
@@ -1731,6 +1852,7 @@ export class BrowserController {
           totalSize: saved.totalSize,
           fileCount: saved.fileCount,
           manifestPath: `${saved.path}/${saved.value.manifest.path}`,
+          qualityPath: `${saved.path}/${saved.value.quality.path}`,
           contactSheetPath: `${saved.path}/${saved.value.contactSheet.path}`,
           frameCount: saved.value.frameCount,
           width: saved.value.width,
@@ -1838,13 +1960,14 @@ export class BrowserController {
     this.invalidateSnapshot(entry);
   }
 
-  async events(workspaceId: string, sessionId: string, cursor: number, maxBytes: number) {
+  async events(workspaceId: string, sessionId: string, cursor: number, maxBytes: number, scope: 'history' | 'current-navigation' = 'history') {
     const entry = await this.requireSession(workspaceId, sessionId);
     return this.withAgentOperation(entry, async () => {
       const firstCursor = entry.events[0]?.cursor ?? entry.nextEventCursor;
       let bytes = 0;
       const events: BrowserEventEntry[] = [];
       for (const event of entry.events) {
+        if (scope === 'current-navigation' && event.navigationEpoch !== entry.navigationEpoch) continue;
         const eventBytes = Buffer.byteLength(JSON.stringify(event));
         if (event.cursor + eventBytes <= cursor) continue;
         if (bytes + eventBytes > maxBytes && events.length > 0) break;
@@ -1856,11 +1979,45 @@ export class BrowserController {
         events,
         nextCursor: last === undefined ? Math.max(cursor, entry.nextEventCursor) : last.cursor + Buffer.byteLength(JSON.stringify(last)),
         truncatedBeforeCursor: cursor < firstCursor,
+        navigationEpoch: entry.navigationEpoch,
       };
     });
   }
 
-  async assert(workspaceId: string, sessionId: string, condition: BrowserCondition) {
+  async inspect(
+    workspaceId: string,
+    sessionId: string,
+    target: 'element' | 'active',
+    snapshotId: string | undefined,
+    elementRef: string | undefined,
+    cssProperties: readonly string[],
+    cssVariables: readonly string[],
+  ) {
+    const entry = await this.requireSession(workspaceId, sessionId);
+    return this.withAgentOperation(entry, async () => {
+      let objectId: string | undefined;
+      if (target === 'element') {
+        if (snapshotId === undefined || elementRef === undefined) fail('INVALID_INPUT', 'La inspección de elemento requiere snapshotId y elementRef.');
+        const { nodeId } = await this.resolveElement(entry, snapshotId, elementRef);
+        const resolved = await entry.content.webContents.debugger.sendCommand('DOM.resolveNode', { nodeId }) as { object?: { objectId?: string } };
+        objectId = resolved.object?.objectId;
+      } else {
+        const resolved = await entry.content.webContents.debugger.sendCommand('Runtime.evaluate', {
+          expression: 'document.activeElement',
+        }) as { result?: { objectId?: string } };
+        objectId = resolved.result?.objectId;
+      }
+      if (objectId === undefined) fail('ELEMENT_NOT_INTERACTABLE', 'No hay un elemento activo que se pueda inspeccionar.');
+      try {
+        const inspection = await inspectResolvedBrowserElement(entry.content.webContents, objectId, cssProperties, cssVariables);
+        return { sessionId, target, ...inspection };
+      } finally {
+        await entry.content.webContents.debugger.sendCommand('Runtime.releaseObject', { objectId }).catch(() => undefined);
+      }
+    });
+  }
+
+  async assert(workspaceId: string, sessionId: string, condition: Exclude<BrowserCondition, { readonly kind: 'stable' }>) {
     const entry = await this.requireSession(workspaceId, sessionId);
     return this.withAgentOperation(entry, async () => {
       if (!(await this.conditionSatisfied(entry, condition))) fail('ASSERTION_FAILED', 'La condición del navegador no se cumple.');
@@ -1873,6 +2030,28 @@ export class BrowserController {
     return this.withAgentOperation(entry, async () => {
       const startedAt = Date.now();
       const deadline = startedAt + timeoutMs;
+      if (condition.kind === 'stable') {
+        let previous: Awaited<ReturnType<typeof sampleResolvedBrowserElement>> | undefined;
+        let stableSince = startedAt;
+        do {
+          this.ensureAgentControl(entry);
+          const { nodeId } = await this.resolveElement(entry, condition.snapshotId, condition.elementRef);
+          const resolved = await entry.content.webContents.debugger.sendCommand('DOM.resolveNode', { nodeId }) as { object?: { objectId?: string } };
+          const objectId = resolved.object?.objectId;
+          if (objectId === undefined) fail('STALE_SNAPSHOT', 'El elemento ya no existe.');
+          let current: Awaited<ReturnType<typeof sampleResolvedBrowserElement>>;
+          try { current = await sampleResolvedBrowserElement(entry.content.webContents, objectId); }
+          finally { await entry.content.webContents.debugger.sendCommand('Runtime.releaseObject', { objectId }).catch(() => undefined); }
+          const now = Date.now();
+          if (previous === undefined || !visualSamplesEqual(previous, current, condition.tolerancePx)) stableSince = now;
+          else if (now - stableSince >= condition.intervalMs) {
+            return { sessionId, satisfied: true as const, conditionKind: condition.kind, waitedMs: now - startedAt };
+          }
+          previous = current;
+          await new Promise((resolveDelay) => setTimeout(resolveDelay, Math.min(50, Math.max(1, deadline - Date.now()))));
+        } while (Date.now() < deadline);
+        fail('TIMEOUT', 'El elemento no mantuvo geometría, color y transición estables durante el intervalo solicitado.');
+      }
       do {
         if (await this.conditionSatisfied(entry, condition)) {
           return { sessionId, satisfied: true as const, conditionKind: condition.kind, waitedMs: Date.now() - startedAt };
@@ -2023,20 +2202,271 @@ export class BrowserController {
     if (previous !== undefined) return previous;
     const epoch = this.beginAgentOperation(entry);
     try {
-    entry.content.webContents.focus();
-    const { nodeId } = await this.resolveElement(entry, snapshotId, elementRef);
-    await entry.content.webContents.debugger.sendCommand('DOM.focus', { nodeId });
-    await entry.content.webContents.debugger.sendCommand('Input.dispatchKeyEvent', { type: 'rawKeyDown', key, code: key });
-    await entry.content.webContents.debugger.sendCommand('Input.dispatchKeyEvent', { type: 'keyUp', key, code: key });
-    await waitForInteractionToSettle();
-    this.invalidateSnapshot(entry);
-    const result = { sessionId, applied: true as const, snapshotInvalidated: true as const };
-    this.assertAgentOperation(entry, epoch);
-    this.rememberInteractionOperation(operationKey, fingerprint, result);
-    return result;
+      entry.content.webContents.focus();
+      await entry.content.webContents.debugger.sendCommand('Page.bringToFront');
+      const { nodeId } = await this.resolveElement(entry, snapshotId, elementRef);
+      const state = await this.inspectElement(entry, nodeId);
+      if (!state.attached) fail('STALE_SNAPSHOT', 'El elemento ya no existe.');
+      if (!state.visible || !state.enabled) {
+        fail('ELEMENT_NOT_INTERACTABLE', 'El elemento no puede recibir el foco del teclado.');
+      }
+      try {
+        await entry.content.webContents.debugger.sendCommand('DOM.focus', { nodeId });
+      } catch {
+        // DOM.focus expone errores crudos de CDP cuando el nodo se desconecta
+        // entre la resolución y el foco, o cuando Chromium no lo considera
+        // enfocables. Revalidamos el snapshot para conservar errores públicos.
+        try {
+          const current = await this.resolveElement(entry, snapshotId, elementRef);
+          const currentState = await this.inspectElement(entry, current.nodeId);
+          if (!currentState.attached) fail('STALE_SNAPSHOT', 'El elemento ya no existe.');
+        } catch (error) {
+          if (error instanceof DevelopmentBrokerError) throw error;
+          fail('STALE_SNAPSHOT', 'El documento cambió antes de aplicar la tecla.');
+        }
+        fail('ELEMENT_NOT_INTERACTABLE', 'El elemento no puede recibir el foco del teclado.');
+      }
+      let effectStarted = false;
+      try {
+        effectStarted = true;
+        await dispatchBoundedBrowserKey(entry.content.webContents, key);
+        await waitForInteractionToSettle();
+      } catch (error) {
+        if (!effectStarted) throw error;
+        this.invalidateSnapshot(entry);
+        fail('WEB_EFFECT_UNCERTAIN', 'La tecla pudo producir un efecto antes del fallo; vuelve a observar antes de continuar.');
+      }
+      this.invalidateSnapshot(entry);
+      const result = { sessionId, applied: true as const, snapshotInvalidated: true as const };
+      this.assertAgentOperation(entry, epoch);
+      this.rememberInteractionOperation(operationKey, fingerprint, result);
+      return result;
     } finally {
       this.endAgentOperation(entry);
     }
+  }
+
+  async keyboardSequence(workspaceId: string, sessionId: string, snapshotId: string, elementRef: string, keys: readonly string[], operationId: string) {
+    const operationKey = `${workspaceId}:${sessionId}:${operationId}`;
+    const fingerprint = interactionFingerprint(['browser.keyboard.sequence', snapshotId, elementRef, ...keys]);
+    const existing = this.compositeOperations.get(operationKey);
+    if (existing !== undefined) {
+      if (existing.fingerprint !== fingerprint) fail('IDEMPOTENCY_CONFLICT', 'El operationId ya representa otra operación compuesta.');
+      if (existing.state === 'complete') return existing.result;
+      if (existing.state === 'uncertain') fail('WEB_EFFECT_UNCERTAIN', 'La secuencia anterior quedó en estado incierto.');
+      fail('RATE_LIMITED', 'La misma secuencia de teclado sigue en curso.');
+    }
+    const entry = await this.requireInteractionSession(workspaceId, sessionId);
+    const epoch = this.beginAgentOperation(entry);
+    let keysSent = 0;
+    let effectStarted = false;
+    try {
+      entry.content.webContents.focus();
+      await entry.content.webContents.debugger.sendCommand('Page.bringToFront');
+      const { nodeId } = await this.resolveElement(entry, snapshotId, elementRef);
+      const initial = await this.inspectElement(entry, nodeId);
+      if (!initial.attached) fail('STALE_SNAPSHOT', 'El elemento ya no existe.');
+      if (!initial.visible || !initial.enabled) fail('ELEMENT_NOT_INTERACTABLE', 'El elemento no puede recibir el foco del teclado.');
+      try { await entry.content.webContents.debugger.sendCommand('DOM.focus', { nodeId }); }
+      catch { fail('ELEMENT_NOT_INTERACTABLE', 'El elemento no puede recibir el foco del teclado.'); }
+      const focused = await inspectActiveBrowserKeyboardTarget(entry.content.webContents);
+      if (isSensitiveInput({ inputType: focused.inputType, autocomplete: focused.autocomplete, identity: focused.identity })) {
+        fail('SENSITIVE_INPUT_BLOCKED', 'La secuencia de teclado no puede comenzar en un campo sensible.');
+      }
+      const record: CompositeOperationRecord = { fingerprint, sessionId, state: 'pending' };
+      this.compositeOperations.set(operationKey, record);
+      while (this.compositeOperations.size > MAX_INTERACTION_OPERATIONS) this.compositeOperations.delete(this.compositeOperations.keys().next().value as string);
+      const initialGeneration = entry.generation;
+      const finish = (actionState: 'complete' | 'partial' | 'uncertain', stoppedReason?: 'sensitive_focus' | 'document_changed' | 'target_unavailable' | 'dispatch_failed') => {
+        if (keysSent > 0) this.invalidateSnapshot(entry);
+        const result = {
+          sessionId, requestedKeys: keys.length, keysSent, actionState,
+          snapshotInvalidated: keysSent > 0,
+          ...(stoppedReason === undefined ? {} : { stoppedReason }),
+        };
+        record.state = 'complete'; record.result = result;
+        return result;
+      };
+      for (let index = 0; index < keys.length; index += 1) {
+        this.assertAgentOperation(entry, epoch);
+        if (index > 0) {
+          if (entry.generation !== initialGeneration) return finish('partial', 'document_changed');
+          const active = await inspectActiveBrowserKeyboardTarget(entry.content.webContents);
+          if (!active.connected || !active.visible || !active.enabled) return finish('partial', 'target_unavailable');
+          if (isSensitiveInput({ inputType: active.inputType, autocomplete: active.autocomplete, identity: active.identity })) {
+            return finish('partial', 'sensitive_focus');
+          }
+        }
+        const currentKey = keys[index] as string;
+        try {
+          effectStarted = true;
+          await dispatchBoundedBrowserKey(entry.content.webContents, currentKey);
+          keysSent += 1;
+        } catch {
+          return finish('uncertain', 'dispatch_failed');
+        }
+        if (index + 1 < keys.length) await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      await waitForInteractionToSettle();
+      return finish('complete');
+    } catch (error) {
+      if (!effectStarted) this.compositeOperations.delete(operationKey);
+      throw error;
+    } finally {
+      this.endAgentOperation(entry);
+    }
+  }
+
+  async actionCapture(
+    workspaceId: string,
+    sessionId: string,
+    snapshotId: string,
+    elementRef: string,
+    action: { readonly kind: 'click' | 'hover' } | { readonly kind: 'key'; readonly key: string },
+    wait: { readonly kind: 'delay'; readonly settleMs: number } | { readonly kind: 'stable'; readonly intervalMs: number; readonly tolerancePx: number; readonly timeoutMs: number; readonly allowUnstable: boolean },
+    output: { readonly kind: 'inline' } | { readonly kind: 'save'; readonly workspaceId: string; readonly path: string },
+    operationId: string,
+  ) {
+    const operationKey = `${workspaceId}:${sessionId}:${operationId}`;
+    const fp = interactionFingerprint(['browser.action.capture', snapshotId, elementRef, JSON.stringify(action), JSON.stringify(wait), JSON.stringify(output)]);
+    const existing = this.compositeOperations.get(operationKey);
+    if (existing !== undefined) {
+      if (existing.fingerprint !== fp) fail('IDEMPOTENCY_CONFLICT', 'El operationId ya representa otra operación compuesta.');
+      if (existing.state === 'complete') return existing.result;
+      if (existing.completion !== undefined) return existing.completion;
+      fail('WEB_EFFECT_UNCERTAIN', 'La acción compuesta anterior no tiene un recibo recuperable.');
+    }
+    const entry = await this.requireInteractionSession(workspaceId, sessionId);
+    const expectedWorkspace = await this.requireWorkspace(workspaceId);
+    if (output.kind === 'save') {
+      if (output.workspaceId !== workspaceId) fail('APPROVAL_INVALID', 'La evidencia local solo puede guardarse en el workspace de la sesión.');
+      if (!output.path.toLowerCase().endsWith('.png')) fail('INVALID_INPUT', 'La evidencia debe guardarse como PNG.');
+      if (this.options.preflightScreenshot === undefined || this.options.saveScreenshot === undefined) fail('FEATURE_UNAVAILABLE', 'El guardado de evidencia no está disponible.');
+      await this.options.preflightScreenshot({ workspaceId, expectedWorkspace, path: output.path });
+    }
+    const raced = this.compositeOperations.get(operationKey);
+    if (raced !== undefined) {
+      if (raced.fingerprint !== fp) fail('IDEMPOTENCY_CONFLICT', 'El operationId ya representa otra operación compuesta.');
+      if (raced.state === 'complete') return raced.result;
+      if (raced.completion !== undefined) return raced.completion;
+      fail('RATE_LIMITED', 'La misma acción compuesta se está preparando.');
+    }
+    const record: CompositeOperationRecord = { fingerprint: fp, sessionId, state: 'pending' };
+    this.compositeOperations.set(operationKey, record);
+    while (this.compositeOperations.size > MAX_INTERACTION_OPERATIONS) this.compositeOperations.delete(this.compositeOperations.keys().next().value as string);
+    let effectStarted = false;
+    let actionCompleted = false;
+    const run = (async () => {
+      const epoch = this.beginAgentOperation(entry);
+      let objectId: string | undefined;
+      try {
+        entry.content.webContents.focus();
+        await entry.content.webContents.debugger.sendCommand('Page.bringToFront');
+        const { nodeId } = await this.resolveElement(entry, snapshotId, elementRef);
+        const state = await this.inspectElement(entry, nodeId);
+        if (!state.attached) fail('STALE_SNAPSHOT', 'El elemento ya no existe.');
+        if (action.kind === 'click' && state.fileInput) fail('SENSITIVE_INPUT_BLOCKED', 'La selección de archivos requiere control humano exclusivo.');
+        if (!state.visible || !state.enabled || (action.kind !== 'key' && !state.receivesPointer)) {
+          fail('ELEMENT_NOT_INTERACTABLE', 'El elemento no puede recibir la acción solicitada.');
+        }
+        const resolved = await entry.content.webContents.debugger.sendCommand('DOM.resolveNode', { nodeId }) as { object?: { objectId?: string } };
+        objectId = resolved.object?.objectId;
+        if (objectId === undefined) fail('STALE_SNAPSHOT', 'El elemento ya no existe.');
+        if (action.kind === 'key') {
+          try { await entry.content.webContents.debugger.sendCommand('DOM.focus', { nodeId }); }
+          catch { fail('ELEMENT_NOT_INTERACTABLE', 'El elemento no puede recibir el foco del teclado.'); }
+          const focused = await inspectActiveBrowserKeyboardTarget(entry.content.webContents);
+          if (isSensitiveInput({ inputType: focused.inputType, autocomplete: focused.autocomplete, identity: focused.identity })) {
+            fail('SENSITIVE_INPUT_BLOCKED', 'La acción no puede enviar teclas a un campo sensible.');
+          }
+          effectStarted = true;
+          await dispatchBoundedBrowserKey(entry.content.webContents, action.key);
+        } else if (action.kind === 'hover') {
+          effectStarted = true;
+          await entry.content.webContents.debugger.sendCommand('Runtime.callFunctionOn', {
+            objectId,
+            functionDeclaration: `function () { const options={bubbles:true,cancelable:true,composed:true,view:window}; this.dispatchEvent(new PointerEvent('pointerover',options)); this.dispatchEvent(new MouseEvent('mouseover',options)); this.dispatchEvent(new PointerEvent('pointerenter',{...options,bubbles:false})); this.dispatchEvent(new MouseEvent('mouseenter',{...options,bubbles:false})); }`,
+            userGesture: true,
+          });
+        } else {
+          effectStarted = true;
+          const activation = entry.content.webContents.debugger.sendCommand('Runtime.callFunctionOn', {
+            objectId, functionDeclaration: 'function () { this.click(); }', userGesture: true,
+          });
+          const outcome = await Promise.race([
+            activation.then(() => 'complete' as const),
+            (async () => { const deadline = Date.now() + 500; while (Date.now() < deadline) { if (entry.dialogOpen) return 'dialog' as const; await new Promise((resolve) => setTimeout(resolve, 20)); } return 'timeout' as const; })(),
+          ]);
+          if (outcome === 'timeout') await activation;
+          else if (outcome === 'dialog') void activation.catch(() => undefined);
+        }
+        actionCompleted = true;
+        let stable = true;
+        let waitedMs = 0;
+        if (wait.kind === 'delay') {
+          const waitStartedAt = Date.now();
+          const deadline = waitStartedAt + wait.settleMs;
+          while (Date.now() < deadline) {
+            this.assertAgentOperation(entry, epoch);
+            await new Promise((resolve) => setTimeout(resolve, Math.min(50, Math.max(1, deadline - Date.now()))));
+          }
+          waitedMs = Date.now() - waitStartedAt;
+        } else {
+          const stability = await waitForResolvedBrowserElementStability(entry.content.webContents, objectId, {
+            intervalMs: wait.intervalMs, tolerancePx: wait.tolerancePx, timeoutMs: wait.timeoutMs,
+            validate: () => this.assertAgentOperation(entry, epoch),
+          }).catch(() => ({ stable: false, waitedMs: wait.timeoutMs }));
+          stable = stability.stable; waitedMs = stability.waitedMs;
+          if (!stable && !wait.allowUnstable) {
+            this.invalidateSnapshot(entry);
+            const result = { sessionId, actionState: 'complete' as const, captureState: 'unstable' as const, waitedMs, snapshotInvalidated: true };
+            record.state = 'complete'; record.result = result;
+            return result;
+          }
+        }
+        this.assertAgentOperation(entry, epoch);
+        try {
+          const captured = await this.captureScreenshotData(entry, output.kind === 'inline');
+          this.assertAgentOperation(entry, epoch);
+          this.invalidateSnapshot(entry);
+          if (output.kind === 'inline') {
+            const result = { sessionId, actionState: 'complete' as const, captureState: stable ? 'complete' as const : 'unstable' as const,
+              waitedMs, snapshotInvalidated: true, mimeType: captured.mimeType, dataBase64: captured.dataBase64,
+              width: captured.width, height: captured.height, fallbackUsed: captured.fallbackUsed };
+            record.state = 'complete'; record.result = result;
+            return result;
+          }
+          const saved = await this.options.saveScreenshot!({ workspaceId, expectedWorkspace, path: output.path, bytes: Buffer.from(captured.dataBase64, 'base64') });
+          const result = { sessionId, actionState: 'complete' as const, captureState: stable ? 'complete' as const : 'unstable' as const,
+            waitedMs, snapshotInvalidated: true, mimeType: 'image/png' as const, width: captured.width, height: captured.height,
+            fallbackUsed: false as const, receipt: saved };
+          record.state = 'complete'; record.result = result;
+          return result;
+        } catch (error) {
+          this.invalidateSnapshot(entry);
+          const result = { sessionId, actionState: 'complete' as const, captureState: 'failed' as const, waitedMs,
+            snapshotInvalidated: true, failureCode: error instanceof LocalBridgeError || error instanceof DevelopmentBrokerError ? error.code : 'INTERNAL_ERROR' };
+          record.state = 'complete'; record.result = result;
+          return result;
+        }
+      } catch (error) {
+        if (!effectStarted) {
+          this.compositeOperations.delete(operationKey);
+          throw error;
+        }
+        this.invalidateSnapshot(entry);
+        const result = { sessionId, actionState: actionCompleted ? 'complete' as const : 'uncertain' as const,
+          captureState: 'skipped' as const, waitedMs: 0, snapshotInvalidated: true,
+          failureCode: error instanceof LocalBridgeError || error instanceof DevelopmentBrokerError ? error.code : 'INTERNAL_ERROR' };
+        record.state = 'complete'; record.result = result;
+        return result;
+      } finally {
+        if (objectId !== undefined) await entry.content.webContents.debugger.sendCommand('Runtime.releaseObject', { objectId }).catch(() => undefined);
+        this.endAgentOperation(entry);
+      }
+    })();
+    record.completion = run;
+    return run;
   }
 
   async hover(workspaceId: string, sessionId: string, snapshotId: string, elementRef: string, operationId?: string) {
@@ -2573,6 +3003,7 @@ export class BrowserController {
     for (const [key, value] of this.operations) if (value === sessionId) this.operations.delete(key);
     for (const key of this.humanControlOperations.keys()) if (key.includes(`:${sessionId}:`)) this.humanControlOperations.delete(key);
     for (const [key, value] of this.interactionOperations) if (value.sessionId === sessionId) this.interactionOperations.delete(key);
+    for (const [key, value] of this.compositeOperations) if (value.sessionId === sessionId) this.compositeOperations.delete(key);
   }
 
   async stop(workspaceId: string, sessionId: string): Promise<BrowserSessionSummary> {

@@ -31,6 +31,7 @@ const limitsSchema = z.object({
 
 const profileAvailabilitySchema = z.object({
   name: z.string(),
+  source: z.literal('reviewed'),
   available: z.boolean(),
   blockedReason: z.enum(['capability-disabled', 'automation-review-required']).optional(),
 }).strict();
@@ -71,7 +72,7 @@ const DESCRIPTION = [
   'Lists the workspaces the user has authorized for this server, with their current permissions and limits.',
   'Only enabled workspaces are returned; the model can never see or reference a workspace the user has not explicitly authorized.',
   'Use this before any other workspace or file tool to discover valid workspaceId values and avoid calling operations that will be denied.',
-  'profileAvailability reports whether each saved validation, process and browser profile is currently usable, and why it is blocked, without granting any capability.',
+  'profileAvailability contains only locally reviewed profiles and reports whether each is currently usable, and why it is blocked, without granting any capability. Detected setup proposals are reported separately by project.list and are never treated as reviewed profiles.',
   'Requires no permissions and never modifies state.',
 ].join(' ');
 
@@ -115,11 +116,13 @@ export function registerWorkspaceListTool(server: McpServer, ctx: ToolContext): 
               profileAvailability: {
                 validations: validationProfiles.map((name) => ({
                   name,
+                  source: 'reviewed' as const,
                   available: workspace.permissions.validations,
                   ...(workspace.permissions.validations ? {} : { blockedReason: 'capability-disabled' as const }),
                 })),
                 processes: processProfiles.map((name) => ({
                   name,
+                  source: 'reviewed' as const,
                   available: workspace.permissions.processes && !automationBlocked,
                   ...(!workspace.permissions.processes
                     ? { blockedReason: 'capability-disabled' as const }
@@ -127,6 +130,7 @@ export function registerWorkspaceListTool(server: McpServer, ctx: ToolContext): 
                 })),
                 browser: browserProfiles.map((name) => ({
                   name,
+                  source: 'reviewed' as const,
                   available: workspace.permissions.browserRead && !automationBlocked,
                   ...(!workspace.permissions.browserRead
                     ? { blockedReason: 'capability-disabled' as const }

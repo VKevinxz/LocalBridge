@@ -39,6 +39,7 @@ export interface MotionCaptureProgress {
 
 export interface MotionCaptureValue {
   readonly manifest: ArtifactFileReceipt;
+  readonly quality: ArtifactFileReceipt;
   readonly contactSheet: ArtifactFileReceipt;
   readonly frameCount: number;
   readonly width: number;
@@ -59,6 +60,16 @@ interface MotionFrameSample {
   readonly sha256: string;
   readonly size: number;
   readonly activeAnimationCount: number;
+}
+
+interface MotionFrameQuality {
+  readonly index: number;
+  readonly targetProgress: number;
+  readonly observedScrollBefore: { readonly x: number; readonly y: number };
+  readonly observedScrollAfter: { readonly x: number; readonly y: number };
+  readonly requestAtMs: number;
+  readonly receivedAtMs: number;
+  readonly persistDurationMs: number;
 }
 
 interface PageMotionState {
@@ -238,23 +249,38 @@ async function persistFrame(
   context: MotionCaptureContext,
   contactSheet: ContactSheet,
   samples: MotionFrameSample[],
+  quality: MotionFrameQuality[],
   index: number,
   progress: number,
   elapsedMs: number,
   state: PageMotionState,
+  stateAfter: PageMotionState,
   bytes: Buffer,
+  requestAtMs: number,
+  receivedAtMs: number,
 ): Promise<void> {
   ensurePng(bytes, context.viewport);
   contactSheet.add(index, bytes);
   const path = `frames/frame-${String(index).padStart(3, '0')}.png`;
+  const persistStarted = performance.now();
   const receipt = await context.writer.write(path, bytes);
   samples.push({ index, progress, elapsedMs, scrollX: state.scrollX, scrollY: state.scrollY,
     path: receipt.path, sha256: receipt.sha256, size: receipt.size, activeAnimationCount: state.activeAnimationCount });
+  quality.push({
+    index,
+    targetProgress: progress,
+    observedScrollBefore: { x: state.scrollX, y: state.scrollY },
+    observedScrollAfter: { x: stateAfter.scrollX, y: stateAfter.scrollY },
+    requestAtMs,
+    receivedAtMs,
+    persistDurationMs: Math.max(0, Math.round(performance.now() - persistStarted)),
+  });
   context.onProgress?.({ completed: index + 1, total: context.trajectory.sampleCount });
 }
 
-async function captureStepped(context: MotionCaptureContext, contactSheet: ContactSheet): Promise<{ samples: MotionFrameSample[]; droppedFrames: number }> {
+async function captureStepped(context: MotionCaptureContext, contactSheet: ContactSheet): Promise<{ samples: MotionFrameSample[]; quality: MotionFrameQuality[]; droppedFrames: number }> {
   const samples: MotionFrameSample[] = [];
+  const quality: MotionFrameQuality[] = [];
   const interval = context.trajectory.durationMs / (context.trajectory.sampleCount - 1);
   const began = performance.now();
   for (let index = 0; index < context.trajectory.sampleCount; index += 1) {
@@ -265,14 +291,17 @@ async function captureStepped(context: MotionCaptureContext, contactSheet: Conta
     const state = await setScrollPosition(context.webContents,
       context.trajectory.startY + context.trajectory.distancePx * progress);
     context.assertCurrent();
+    const requestAtMs = Math.max(0, Math.round(performance.now() - began));
     const bytes = await capturePng(context.webContents, context.viewport);
-    await persistFrame(context, contactSheet, samples, index, progress,
-      Math.max(0, Math.round(performance.now() - began)), state, bytes);
+    const receivedAtMs = Math.max(requestAtMs, Math.round(performance.now() - began));
+    const stateAfter = await pageState(context.webContents);
+    await persistFrame(context, contactSheet, samples, quality, index, progress,
+      receivedAtMs, state, stateAfter, bytes, requestAtMs, receivedAtMs);
   }
-  return { samples, droppedFrames: 0 };
+  return { samples, quality, droppedFrames: 0 };
 }
 
-async function captureScreencast(context: MotionCaptureContext, contactSheet: ContactSheet): Promise<{ samples: MotionFrameSample[]; droppedFrames: number } | undefined> {
+async function captureScreencast(context: MotionCaptureContext, contactSheet: ContactSheet): Promise<{ samples: MotionFrameSample[]; quality: MotionFrameQuality[]; droppedFrames: number } | undefined> {
   let latestSequence: number | undefined;
   let sequence = 0;
   let consumedSequence = 0;
@@ -309,6 +338,7 @@ async function captureScreencast(context: MotionCaptureContext, contactSheet: Co
     if (!available || latestSequence === undefined) return undefined;
 
     const samples: MotionFrameSample[] = [];
+    const quality: MotionFrameQuality[] = [];
     const began = performance.now();
     context.onEffectStart?.();
     let scrollError: unknown;
@@ -322,16 +352,19 @@ async function captureScreencast(context: MotionCaptureContext, contactSheet: Co
         if (latestSequence === undefined) fail('MOTION_CAPTURE_INTERRUPTED', 'El screencast dejó de producir frames.');
         consumedSequence = latestSequence;
         const state = await pageState(context.webContents);
+        const requestAtMs = Math.max(0, Math.round(performance.now() - began));
         const bytes = await capturePng(context.webContents, context.viewport);
-        await persistFrame(context, contactSheet, samples, index, index / (context.trajectory.sampleCount - 1),
-          Math.max(0, Math.round(performance.now() - began)), state, bytes);
+        const receivedAtMs = Math.max(requestAtMs, Math.round(performance.now() - began));
+        const stateAfter = await pageState(context.webContents);
+        await persistFrame(context, contactSheet, samples, quality, index, index / (context.trajectory.sampleCount - 1),
+          receivedAtMs, state, stateAfter, bytes, requestAtMs, receivedAtMs);
       }
       await scroll;
       if (scrollError !== undefined) throw scrollError;
     } finally {
       await scroll;
     }
-    return { samples, droppedFrames };
+    return { samples, quality, droppedFrames };
   } finally {
     if (started) await context.webContents.debugger.sendCommand('Page.stopScreencast').catch(() => undefined);
     context.webContents.debugger.off('message', onMessage);
@@ -510,7 +543,7 @@ export async function capturePageMotion(context: MotionCaptureContext): Promise<
     await context.writer.ensureCapacity(worstTotal);
     assertWithinDeadline();
     const contactSheet = new ContactSheet(trajectory.sampleCount);
-    let captured: { samples: MotionFrameSample[]; droppedFrames: number } | undefined;
+    let captured: { samples: MotionFrameSample[]; quality: MotionFrameQuality[]; droppedFrames: number } | undefined;
     let mode: 'stepped' | 'screencast' = 'stepped';
     if (context.captureMode !== 'stepped') {
       captured = await captureScreencast(boundedContext, contactSheet);
@@ -548,8 +581,19 @@ export async function capturePageMotion(context: MotionCaptureContext): Promise<
     };
     const manifestReceipt = await context.writer.write('manifest.json', Buffer.from(JSON.stringify(manifest, null, 2), 'utf8'));
     assertWithinDeadline();
+    const quality = {
+      formatVersion: 1,
+      kind: 'localbridge-motion-quality',
+      manifestSha256: manifestReceipt.sha256,
+      clock: 'performance.now',
+      timingOrigin: 'capture-start',
+      samples: captured.quality,
+    };
+    const qualityReceipt = await context.writer.write('quality.json', Buffer.from(JSON.stringify(quality, null, 2), 'utf8'));
+    assertWithinDeadline();
     return {
       manifest: manifestReceipt,
+      quality: qualityReceipt,
       contactSheet: contactReceipt,
       frameCount: captured.samples.length,
       width: context.viewport.width,

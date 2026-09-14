@@ -90,6 +90,7 @@ const captureReceiptFields = {
   totalSize: z.number().int().nonnegative(),
   fileCount: z.number().int().positive(),
   manifestPath: z.string(),
+  qualityPath: z.string().optional(),
   contactSheetPath: z.string(),
   frameCount: z.number().int().min(3).max(24),
   width: z.number().int().positive(),
@@ -138,28 +139,52 @@ const manifestSchema = z.object({
   warnings: z.array(z.string().max(512)).max(16),
   truncated: z.boolean(),
 }).strict();
+const qualitySchema = z.object({
+  formatVersion: z.literal(1),
+  kind: z.literal('localbridge-motion-quality'),
+  manifestSha256: z.string().regex(/^[a-f0-9]{64}$/),
+  clock: z.literal('performance.now'),
+  timingOrigin: z.literal('capture-start'),
+  samples: z.array(z.object({
+    index: z.number().int().nonnegative(), targetProgress: z.number().min(0).max(1),
+    observedScrollBefore: z.object({ x: z.number(), y: z.number() }).strict(),
+    observedScrollAfter: z.object({ x: z.number(), y: z.number() }).strict(),
+    requestAtMs: z.number().int().nonnegative(), receivedAtMs: z.number().int().nonnegative(),
+    persistDurationMs: z.number().int().nonnegative(),
+  }).strict()).min(3).max(24),
+}).strict();
 
 const compareInputSchema = z.object({
   workspaceId: workspaceIdSchema,
   referenceManifestPath: manifestPathSchema,
   candidateManifestPath: manifestPathSchema,
   path: bundlePathSchema,
-  alignment: z.literal('scroll-progress').default('scroll-progress'),
+  alignment: z.enum(['scroll-progress', 'scroll-position']).default('scroll-progress'),
+  scrollTolerancePx: z.number().int().min(0).max(100).default(1),
   threshold: z.number().min(0).max(1).default(0.1),
   includeAA: z.boolean().default(false),
   operationId: operationIdSchema,
 }).strict();
 const frameDifferenceSchema = z.object({
   index: z.number().int().nonnegative(), progress: z.number().min(0).max(1),
+  referenceIndex: z.number().int().nonnegative().optional(), candidateIndex: z.number().int().nonnegative().optional(),
+  referenceScrollY: z.number().optional(), candidateScrollY: z.number().optional(),
   mismatchPixels: z.number().int().nonnegative(), mismatchRatio: z.number().min(0).max(1), path: z.string(),
 }).strict();
 const compareOutputSchema = z.object({
   path: z.string(), created: z.literal(true), totalSize: z.number().int().nonnegative(), fileCount: z.number().int().positive(),
-  reportPath: z.string(), contactSheetPath: z.string(), frameCount: z.number().int().min(3).max(24),
+  reportPath: z.string(), contactSheetPath: z.string(), frameCount: z.number().int().min(0).max(24),
   width: z.number().int().positive(), height: z.number().int().positive(),
   averageMismatchRatio: z.number().min(0).max(1), maximumMismatchRatio: z.number().min(0).max(1),
   worstFrame: z.number().int().nonnegative(), threshold: z.number().min(0).max(1), includeAA: z.boolean(),
   differences: z.array(frameDifferenceSchema).max(24), warnings: z.array(z.string().max(512)).max(32),
+  alignment: z.enum(['scroll-progress', 'scroll-position']).optional(),
+  coverage: z.object({
+    matchedPairs: z.number().int().nonnegative(), referenceSamples: z.number().int().positive(), candidateSamples: z.number().int().positive(),
+    unmatchedReference: z.array(z.number().int().nonnegative()).max(24), unmatchedCandidate: z.array(z.number().int().nonnegative()).max(24),
+    fitness: z.enum(['position-aligned', 'nominal', 'incomplete']),
+  }).strict().optional(),
+  quality: z.object({ reference: z.enum(['known', 'unknown']), candidate: z.enum(['known', 'unknown']) }).strict().optional(),
 }).strict();
 
 function client(ctx: ToolContext) {
@@ -243,15 +268,58 @@ function validateManifest(manifest: z.infer<typeof manifestSchema>): void {
   }
 }
 
-function requireCompatible(reference: z.infer<typeof manifestSchema>, candidate: z.infer<typeof manifestSchema>): void {
+function requireCompatible(reference: z.infer<typeof manifestSchema>, candidate: z.infer<typeof manifestSchema>, alignment: 'scroll-progress' | 'scroll-position'): void {
   const same = reference.formatVersion === candidate.formatVersion &&
     JSON.stringify(reference.viewport) === JSON.stringify(candidate.viewport) &&
     reference.trajectory.axis === candidate.trajectory.axis &&
-    reference.trajectory.start === candidate.trajectory.start &&
-    reference.trajectory.end === candidate.trajectory.end &&
-    JSON.stringify(reference.trajectory.progress) === JSON.stringify(candidate.trajectory.progress) &&
-    reference.samples.length === candidate.samples.length;
+    (alignment === 'scroll-position' || (
+      reference.trajectory.start === candidate.trajectory.start &&
+      reference.trajectory.end === candidate.trajectory.end &&
+      JSON.stringify(reference.trajectory.progress) === JSON.stringify(candidate.trajectory.progress) &&
+      reference.samples.length === candidate.samples.length
+    ));
   if (!same) throw new LocalBridgeError('MOTION_BUNDLES_INCOMPATIBLE');
+}
+
+function comparisonEvidenceWarnings(
+  reference: z.infer<typeof manifestSchema>,
+  candidate: z.infer<typeof manifestSchema>,
+): string[] {
+  const comparableCount = Math.min(reference.samples.length, candidate.samples.length);
+  const scrollDeltas = reference.samples.slice(0, comparableCount).map((sample, index) =>
+    Math.abs(sample.scrollY - candidate.samples[index]!.scrollY));
+  const misaligned = scrollDeltas.filter((delta) => delta > 1);
+  const warnings: string[] = [];
+  if (misaligned.length > 0) {
+    const maximum = Math.max(...misaligned);
+    warnings.push(
+      `Observed scroll positions differ by up to ${maximum} CSS px in ${misaligned.length}/${scrollDeltas.length} nominally aligned samples. Visual scores remain raw but are not clean position-aligned fidelity evidence.`,
+    );
+  }
+  if (reference.environment.captureMode !== candidate.environment.captureMode) {
+    warnings.push('Motion capture modes differ; sampled and continuous traces do not provide equivalent temporal evidence.');
+  }
+  if (reference.trajectory.durationMs !== candidate.trajectory.durationMs) {
+    warnings.push('Motion capture durations differ; matching scroll progress does not establish matching animation time.');
+  }
+  if (reference.environment.visibility !== candidate.environment.visibility) {
+    warnings.push('Document visibility differs between traces; background throttling may affect motion evidence.');
+  }
+  if (reference.environment.prefersReducedMotion !== candidate.environment.prefersReducedMotion) {
+    warnings.push('The reduced-motion preference differs between traces; animation behavior may not be comparable.');
+  }
+  for (const [label, manifest] of [['reference', reference], ['candidate', candidate]] as const) {
+    if (manifest.droppedFrames > 0) {
+      warnings.push(
+        `The ${label} trace dropped ${manifest.droppedFrames} intermediate screencast events through bounded backpressure; this does not mean persisted PNG samples are missing.`,
+      );
+    }
+  }
+  if (reference.samples.some((sample) => sample.activeAnimationCount > 0) ||
+      candidate.samples.some((sample) => sample.activeAnimationCount > 0)) {
+    warnings.push('Active animations were present during at least one sample; compare repeated traces before treating dynamic differences as deterministic.');
+  }
+  return warnings;
 }
 
 async function readManifest(workspace: Awaited<ReturnType<typeof requireAuthorizedWorkspace>>, manifestPath: string) {
@@ -265,7 +333,65 @@ async function readManifest(workspace: Awaited<ReturnType<typeof requireAuthoriz
   const result = manifestSchema.safeParse(parsed);
   if (!result.success) throw new LocalBridgeError('MOTION_BUNDLE_INVALID');
   validateManifest(result.data);
+  return { manifest: result.data, sha256: file.sha256 };
+}
+
+async function readQuality(
+  workspace: Awaited<ReturnType<typeof requireAuthorizedWorkspace>>,
+  manifestPath: string,
+  manifestSha256: string,
+): Promise<z.infer<typeof qualitySchema> | undefined> {
+  const base = path.posix.dirname(manifestPath.replaceAll('\\', '/'));
+  const qualityPath = base === '.' ? 'quality.json' : `${base}/quality.json`;
+  let file: Awaited<ReturnType<typeof readWorkspaceBinaryFile>>;
+  try {
+    file = await readWorkspaceBinaryFile(workspace, qualityPath, 1024 * 1024);
+  } catch (error) {
+    if (error instanceof LocalBridgeError && error.code === 'FILE_NOT_FOUND') return undefined;
+    throw error;
+  }
+  let parsed: unknown;
+  try { parsed = JSON.parse(file.bytes.toString('utf8')); }
+  catch { throw new LocalBridgeError('MOTION_BUNDLE_INVALID'); }
+  const result = qualitySchema.safeParse(parsed);
+  if (!result.success || result.data.manifestSha256 !== manifestSha256) throw new LocalBridgeError('MOTION_BUNDLE_INVALID');
+  if (result.data.samples.some((sample, index) => sample.index !== index || sample.receivedAtMs < sample.requestAtMs)) {
+    throw new LocalBridgeError('MOTION_BUNDLE_INVALID');
+  }
   return result.data;
+}
+
+interface MotionPair { readonly referenceIndex: number; readonly candidateIndex: number }
+
+function alignMotionSamples(
+  reference: z.infer<typeof manifestSchema>,
+  candidate: z.infer<typeof manifestSchema>,
+  alignment: 'scroll-progress' | 'scroll-position',
+  tolerance: number,
+): MotionPair[] {
+  if (alignment === 'scroll-progress') {
+    return reference.samples.map((_sample, index) => ({ referenceIndex: index, candidateIndex: index }));
+  }
+  const pairs: MotionPair[] = [];
+  let candidateStart = 0;
+  for (let referenceIndex = 0; referenceIndex < reference.samples.length; referenceIndex += 1) {
+    const target = reference.samples[referenceIndex]!.scrollY;
+    let selected = -1;
+    let selectedDelta = Number.POSITIVE_INFINITY;
+    for (let candidateIndex = candidateStart; candidateIndex < candidate.samples.length; candidateIndex += 1) {
+      const delta = Math.abs(candidate.samples[candidateIndex]!.scrollY - target);
+      if (delta <= tolerance && delta < selectedDelta) {
+        selected = candidateIndex;
+        selectedDelta = delta;
+      }
+      if (candidate.samples[candidateIndex]!.scrollY > target + tolerance && selected >= 0) break;
+    }
+    if (selected >= 0) {
+      pairs.push({ referenceIndex, candidateIndex: selected });
+      candidateStart = selected + 1;
+    }
+  }
+  return pairs;
 }
 
 async function readDeclaredFrame(
@@ -284,23 +410,30 @@ async function compareMotionBundles(
   workspace: Awaited<ReturnType<typeof requireAuthorizedWorkspace>>,
   input: z.infer<typeof compareInputSchema>,
 ) {
-  const [reference, candidate] = await Promise.all([
+  const [referenceRead, candidateRead] = await Promise.all([
     readManifest(workspace, input.referenceManifestPath),
     readManifest(workspace, input.candidateManifestPath),
   ]);
-  requireCompatible(reference, candidate);
-  const contactSheet = new ContactSheet(reference.samples.length);
+  const reference = referenceRead.manifest;
+  const candidate = candidateRead.manifest;
+  requireCompatible(reference, candidate, input.alignment);
+  const [referenceQuality, candidateQuality] = await Promise.all([
+    readQuality(workspace, input.referenceManifestPath, referenceRead.sha256),
+    readQuality(workspace, input.candidateManifestPath, candidateRead.sha256),
+  ]);
+  const pairs = alignMotionSamples(reference, candidate, input.alignment, input.scrollTolerancePx);
+  const contactSheet = new ContactSheet(Math.max(1, pairs.length));
   const warnings = [...new Set([
+    ...comparisonEvidenceWarnings(reference, candidate),
     ...reference.warnings,
     ...candidate.warnings,
-    ...(reference.samples.some((sample) => sample.activeAnimationCount > 0) || candidate.samples.some((sample) => sample.activeAnimationCount > 0)
-      ? ['Active animations were present during at least one sample; compare repeated traces before treating dynamic differences as deterministic.'] : []),
   ])].slice(0, 32);
   return createWorkspaceArtifactDirectory(workspace, input.path, async (writer: WorkspaceArtifactWriter) => {
     const differences: Array<z.infer<typeof frameDifferenceSchema>> = [];
-    for (let index = 0; index < reference.samples.length; index += 1) {
-      const referenceSample = reference.samples[index]!;
-      const candidateSample = candidate.samples[index]!;
+    for (let index = 0; index < pairs.length; index += 1) {
+      const pair = pairs[index]!;
+      const referenceSample = reference.samples[pair.referenceIndex]!;
+      const candidateSample = candidate.samples[pair.candidateIndex]!;
       const [referenceFrame, candidateFrame] = await Promise.all([
         readDeclaredFrame(workspace, input.referenceManifestPath, referenceSample),
         readDeclaredFrame(workspace, input.candidateManifestPath, candidateSample),
@@ -324,19 +457,36 @@ async function compareMotionBundles(
       differences.push({
         index,
         progress: referenceSample.progress,
+        referenceIndex: pair.referenceIndex,
+        candidateIndex: pair.candidateIndex,
+        referenceScrollY: referenceSample.scrollY,
+        candidateScrollY: candidateSample.scrollY,
         mismatchPixels,
         mismatchRatio: mismatchPixels / (referenceFrame.width * referenceFrame.height),
         path: `${input.path}/${receipt.path}`,
       });
     }
     const contact = await writer.write('contact-sheet.png', contactSheet.encode());
-    const maximumMismatchRatio = Math.max(...differences.map((item) => item.mismatchRatio));
-    const averageMismatchRatio = differences.reduce((sum, item) => sum + item.mismatchRatio, 0) / differences.length;
-    const worst = differences.reduce((left, right) => right.mismatchRatio > left.mismatchRatio ? right : left);
+    const maximumMismatchRatio = differences.length === 0 ? 0 : Math.max(...differences.map((item) => item.mismatchRatio));
+    const averageMismatchRatio = differences.length === 0 ? 0 : differences.reduce((sum, item) => sum + item.mismatchRatio, 0) / differences.length;
+    const worst = differences.length === 0 ? { index: 0 } : differences.reduce((left, right) => right.mismatchRatio > left.mismatchRatio ? right : left);
+    const referenceMatched = new Set(pairs.map((pair) => pair.referenceIndex));
+    const candidateMatched = new Set(pairs.map((pair) => pair.candidateIndex));
+    const coverage = {
+      matchedPairs: pairs.length,
+      referenceSamples: reference.samples.length,
+      candidateSamples: candidate.samples.length,
+      unmatchedReference: reference.samples.map((_sample, index) => index).filter((index) => !referenceMatched.has(index)),
+      unmatchedCandidate: candidate.samples.map((_sample, index) => index).filter((index) => !candidateMatched.has(index)),
+      fitness: input.alignment === 'scroll-progress' ? 'nominal' as const :
+        pairs.length === reference.samples.length && pairs.length === candidate.samples.length ? 'position-aligned' as const : 'incomplete' as const,
+    };
+    if (coverage.fitness === 'incomplete') warnings.unshift('Scroll-position alignment has incomplete coverage; unmatched samples were not reused or interpolated.');
     const report = {
       formatVersion: 1,
       kind: 'localbridge-motion-comparison',
       alignment: input.alignment,
+      scrollTolerancePx: input.scrollTolerancePx,
       referenceManifestPath: input.referenceManifestPath,
       candidateManifestPath: input.candidateManifestPath,
       viewport: reference.viewport,
@@ -346,6 +496,8 @@ async function compareMotionBundles(
       maximumMismatchRatio,
       worstFrame: worst.index,
       differences,
+      coverage,
+      quality: { reference: referenceQuality === undefined ? 'unknown' : 'known', candidate: candidateQuality === undefined ? 'unknown' : 'known' },
       warnings,
     };
     const reportReceipt = await writer.write('report.json', Buffer.from(JSON.stringify(report, null, 2), 'utf8'));
@@ -360,6 +512,9 @@ async function compareMotionBundles(
       worstFrame: worst.index,
       differences,
       warnings,
+      alignment: input.alignment,
+      coverage,
+      quality: { reference: referenceQuality === undefined ? 'unknown' as const : 'known' as const, candidate: candidateQuality === undefined ? 'unknown' as const : 'known' as const },
     };
   }, {
     maxFileBytes: 256 * 1024 * 1024,
@@ -451,7 +606,7 @@ export function registerWebMotionCaptureTool(server: McpServer, ctx: ToolContext
 export function registerVisualMotionCompareTool(server: McpServer, ctx: ToolContext): void {
   server.registerTool('visual.motion.compare', {
     title: 'Compare two saved motion traces',
-    description: 'Validates two existing .lbmotion manifest paths and their declared frame hashes, requires identical viewport and scroll-progress vectors, then atomically creates pixel-diff frames, a contact sheet and report in a new .lbmotion directory. If a manifest is missing, capture that trace again after fixing the original capture error. Requires workspace read and write.',
+    description: 'Validates two existing .lbmotion traces and declared frame hashes, then compares either the original nominal progress pairs or unique ordered samples within a declared observed-scroll tolerance. It reports unmatched samples and capture-quality availability without interpolating or reusing frames. Requires workspace read and write.',
     inputSchema: compareInputSchema,
     outputSchema: compareOutputSchema,
     annotations: { readOnlyHint: false, idempotentHint: true, destructiveHint: false, openWorldHint: false },
@@ -463,7 +618,7 @@ export function registerVisualMotionCompareTool(server: McpServer, ctx: ToolCont
       const key = idempotencyKey('visual.motion.compare', input.workspaceId, input.operationId);
       const fingerprint = idempotencyFingerprint(
         input.referenceManifestPath, input.candidateManifestPath, input.path,
-        input.alignment, String(input.threshold), String(input.includeAA),
+        input.alignment, String(input.scrollTolerancePx), String(input.threshold), String(input.includeAA),
       );
       const compared = await withAuthorizedWorkspaceCapabilitiesEffect(
         ctx.workspaceConfigPath,
@@ -492,6 +647,9 @@ export function registerVisualMotionCompareTool(server: McpServer, ctx: ToolCont
               includeAA: input.includeAA,
               differences: artifact.value.differences,
               warnings: artifact.value.warnings,
+              alignment: artifact.value.alignment,
+              coverage: artifact.value.coverage,
+              quality: artifact.value.quality,
             };
           } finally {
             activeMotionComparisons -= 1;

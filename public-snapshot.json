@@ -57,6 +57,8 @@
     "docs/releases/v1.6.2.md",
     "docs/releases/v1.6.3.md",
     "docs/releases/v1.7.0.md",
+    "docs/releases/v1.8.0.md",
+    "docs/releases/v1.8.1.md",
     "docs/releases/preview-v1.1.0.1.md",
     "docs/releases/preview-v1.1.0.2.md",
     "docs/releases/preview-v1.1.0.3.md",
@@ -75,6 +77,7 @@
   ],
   "excludedExtensions": [
     ".db",
+    ".enc",
     ".exe",
     ".key",
     ".log",

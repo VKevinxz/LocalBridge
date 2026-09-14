@@ -8,6 +8,28 @@ import type { ToolContext } from "../tool-context.js";
 import { toolError, toolSuccess } from "../tool-result.js";
 
 const projectIdSchema = z.string().regex(/^project_[a-f0-9]{24}$/);
+const reviewedProfileSchema = z.object({
+  workspaceId: z.string().max(160),
+  name: z.string().max(64),
+  available: z.boolean(),
+  blockedReason: z.enum(["capability-disabled", "automation-review-required"]).optional(),
+}).strict();
+const automationAvailabilitySchema = z.object({
+  reviewedProfiles: z.object({
+    processes: z.array(reviewedProfileSchema).max(256),
+    validations: z.array(reviewedProfileSchema).max(256),
+    browser: z.array(reviewedProfileSchema).max(256),
+  }).strict(),
+  detectedProposal: z.object({
+    state: z.enum(["none", "detected-awaiting-review", "applying", "detected-inactive"]),
+    processCount: z.number().int().min(0).max(128),
+    validationCount: z.number().int().min(0).max(128),
+  }).strict(),
+}).strict();
+const emptyAutomationAvailability = {
+  reviewedProfiles: { processes: [], validations: [], browser: [] },
+  detectedProposal: { state: "none" as const, processCount: 0, validationCount: 0 },
+};
 const projectSchema = z.object({
   projectId: projectIdSchema,
   name: z.string().max(80),
@@ -27,6 +49,7 @@ const projectSchema = z.object({
     terminalAvailable: z.boolean(),
     blockedReason: z.enum(["trust-inactive", "device-mismatch", "guided-mode", "sandbox-unavailable", "project-not-ready"]).optional(),
   }).strict(),
+  automation: automationAvailabilitySchema.default(emptyAutomationAvailability),
 }).strict();
 const planSummarySchema = z.object({
   planSha256: z.string().regex(/^[a-f0-9]{64}$/),
@@ -76,7 +99,7 @@ export function registerProjectListTool(server: McpServer, ctx: ToolContext): vo
   const outputSchema = z.object({ projects: z.array(projectSchema).max(500) }).strict();
   server.registerTool("project.list", {
     title: "List assisted local projects",
-    description: "Lists user-created project groupings, their readiness, scan coverage and effective terminal availability. A blockedReason explains why execution is closed without granting it. It returns opaque references only and never returns roots, commands, manifests, dependencies, logs or environment values.",
+    description: "Lists user-created project groupings, their readiness, scan coverage, effective terminal availability, locally reviewed profiles and any separately detected setup proposal. A proposal is never a reviewed profile and never blocks a separately authorized full-host terminal. A blockedReason explains why a resource is closed without granting it. It returns opaque references only and never returns roots, commands, manifests, dependencies, logs or environment values.",
     inputSchema: z.object({}).strict(),
     outputSchema,
     annotations: { readOnlyHint: true, idempotentHint: true, destructiveHint: false, openWorldHint: false },

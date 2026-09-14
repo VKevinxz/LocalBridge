@@ -14,6 +14,7 @@ import {
   diagnosticTextSchema,
   externalDestinationSchema,
   newWorkspaceInputSchema,
+  tunnelConnectInputSchema,
   tunnelApiKeyInputSchema,
   portableImportSessionIdSchema,
   portableWorkspaceRefSchema,
@@ -98,6 +99,10 @@ describe('frontera IPC de Electron', () => {
     expect(() => tunnelApiKeyInputSchema.parse('   ')).toThrow();
     expect(() => tunnelApiKeyInputSchema.parse('x'.repeat(16_385))).toThrow();
     expect(tunnelApiKeyInputSchema.parse('clave-de-prueba')).toBe('clave-de-prueba');
+    expect(tunnelConnectInputSchema.parse({ remember: true })).toEqual({ remember: true });
+    expect(tunnelConnectInputSchema.parse({ apiKey: 'clave-efímera', remember: false })).toEqual({ apiKey: 'clave-efímera', remember: false });
+    expect(() => tunnelConnectInputSchema.parse({ apiKey: 'clave', remember: true, profileId: 'profile_other000' })).toThrow();
+    expect(() => tunnelConnectInputSchema.parse({ apiKey: 'clave' })).toThrow();
   });
 
   it('solo permite enlaces externos predefinidos, nunca una URL del renderer', () => {

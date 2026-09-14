@@ -9,6 +9,16 @@ import { describe, expect, it } from "vitest";
 const execFileAsync = promisify(execFile);
 
 describe("public source snapshot", () => {
+  it.skipIf(process.platform !== "win32")("runs the publication gate with the same argument-free call used by release workflows", async () => {
+    const { stdout } = await execFileAsync("powershell.exe", [
+      "-NoProfile",
+      "-ExecutionPolicy", "Bypass",
+      "-File", path.resolve("scripts/check-publication-readiness.ps1"),
+    ], { cwd: process.cwd(), timeout: 30_000, windowsHide: true });
+
+    expect(stdout).toContain("Publication metadata is ready for v1.8.1.");
+  }, 45_000);
+
   it.skipIf(process.platform !== "win32")("exports a clean tree without internal decision history", async () => {
     const parent = await mkdtemp(path.join(os.tmpdir(), "localbridge-public-snapshot-"));
     const destination = path.join(parent, "source");
@@ -29,7 +39,7 @@ describe("public source snapshot", () => {
     } finally {
       await rm(parent, { recursive: true, force: true });
     }
-  });
+  }, 45_000);
 
   it("keeps the approved no-license posture as an explicit fail-closed publication gate", async () => {
     const source = await readFile("scripts/check-publication-readiness.ps1", "utf8");

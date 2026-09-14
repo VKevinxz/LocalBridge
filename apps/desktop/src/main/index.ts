@@ -33,6 +33,7 @@ import {
 import {
   DEFAULT_CONNECTION_PROFILE,
   analysisJobTargetInputSchema,
+  taskBatchTargetInputSchema,
   FolderSelectionVault,
   TunnelSupervisor,
   absolutePathSchema,
@@ -56,6 +57,7 @@ import {
   backOnboarding,
   buildOnboardingSnapshot,
   completeOnboarding,
+  connectWithTunnelCredential,
   defaultDesktopSettingsPath,
   defaultWebProfileStorePath,
   defaultOnboardingStatePath,
@@ -87,6 +89,8 @@ import {
   migrateRegistryFile,
   migrateDevelopmentProjectsToCatalog,
   loadEncryptedKey,
+  migrateLegacyEncryptedKey,
+  publicStoredTunnelKeyState,
   legacyOnboardingMarkers,
   onboardingAccessInputSchema,
   onboardingCompletionInputSchema,
@@ -103,10 +107,11 @@ import {
   replaceDevelopmentProjects,
   replaceProjectTrust,
   resolveBundledRuntimePaths,
-  saveEncryptedKey,
+  saveAndVerifyEncryptedKey,
   synchronizeActiveConnectionProfile,
   newWorkspaceInputSchema,
   tunnelApiKeyInputSchema,
+  tunnelConnectInputSchema,
   tunnelIdSchema,
   portableImportSessionIdSchema,
   portableWorkspaceRefSchema,
@@ -186,6 +191,7 @@ import {
   createWorkspaceArtifactDirectory,
   createWorkspaceBinaryFile,
   createWorkspaceBinaryFileFromChunks,
+  preflightWorkspaceBinaryFileCreate,
 } from "@localbridge/filesystem";
 import {
   requireAuthorizedWorkspace,
@@ -195,6 +201,7 @@ import {
   withCurrentWorkspaceAuthorityEffect,
 } from "@localbridge/permissions";
 import { createLogger, defaultAuditDbPath, defaultWorkspaceConfigPath, LocalBridgeError } from "@localbridge/shared";
+import { runValidation } from "@localbridge/validation";
 import {
   AnalysisJobSupervisor,
   ApplicationSupervisor,
@@ -202,15 +209,19 @@ import {
   ProcessSupervisor,
   SetupSupervisor,
   TerminalSupervisor,
+  TaskBatchSupervisor,
   createDevelopmentRuntimeHandler,
   startDevelopmentBroker,
   type RunningDevelopmentBroker,
   type SetupRunSummary,
 } from "@localbridge/development";
 import {
+  isPathDenied,
   projectCatalogRecordSchema,
   projectScanRecordSchema,
   projectTrustModeSchema,
+  resolveSafePath,
+  resolveWriteTarget,
   type DevelopmentProject,
   type ProjectCatalogRecord,
   type ProjectScanRecord,
@@ -263,6 +274,8 @@ let setupSupervisor: SetupSupervisor | undefined;
 let terminalSupervisor: TerminalSupervisor | undefined;
 let analysisSupervisor: AnalysisJobSupervisor | undefined;
 let analysisUnavailableReason: 'journal-unavailable' | undefined;
+let taskBatchSupervisor: TaskBatchSupervisor | undefined;
+let taskBatchUnavailableReason: 'journal-unavailable' | undefined;
 let deviceBinding = "";
 const humanControlCoordinator = new HumanControlCoordinator();
 const projectRescanTimers = new Map<string, NodeJS.Timeout>();
@@ -1079,6 +1092,16 @@ async function startDevelopmentRuntime(): Promise<void> {
         () => createWorkspaceBinaryFile(input.expectedWorkspace, input.path, input.bytes),
       );
     },
+    preflightScreenshot: async (input) => {
+      if (input.expectedWorkspace.id !== input.workspaceId) throw new LocalBridgeError("APPROVAL_INVALID");
+      await withAuthorizedWorkspaceCapabilitiesEffect(
+        registryPath,
+        desktopSecurityLogger,
+        input.expectedWorkspace,
+        ["browserRead", "write"],
+        async () => { await preflightWorkspaceBinaryFileCreate(input.expectedWorkspace, input.path); },
+      );
+    },
     saveMotionBundle: async (input) => {
       if (input.expectedWorkspace.id !== input.workspaceId) throw new LocalBridgeError("APPROVAL_INVALID");
       return withAuthorizedWorkspaceCapabilitiesEffect(
@@ -1252,6 +1275,16 @@ async function startDevelopmentRuntime(): Promise<void> {
         });
       },
     ),
+    preflightDownload: (input) => withAuthorizedWebProfileEffect(
+      webProfileStorePath,
+      input.webProfileId,
+      input.profileRevision,
+      "download",
+      async () => {
+        const workspace = await requireAuthorizedWorkspace(registryPath, desktopSecurityLogger, input.workspaceId, "write");
+        await preflightWorkspaceBinaryFileCreate(workspace, input.path, { maximumBytes: input.maximumBytes });
+      },
+    ),
     saveDownloadStream: async (input) => {
       await requireCurrentWebProfileAuthority(
         webProfileStorePath,
@@ -1342,6 +1375,8 @@ async function startDevelopmentRuntime(): Promise<void> {
   });
   analysisSupervisor = undefined;
   analysisUnavailableReason = undefined;
+  taskBatchSupervisor = undefined;
+  taskBatchUnavailableReason = undefined;
   try {
     const artifactAnalysisRuntime = new ArtifactAnalysisRuntime({
       workspaceConfigPath: registryPath,
@@ -1362,6 +1397,63 @@ async function startDevelopmentRuntime(): Promise<void> {
       },
       onChange: () => sendToRenderer("development:changed"),
     });
+    try {
+      taskBatchSupervisor = new TaskBatchSupervisor({
+        journalPath: join(dirname(auditDbPath), "task-batches.sqlite"),
+        analysis: analysisSupervisor,
+        runValidation: async (workspaceId, profile, context) => {
+          const workspace = await requireAuthorizedWorkspace(registryPath, desktopSecurityLogger, workspaceId, "validations");
+          const command = workspace.validationProfiles[profile];
+          if (command === undefined) throw new LocalBridgeError("COMMAND_NOT_ALLOWED");
+          const result = await runValidation(workspace, profile, {
+            signal: context.signal,
+            onStarted: context.started,
+            onLockAcquired: context.lockAcquired,
+            onLockReleased: context.lockReleased,
+          });
+          return { ...result, reviewFingerprint: hashText(JSON.stringify(command)) };
+        },
+        revalidateRead: async (workspaceId) => {
+          await requireAuthorizedWorkspace(registryPath, desktopSecurityLogger, workspaceId, "read");
+        },
+        preflightBatch: async (request) => {
+          const workspace = await requireAuthorizedWorkspace(registryPath, desktopSecurityLogger, request.workspaceId, "read");
+          for (const child of request.children) {
+            if (child.operationKind === 'validation.run') {
+              const validationWorkspace = await requireAuthorizedWorkspace(
+                registryPath, desktopSecurityLogger, request.workspaceId, "validations",
+              );
+              if (validationWorkspace.validationProfiles[String(child.parameters['profile'])] === undefined) {
+                throw new LocalBridgeError('COMMAND_NOT_ALLOWED');
+              }
+              continue;
+            }
+            const sourcePath = child.sourcePath!;
+            if (isPathDenied(sourcePath, workspace.denyPatterns)) throw new LocalBridgeError('PATH_DENIED');
+            if (child.operationKind === 'web.download.start') {
+              await requireAuthorizedWorkspace(registryPath, desktopSecurityLogger, request.workspaceId, "write");
+              const destination = await resolveWriteTarget(workspace.rootPath, sourcePath, { createParentDirs: false });
+              if (destination.exists) throw new LocalBridgeError('FILE_ALREADY_EXISTS');
+              if (webController === undefined) throw new LocalBridgeError('FEATURE_UNAVAILABLE');
+              await webController.preflightDownloadReference(
+                String(child.parameters['sessionId']),
+                String(child.parameters['tabId']),
+                String(child.parameters['resourceRef']),
+              );
+              continue;
+            }
+            const source = await resolveSafePath(workspace.rootPath, sourcePath);
+            if (!source.exists) throw new LocalBridgeError('FILE_NOT_FOUND');
+          }
+        },
+        onChange: () => sendToRenderer("development:changed"),
+      });
+    } catch (error) {
+      taskBatchUnavailableReason = 'journal-unavailable';
+      desktopSecurityLogger.error('task batch runtime unavailable', {
+        errorName: error instanceof Error ? error.name : 'UnknownError',
+      });
+    }
   } catch (error) {
     // El journal nuevo es una capacidad aislada. Su caída impide admitir jobs
     // sin durabilidad, pero no derriba terminal, Git, navegador ni lecturas
@@ -1385,6 +1477,7 @@ async function startDevelopmentRuntime(): Promise<void> {
         },
       },
       ...(analysisSupervisor === undefined ? {} : { analysis: analysisSupervisor }),
+      ...(taskBatchSupervisor === undefined ? {} : { tasks: taskBatchSupervisor }),
       browser: browserController,
       web: webController,
     }),
@@ -1399,10 +1492,11 @@ async function listProjectsForBroker() {
   // (ADR-0040) para que pueda explicar una estructura parcial o una revisión
   // pendiente en vez de encontrarse una denegación sin causa visible. No se
   // exponen recuentos, rutas ni nombres de carpeta.
-  const [catalog, scans, trustStore] = await Promise.all([
+  const [catalog, scans, trustStore, setupSessions] = await Promise.all([
     loadProjectCatalog(projectCatalogPath()).catch(() => ({ schemaVersion: 1 as const, projects: [] })),
     loadProjectScanStore(projectScanPath()).catch(() => ({ schemaVersion: 1 as const, scans: [] })),
     loadProjectTrustStore(projectTrustPath()).catch(() => ({ schemaVersion: 1 as const, decisions: [] })),
+    listProjectSetupSessions(projectSetupStorePath()).catch(() => []),
   ]);
   return {
     projects: projects.filter((project) => project.workspaceIds.every((workspaceId) => enabled.has(workspaceId))).map((project) => {
@@ -1417,6 +1511,39 @@ async function listProjectsForBroker() {
             : trust.deviceBinding !== deviceBinding ? "device-mismatch" as const
               : trust.mode === "guided" ? "guided-mode" as const
                 : "sandbox-unavailable" as const;
+      const projectWorkspaces = registry.workspaces.filter((workspace) => project.workspaceIds.includes(workspace.id));
+      const reviewedProfiles = {
+        processes: projectWorkspaces.flatMap((workspace) => Object.keys(workspace.processProfiles ?? {}).toSorted().map((name) => ({
+          workspaceId: workspace.id,
+          name,
+          available: workspace.permissions.processes && workspace.automationReviewRequired !== true,
+          ...(!workspace.permissions.processes
+            ? { blockedReason: "capability-disabled" as const }
+            : workspace.automationReviewRequired === true ? { blockedReason: "automation-review-required" as const } : {}),
+        }))),
+        validations: projectWorkspaces.flatMap((workspace) => Object.keys(workspace.validationProfiles).toSorted().map((name) => ({
+          workspaceId: workspace.id,
+          name,
+          available: workspace.permissions.validations,
+          ...(workspace.permissions.validations ? {} : { blockedReason: "capability-disabled" as const }),
+        }))),
+        browser: projectWorkspaces.flatMap((workspace) => Object.keys(workspace.browserProfiles ?? {}).toSorted().map((name) => ({
+          workspaceId: workspace.id,
+          name,
+          available: workspace.permissions.browserRead && workspace.automationReviewRequired !== true,
+          ...(!workspace.permissions.browserRead
+            ? { blockedReason: "capability-disabled" as const }
+            : workspace.automationReviewRequired === true ? { blockedReason: "automation-review-required" as const } : {}),
+        }))),
+      };
+      const setupSession = setupSessions.filter((candidate) => candidate.projectId === project.id).at(-1);
+      const proposal = setupSession?.plan;
+      const setupPhase = setupSession?.phase;
+      const proposalState = proposal === undefined || setupPhase === "ready" || setupPhase === "cancelled"
+        ? "none" as const
+        : setupPhase === "awaiting-local-review" ? "detected-awaiting-review" as const
+          : setupPhase === "installing" || setupPhase === "finalizing" ? "applying" as const
+            : "detected-inactive" as const;
       return {
         projectId: project.id,
         name: project.name,
@@ -1430,6 +1557,14 @@ async function listProjectsForBroker() {
           trustMode: trust?.mode ?? "guided",
           terminalAvailable,
           ...(blockedReason === undefined ? {} : { blockedReason }),
+        },
+        automation: {
+          reviewedProfiles,
+          detectedProposal: {
+            state: proposalState,
+            processCount: proposalState === "none" ? 0 : proposal?.proposedProfiles.filter((profile) => profile.role === "server").length ?? 0,
+            validationCount: proposalState === "none" ? 0 : proposal?.proposedProfiles.filter((profile) => profile.role === "validation").length ?? 0,
+          },
         },
       };
     }),
@@ -1710,6 +1845,30 @@ async function activeConnectionContext() {
   return { settings, connection, keyPath: defaultTunnelKeyPath(connection.id) };
 }
 
+async function activeStoredTunnelKey() {
+  const context = await activeConnectionContext();
+  const migration = await migrateLegacyEncryptedKey({
+    profileIds: context.settings.connectionProfiles.map((profile) => profile.id),
+    activeProfileId: context.connection.id,
+  }, keyStoreDeps);
+  const loaded = await loadEncryptedKey(context.keyPath, keyStoreDeps);
+  if (loaded.status !== "absent") return { ...context, loaded, migration };
+  if (migration.status === "encryption-unavailable") {
+    return { ...context, loaded: { status: "encryption-unavailable" } as const, migration };
+  }
+  if (migration.status === "source-unreadable") {
+    return { ...context, loaded: { status: "unreadable" } as const, migration };
+  }
+  if (migration.status === "failed") {
+    return { ...context, loaded: { status: "io-error", code: "KEY_STORE_READ_FAILED" } as const, migration };
+  }
+  return { ...context, loaded, migration };
+}
+
+async function saveAndVerifyTunnelKey(keyPath: string, apiKey: string): Promise<boolean> {
+  return saveAndVerifyEncryptedKey(keyPath, apiKey, keyStoreDeps);
+}
+
 function assertTrustedSender(event: IpcMainInvokeEvent): void {
   const trustedContents = mainWindow === undefined || mainWindow.isDestroyed() ? undefined : mainWindow.webContents;
   assertTrustedIpcSender(event, trustedContents);
@@ -1863,14 +2022,22 @@ function registerIpcHandlers(): void {
       const provision = bundledProvisionOptions(connection);
       await initializeTunnelProfile(provision);
       const report = await diagnoseTunnelProfile({ ...provision, apiKey, gitApprovalMode: settings.gitApprovalMode });
+      let keyPersistence: "remembered" | "failed" | undefined;
       if (report.ok) {
-        await saveEncryptedKey(keyPath, apiKey, keyStoreDeps);
+        keyPersistence = await saveAndVerifyTunnelKey(keyPath, apiKey) ? "remembered" : "failed";
         diagnosedOnboardingProfiles.add(settings.activeConnectionProfileId);
         const previous = await currentOnboardingState();
         const next = { ...previous, selectedConnectionProfileId: settings.activeConnectionProfileId, updatedAt: new Date().toISOString() };
         await persistOnboardingState(previous, next);
       }
-      return { report, snapshot: await onboardingSnapshot(onboardingOwner(event)) };
+      return {
+        report: {
+          ...report,
+          ...(keyPersistence === undefined ? {} : { keyPersistence }),
+          ...(keyPersistence === "failed" ? { warningCode: "KEY_STORE_WRITE_FAILED" as const } : {}),
+        },
+        snapshot: await onboardingSnapshot(onboardingOwner(event)),
+      };
     });
   });
 
@@ -2265,9 +2432,11 @@ function registerIpcHandlers(): void {
       removal.removableApplicationIds.includes(entry.applicationId) && ["starting", "ready", "stopping"].includes(entry.state)) ?? [])
       .map((run) => currentApplicationSupervisor!.stop(run.runId)));
     const currentAnalysisSupervisor = analysisSupervisor;
+    const currentTaskBatchSupervisor = taskBatchSupervisor;
     const currentProcessSupervisor = processSupervisor;
     const currentBrowserController = browserController;
     await Promise.all(removal.removableWorkspaceIds.map(async (workspaceId) => {
+      await currentTaskBatchSupervisor?.cancelWorkspace(workspaceId);
       await currentAnalysisSupervisor?.cancelWorkspace(workspaceId);
       await Promise.all([
         ...(currentProcessSupervisor?.listAll().filter((entry) =>
@@ -2527,14 +2696,34 @@ function registerIpcHandlers(): void {
         listeners: listeners ?? [],
       };
     }));
+    const projectAvailability = (await listProjectsForBroker()).projects.map((project) => ({
+      projectId: project.projectId,
+      projectName: project.name,
+      terminalAvailable: project.execution.terminalAvailable,
+      reviewed: {
+        processes: project.automation.reviewedProfiles.processes.filter((profile) => profile.available).length,
+        validations: project.automation.reviewedProfiles.validations.filter((profile) => profile.available).length,
+        browser: project.automation.reviewedProfiles.browser.filter((profile) => profile.available).length,
+      },
+      detectedProposal: {
+        state: project.automation.detectedProposal.state,
+        processes: project.automation.detectedProposal.processCount,
+        validations: project.automation.detectedProposal.validationCount,
+      },
+    }));
     return {
       processes: (processSupervisor?.listAll() ?? []).filter((entry) => entry.state === "running"),
       browsers: (browserController?.listAll() ?? []).filter((entry) => entry.state === "running"),
       applications: (applicationSupervisor?.listAll() ?? []).filter((entry) => entry.state === "starting" || entry.state === "ready" || entry.state === "stopping"),
       terminals,
       jobs: analysisSupervisor?.listAll(50) ?? [],
+      taskBatches: taskBatchSupervisor?.listAll(50) ?? [],
+      availability: projectAvailability,
       analysisAvailability: analysisSupervisor === undefined
         ? { available: false as const, reason: analysisUnavailableReason ?? 'journal-unavailable' as const }
+        : { available: true as const },
+      taskBatchAvailability: taskBatchSupervisor === undefined
+        ? { available: false as const, reason: taskBatchUnavailableReason ?? 'journal-unavailable' as const }
         : { available: true as const },
       displays: displaySummaries,
       recommendedDisplayId: String(recommendedDisplay().id),
@@ -2560,6 +2749,16 @@ function registerIpcHandlers(): void {
     assertTrustedSender(event);
     const target = analysisJobTargetInputSchema.parse(input);
     return analysisSupervisor?.cancel(target.workspaceId, target.jobId);
+  });
+  ipcMain.handle("development:cancelTaskBatch", (event, input: unknown) => {
+    assertTrustedSender(event);
+    const target = taskBatchTargetInputSchema.parse(input);
+    return taskBatchSupervisor?.cancelMany(
+      target.workspaceId,
+      target.batchId,
+      target.localId === undefined ? undefined : [target.localId],
+      `ui_cancel_${randomUUID().replaceAll("-", "").slice(0, 16)}`,
+    );
   });
   ipcMain.handle("development:copyTerminalListener", async (event, input: unknown) => {
     assertTrustedSender(event);
@@ -3128,28 +3327,38 @@ function registerIpcHandlers(): void {
     return result.canceled ? undefined : result.filePaths[0];
   });
 
-  ipcMain.handle("tunnel:connect", async (event, apiKeyInput: unknown) => {
+  ipcMain.handle("tunnel:connect", async (event, input: unknown) => {
     assertTrustedSender(event);
-    const apiKey = tunnelApiKeyInputSchema.parse(apiKeyInput);
-    await withTunnelSetupLock(async () => {
-      const { settings, connection } = await activeConnectionContext();
+    const request = tunnelConnectInputSchema.parse(input);
+    return withTunnelSetupLock(async () => {
+      const { settings, connection, keyPath, loaded } = await activeStoredTunnelKey();
       const provision = bundledProvisionOptions(connection);
       const runtimePaths = desktopBundledRuntimePaths();
-      await initializeTunnelProfile(provision);
-      tunnel.connect({
-        binaryPath: provision.binaryPath,
-        profile: provision.profile,
-        profileDir: provision.profileDir,
-        cwd: dirname(provision.binaryPath),
-        apiKey,
-        gitApprovalMode: settings.gitApprovalMode,
-        documentWorkerPath: join(dirname(runtimePaths.serverBundlePath), "document-worker.cjs"),
-        ...(developmentBroker === undefined
-          ? {}
-          : {
-              developmentBrokerEndpoint: developmentBroker.endpoint,
-              developmentBrokerToken: developmentBroker.token,
-            }),
+      return connectWithTunnelCredential({
+        request,
+        stored: loaded,
+        validate: (apiKey) => { tunnelApiKeyInputSchema.parse(apiKey); },
+        start: async (apiKey) => {
+          await initializeTunnelProfile(provision);
+          tunnel.connect({
+            binaryPath: provision.binaryPath,
+            profile: provision.profile,
+            profileDir: provision.profileDir,
+            cwd: dirname(provision.binaryPath),
+            apiKey,
+            gitApprovalMode: settings.gitApprovalMode,
+            documentWorkerPath: join(dirname(runtimePaths.serverBundlePath), "document-worker.cjs"),
+            ...(developmentBroker === undefined
+              ? {}
+              : {
+                  developmentBrokerEndpoint: developmentBroker.endpoint,
+                  developmentBrokerToken: developmentBroker.token,
+                }),
+          });
+        },
+        waitUntilConnected: () => tunnel.waitForConnection(),
+        disconnect: () => tunnel.disconnect(),
+        persist: (apiKey) => saveAndVerifyTunnelKey(keyPath, apiKey),
       });
     });
   });
@@ -3166,10 +3375,17 @@ function registerIpcHandlers(): void {
     assertTrustedSender(event);
     const apiKey = tunnelApiKeyInputSchema.parse(apiKeyInput);
     return withTunnelSetupLock(async () => {
-      const { settings, connection } = await activeConnectionContext();
+      const { settings, connection, keyPath } = await activeConnectionContext();
       const provision = bundledProvisionOptions(connection);
       await initializeTunnelProfile(provision);
-      return diagnoseTunnelProfile({ ...provision, apiKey, gitApprovalMode: settings.gitApprovalMode });
+      const report = await diagnoseTunnelProfile({ ...provision, apiKey, gitApprovalMode: settings.gitApprovalMode });
+      if (!report.ok) return report;
+      const remembered = await saveAndVerifyTunnelKey(keyPath, apiKey);
+      return {
+        ...report,
+        keyPersistence: remembered ? "remembered" as const : "failed" as const,
+        ...(remembered ? {} : { warningCode: "KEY_STORE_WRITE_FAILED" as const }),
+      };
     });
   });
 
@@ -3187,15 +3403,10 @@ function registerIpcHandlers(): void {
   });
 
   // Persistencia opcional y cifrada de la clave — nunca en texto plano, ver secure-key-store.ts.
-  ipcMain.handle("tunnel:getSavedKey", async (event) => {
+  ipcMain.handle("tunnel:getKeyState", async (event) => {
     assertTrustedSender(event);
-    const { keyPath } = await activeConnectionContext();
-    return loadEncryptedKey(keyPath, keyStoreDeps);
-  });
-  ipcMain.handle("tunnel:saveKey", async (event, input: unknown) => {
-    assertTrustedSender(event);
-    const { keyPath } = await activeConnectionContext();
-    return saveEncryptedKey(keyPath, tunnelApiKeyInputSchema.parse(input), keyStoreDeps);
+    const { loaded } = await activeStoredTunnelKey();
+    return publicStoredTunnelKeyState(loaded);
   });
   ipcMain.handle("tunnel:forgetKey", async (event) => {
     assertTrustedSender(event);
@@ -3250,5 +3461,6 @@ app.on("before-quit", () => {
   void processSupervisor?.close();
   void terminalSupervisor?.close();
   void analysisSupervisor?.close();
+  void taskBatchSupervisor?.close();
   void developmentBroker?.close();
 });

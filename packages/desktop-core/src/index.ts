@@ -114,6 +114,7 @@ export {
 export {
   absolutePathSchema,
   analysisJobTargetInputSchema,
+  taskBatchTargetInputSchema,
   applicationIdInputSchema,
   adoptDevelopmentProjectInputSchema,
   auditQuerySchema,
@@ -141,6 +142,7 @@ export {
   terminalSessionIdInputSchema,
   terminalSessionTargetInputSchema,
   tunnelApiKeyInputSchema,
+  tunnelConnectInputSchema,
   portableImportSessionIdSchema,
   portableWorkspaceRefSchema,
   setupReviewInputSchema,
@@ -165,14 +167,22 @@ export {
   webViewerStateInputSchema,
   webViewportInputSchema,
   type ExternalDestination,
+  type TunnelConnectInput,
 } from "./ipc-inputs.js";
 
 export {
   clearEncryptedKey,
   defaultTunnelKeyPath,
   loadEncryptedKey,
+  migrateLegacyEncryptedKey,
+  publicStoredTunnelKeyState,
+  saveAndVerifyEncryptedKey,
   saveEncryptedKey,
+  type LegacyKeyMigrationOptions,
+  type LegacyKeyMigrationResult,
+  type SecureKeyLoadResult,
   type SecureKeyStoreDeps,
+  type StoredTunnelKeyState,
 } from "./secure-key-store.js";
 
 export {
@@ -194,6 +204,13 @@ export {
   type RegistryEntryRemovalResult,
   type NewWorkspaceInput,
 } from "./registry-store.js";
+
+export {
+  connectWithTunnelCredential,
+  type TunnelCredentialConnectResult,
+  type TunnelCredentialFlowOptions,
+  type TunnelCredentialRequest,
+} from "./tunnel-credential-flow.js";
 
 export {
   DevelopmentProjectStoreError,
@@ -263,11 +280,13 @@ export {
 export { listAuditEvents, listPendingApprovals, type AuditEvent, type AuditQuery, type PendingApproval } from "./audit-view.js";
 
 export {
+  TunnelConnectionWaitError,
   TunnelSupervisor,
   MIN_UPTIME_FOR_AUTO_RECONNECT_MS,
   MAX_AUTO_RECONNECT_ATTEMPTS,
   AUTO_RECONNECT_DELAY_MS,
   type SpawnFn,
+  type TunnelConnectionWaitCode,
   type TunnelConnectOptions,
   type TunnelStatus,
   type TunnelSupervisorCallbacks,

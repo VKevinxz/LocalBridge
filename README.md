@@ -3,7 +3,7 @@
 Aplicación de escritorio para conectar ChatGPT con proyectos locales de Windows de forma
 explícita, auditable y revocable.
 
-**Versión del árbol:** `v1.7.0` · **Plataforma:** Windows x64 · **Estado:** preview de evaluación ·
+**Versión del árbol:** `v1.8.1` · **Plataforma:** Windows x64 · **Estado:** candidato local ·
 **Licencia:** `UNLICENSED`
 
 [Preview v1.7.0.1](https://github.com/VKevinxz/LocalBridge/releases/tag/preview-v1.7.0.1) ·
@@ -67,7 +67,7 @@ proyectos existentes.
 `git.commit` y `git.push` conservan aprobación protegida. El navegador y los procesos se
 vinculan a referencias opacas y listeners cuya propiedad vuelve a comprobar LocalBridge.
 
-## Uso cotidiano en v1.7.0
+## Uso cotidiano en v1.8.1
 
 **Acceso a Internet** permite habilitar con una sola acción local la investigación pública
 aislada. Los perfiles y sitios concretos existentes siguen disponibles bajo opciones

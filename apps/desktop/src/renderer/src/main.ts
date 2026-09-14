@@ -12,6 +12,7 @@ import type {
   RuntimeReadinessReport,
   OnboardingCompletionDraft,
   OnboardingViewSnapshot,
+  StoredTunnelKeyState,
   TunnelStatus,
   WorkspaceReadinessReport,
   V1ProjectsState,
@@ -109,13 +110,15 @@ interface WorkspaceFormDraft {
 }
 
 interface UiFeedback {
-  readonly kind: 'success' | 'error';
+  readonly kind: 'success' | 'warning' | 'error';
   readonly message: string;
 }
 
 type AppSection = 'home' | 'web' | 'assisted' | 'projects' | 'applications' | 'activity' | 'connection' | 'settings';
 type ActivityFilter = 'all' | 'browsers' | 'resources';
 type BrowserActivityGroup = 'all' | 'attention' | 'regular';
+type ActivitySectionId = 'runtime' | 'technicalLog' | 'documents' | 'audit';
+type ActivityDisclosureState = Record<ActivitySectionId, boolean>;
 type WorkspaceFormTab = 'general' | 'access' | 'services' | 'advanced';
 
 type AccessObjective = 'review' | 'edit' | 'web' | 'complete';
@@ -198,8 +201,9 @@ let settingsDraft: DesktopSettings = { ...settings };
 let effectiveGitApprovalMode: DesktopSettings['gitApprovalMode'] | undefined;
 let runtimeInfo: BundledRuntimePaths | undefined;
 let apiKeyDraft = '';
-let storedApiKey = '';
 let keySaved = false;
+let tunnelKeyState: StoredTunnelKeyState = { status: 'absent' };
+let rememberTunnelKey = true;
 let feedback: UiFeedback | undefined;
 let diagnosticOutput = '';
 let runtimeReport: RuntimeReadinessReport | undefined;
@@ -228,6 +232,17 @@ let webTabs: Record<string, readonly WebTabActivitySummary[]> = {};
 let webProfilesError: string | undefined;
 let webRefreshGeneration = 0;
 let activityFilter: ActivityFilter = 'all';
+const ACTIVITY_DISCLOSURE_STORAGE_KEY = 'localbridge.activityDisclosure.v1';
+const ACTIVITY_DISCLOSURE_DEFAULTS: ActivityDisclosureState = {
+  runtime: false,
+  technicalLog: false,
+  documents: false,
+  audit: false,
+};
+const activityDisclosureStored = readActivityDisclosureState();
+let activityDisclosureState: ActivityDisclosureState = activityDisclosureStored ?? { ...ACTIVITY_DISCLOSURE_DEFAULTS };
+let activityDisclosureCustomized = activityDisclosureStored !== undefined;
+const activityExpandedItems = new Map<string, boolean>();
 let browserViewerSessionId: string | undefined;
 let browserViewerTimer: number | undefined;
 let browserViewerCaptureInFlight = false;
@@ -235,6 +250,46 @@ const LIVE_VIEWER_DISPLAY_STORAGE_KEY = 'localbridge.liveViewerDisplayId';
 const LIVE_VIEWER_PRESENTATION_STORAGE_KEY = 'localbridge.liveViewerPresentationMode';
 let auditFilters: { workspaceId?: string; action?: string; outcome?: 'success' | 'error' } = {};
 let portableImport: { sessionId: string; config: PortableConfig; mapped: Set<string> } | undefined;
+
+function readActivityDisclosureState(): ActivityDisclosureState | undefined {
+  try {
+    const raw = window.localStorage.getItem(ACTIVITY_DISCLOSURE_STORAGE_KEY);
+    if (raw === null) return undefined;
+    const parsed: unknown = JSON.parse(raw);
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return undefined;
+    const candidate = parsed as Record<string, unknown>;
+    if (Object.keys(candidate).length !== 4 ||
+      typeof candidate['runtime'] !== 'boolean' ||
+      typeof candidate['technicalLog'] !== 'boolean' ||
+      typeof candidate['documents'] !== 'boolean' ||
+      typeof candidate['audit'] !== 'boolean') return undefined;
+    return {
+      runtime: candidate['runtime'],
+      technicalLog: candidate['technicalLog'],
+      documents: candidate['documents'],
+      audit: candidate['audit'],
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+function saveActivityDisclosureState(): void {
+  activityDisclosureCustomized = true;
+  try {
+    window.localStorage.setItem(ACTIVITY_DISCLOSURE_STORAGE_KEY, JSON.stringify(activityDisclosureState));
+  } catch {
+    // La preferencia visual es opcional; la actividad sigue disponible sin persistencia.
+  }
+}
+
+function activityItemExpanded(key: string, defaultValue: boolean): boolean {
+  return activityExpandedItems.get(key) ?? defaultValue;
+}
+
+function activityDomId(prefix: string, value: string): string {
+  return `${prefix}-${value.replace(/[^A-Za-z0-9_-]/g, '-')}`;
+}
 
 function escapeHtml(value: string): string {
   return value.replace(/[&<>"']/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[char] ?? char);
@@ -379,10 +434,14 @@ async function withBusyButton<T>(button: HTMLButtonElement, busyLabel: string, t
 }
 
 function runtimeKeyStatus(): string {
-  if (apiKeyDraft !== storedApiKey) {
-    return keySaved ? 'cambio sin validar; se conserva la clave anterior' : 'cambio sin validar; todavía no se guardó';
+  if (apiKeyDraft !== '') {
+    return keySaved ? 'clave nueva sin validar; se conserva la anterior' : 'clave lista para validar';
   }
-  return keySaved ? 'guardada y cifrada por Windows' : 'no guardada';
+  if (tunnelKeyState.status === 'available') return 'guardada y cifrada por Windows';
+  if (tunnelKeyState.status === 'encryption-unavailable') return 'cifrado de Windows no disponible; uso temporal';
+  if (tunnelKeyState.status === 'unreadable') return 'clave guardada ilegible; escribe una nueva';
+  if (tunnelKeyState.status === 'io-error') return 'no se pudo leer el almacén de claves';
+  return 'no guardada';
 }
 
 function updateRuntimeKeyStatusUi(): void {
@@ -393,6 +452,18 @@ function updateRuntimeKeyStatusUi(): void {
 
 function safeTunnelErrorMessage(error: unknown, action: 'guardar el ID' | 'preparar el perfil' | 'diagnóstico' | 'conexión'): string {
   const normalized = errorMessage(error).toLowerCase();
+  if (/tunnel_key_required/.test(normalized)) {
+    return 'Escribe la clave secreta de runtime para conectar este perfil.';
+  }
+  if (/key_store_encryption_unavailable/.test(normalized)) {
+    return 'El cifrado de Windows no está disponible. Escribe la clave para usarla solo durante esta sesión.';
+  }
+  if (/key_store_unreadable/.test(normalized)) {
+    return 'La clave guardada ya no se puede descifrar con esta cuenta de Windows. Escribe una nueva para reemplazarla después de conectar.';
+  }
+  if (/key_store_read_failed/.test(normalized)) {
+    return 'No se pudo leer el almacén local de claves. Puedes escribir la clave para esta sesión y revisar el acceso al perfil.';
+  }
   if (/401|403|unauthor|forbidden|api.?key|credential|clave.+rechaz/.test(normalized)) {
     return 'La clave de runtime fue rechazada. Verifica la clave o genera una nueva; no se guardó el valor rechazado.';
   }
@@ -960,10 +1031,11 @@ function connectionSectionHtml(): string {
           <input type="hidden" name="serverCwd" value="${escapeHtml(settingsDraft.serverCwd)}" />
           <button type="submit">Guardar ID</button>
         </form>
-        <label class="api-key-label">Clave secreta de runtime de ${escapeHtml(activeProfile()?.name ?? 'este perfil')}<span class="field-status">${escapeHtml(runtimeKeyStatus())}</span><input type="password" id="api-key" value="${escapeHtml(apiKeyDraft)}" aria-describedby="runtime-key-help runtime-key-error" autocomplete="off" /><small id="runtime-key-help" class="field-help">Se cifra con Windows después de superar el diagnóstico. No la compartas.</small></label>
+        <label class="api-key-label">Clave secreta de runtime de ${escapeHtml(activeProfile()?.name ?? 'este perfil')}<span class="field-status">${escapeHtml(runtimeKeyStatus())}</span><input type="password" id="api-key" value="${escapeHtml(apiKeyDraft)}" aria-describedby="runtime-key-help runtime-key-error" autocomplete="off" /><small id="runtime-key-help" class="field-help">Puedes dejarla vacía cuando ya existe una clave guardada. No la compartas.</small></label>
         <p id="runtime-key-error" class="error-text field-error" role="alert"></p>
+        <label class="permission-option compact-option"><input type="checkbox" id="remember-tunnel-key" ${rememberTunnelKey ? 'checked' : ''}/><span><strong>Recordar en este equipo</strong><small>Después de conectar correctamente, Windows la cifra para este perfil. Desactívalo para usar una clave nueva solo durante esta sesión.</small></span></label>
         <div class="actions">
-          <button type="button" id="forget-key" ${keySaved ? '' : 'disabled'}>Olvidar clave</button>
+          <button type="button" id="forget-key" ${tunnelKeyState.status === 'absent' ? 'disabled' : ''}>Olvidar clave</button>
           <button type="button" id="prepare-profile">Preparar perfil</button>
           <button type="button" id="diagnose-tunnel">Diagnosticar</button>
         </div>
@@ -1031,6 +1103,7 @@ async function refreshWebState(shouldRender = true): Promise<void> {
     webTabs = {};
   }
   if (viewerResult.status === 'fulfilled') webLiveViewer = viewerResult.value;
+  updateAutomaticActivityDisclosure();
   if (shouldRender) render();
 }
 
@@ -1305,6 +1378,27 @@ const ANALYSIS_STATE_LABELS: Record<NonNullable<DevelopmentActivity['jobs']>[num
   cancelled: 'Cancelado', completed: 'Completado', failed: 'Falló', source_changed: 'Fuente cambiada', interrupted: 'Interrumpido',
 };
 
+const TASK_BATCH_STATE_LABELS: Record<NonNullable<DevelopmentActivity['taskBatches']>[number]['state'], string> = {
+  queued: 'En cola', running: 'Trabajando', cancel_requested: 'Cancelando', cancelled: 'Cancelado',
+  completed: 'Completado', partial: 'Resultado parcial', failed: 'Falló', interrupted: 'Interrumpido',
+};
+
+const TASK_CHILD_STATE_LABELS: Record<NonNullable<DevelopmentActivity['taskBatches']>[number]['children'][number]['state'], string> = {
+  admitted: 'Admitido', waiting_dependency: 'Esperando otro paso', waiting_resource: 'Esperando recursos',
+  running: 'Trabajando', cancel_requested: 'Cancelando', cancelled: 'Cancelado', completed: 'Completado',
+  failed: 'Falló', skipped_dependency: 'Omitido por dependencia', interrupted: 'Interrumpido',
+};
+
+function taskWaitReason(child: NonNullable<DevelopmentActivity['taskBatches']>[number]['children'][number]): string {
+  if (child.state === 'waiting_dependency') return 'Espera que terminen los pasos de los que depende.';
+  if (child.state === 'waiting_resource') return child.operationKind === 'validation.run'
+    ? 'Espera que termine otra validación incompatible del proyecto.'
+    : 'Espera una plaza de análisis disponible.';
+  if (child.state === 'skipped_dependency') return 'No se ejecutó porque falló o se canceló un paso previo.';
+  if (child.resultExpired) return 'El contenido retenido caducó; el recibo permanece disponible.';
+  return '';
+}
+
 function formatAnalysisProgress(job: NonNullable<DevelopmentActivity['jobs']>[number]): string {
   if (job.progress.unit === 'bytes') {
     const completed = formatBytes(job.progress.completed);
@@ -1316,8 +1410,35 @@ function formatAnalysisProgress(job: NonNullable<DevelopmentActivity['jobs']>[nu
 }
 
 function activeAnalysisJobCount(): number {
-  return (developmentActivity.jobs ?? []).filter((job) =>
+  const batched = new Set((developmentActivity.taskBatches ?? []).flatMap((batch) =>
+    batch.children.flatMap((child) => child.analysisJobId ?? [])));
+  const standalone = (developmentActivity.jobs ?? []).filter((job) => !batched.has(job.jobId) &&
     ['queued', 'running', 'waiting_resource', 'cancel_requested'].includes(job.state)).length;
+  const coordinated = (developmentActivity.taskBatches ?? []).flatMap((batch) => batch.children)
+    .filter((child) => ['admitted', 'waiting_dependency', 'waiting_resource', 'running', 'cancel_requested'].includes(child.state)).length;
+  return standalone + coordinated;
+}
+
+function taskBatchRowsHtml(): string[] {
+  return (developmentActivity.taskBatches ?? []).map((batch) => {
+    const workspace = workspaces.find((candidate) => candidate.id === batch.workspaceId);
+    const activeBatch = ['queued', 'running', 'cancel_requested'].includes(batch.state);
+    const batchClass = batch.state === 'completed' ? 'state-ok'
+      : ['failed', 'interrupted'].includes(batch.state) ? 'state-denied'
+        : batch.state === 'partial' ? 'state-warning' : '';
+    const disclosureKey = `batch:${batch.batchId}`;
+    const panelId = activityDomId('activity-batch', batch.batchId);
+    const expanded = activityItemExpanded(disclosureKey, activeBatch);
+    const children = batch.children.map((child) => {
+      const active = ['admitted', 'waiting_dependency', 'waiting_resource', 'running', 'cancel_requested'].includes(child.state);
+      const stateClass = child.state === 'completed' ? 'state-ok'
+        : ['failed', 'interrupted', 'skipped_dependency'].includes(child.state) ? 'state-denied' : '';
+      const reason = taskWaitReason(child);
+      const timing = `admisión ${Math.round(child.timing.admissionMs)} ms · dependencias ${Math.round(child.timing.dependencyWaitMs)} ms · cola ${Math.round(child.timing.capacityWaitMs)} ms · lock ${Math.round(child.timing.lockWaitMs)}/${Math.round(child.timing.lockHoldMs)} ms · ejecución ${Math.round(child.timing.executionMs)} ms · persistencia ${Math.round(child.timing.persistenceMs)} ms`;
+      return `<li class="task-child-row"><div><strong>${escapeHtml(child.localId)} · ${escapeHtml(child.operationKind)}</strong><span>${escapeHtml(child.sourcePath ?? 'perfil revisado')} · ${escapeHtml(reason || child.stage)}</span><details><summary>Detalles técnicos y cobertura</summary><code>${escapeHtml(timing)} · cobertura ${escapeHtml(child.coverage)} · efecto ${escapeHtml(child.effectState)}${child.errorCode === undefined ? '' : ` · ${escapeHtml(child.errorCode)}`}</code></details></div><div class="actions"><span class="state-pill ${stateClass}">${TASK_CHILD_STATE_LABELS[child.state]}</span>${active ? `<button type="button" class="danger" data-task-cancel="${escapeHtml(batch.batchId)}" data-task-child="${escapeHtml(child.localId)}" data-workspace-id="${escapeHtml(batch.workspaceId)}">Cancelar paso</button>` : ''}</div></li>`;
+    }).join('');
+    return `<li class="runtime-item task-batch-row"><div class="runtime-heading"><div><span class="source-pill">LOTE</span><strong>${escapeHtml(workspace?.name ?? batch.workspaceId)}</strong><span>${batch.children.length} paso(s) · actualización ${new Date(batch.updatedAt).toLocaleTimeString()}</span></div><div class="actions"><span class="state-pill ${batchClass}">${TASK_BATCH_STATE_LABELS[batch.state]}</span>${activeBatch ? `<button type="button" class="danger" data-task-cancel="${escapeHtml(batch.batchId)}" data-workspace-id="${escapeHtml(batch.workspaceId)}">Cancelar lote</button>` : ''}<button type="button" class="disclosure-toggle compact-disclosure-toggle" data-activity-item-toggle="${escapeHtml(disclosureKey)}" aria-expanded="${expanded}" aria-controls="${panelId}">${expanded ? 'Ocultar pasos' : 'Mostrar pasos'}</button></div></div><div id="${panelId}" ${expanded ? '' : 'hidden'}><ul class="task-child-list">${children}</ul></div></li>`;
+  });
 }
 
 function developmentActivityHtml(kind: 'all' | 'browsers' | 'resources' = 'all', group: BrowserActivityGroup = 'all'): string {
@@ -1330,18 +1451,35 @@ function developmentActivityHtml(kind: 'all' | 'browsers' | 'resources' = 'all',
   const analysisNotice = analysisUnavailable
     ? '<div class="attention-card attention-error"><div><strong>Análisis de artefactos no disponible</strong><p>El almacén durable necesita reparación. Terminal, Git, navegador y lecturas pequeñas siguen disponibles.</p></div></div>'
     : '';
+  const taskBatchNotice = kind !== 'browsers' && developmentActivity.taskBatchAvailability?.available === false
+    ? '<div class="attention-card attention-error"><div><strong>Lotes coordinados no disponibles</strong><p>El almacén de lotes necesita reparación. Las herramientas individuales, terminal, Git y navegador siguen disponibles.</p></div></div>'
+    : '';
+  const availabilityEntries = kind === 'browsers' ? [] : developmentActivity.availability ?? [];
+  const availabilityNotice = availabilityEntries.length === 0 ? '' : `<details class="availability-summary"><summary>Disponibilidad autorizada de proyectos</summary><ul class="readiness-list">${availabilityEntries.map((entry) => {
+    const proposal = entry.detectedProposal.state === 'none'
+      ? 'sin propuesta detectada pendiente'
+      : entry.detectedProposal.state === 'detected-awaiting-review'
+        ? `propuesta detectada pendiente: ${entry.detectedProposal.processes} servidor(es), ${entry.detectedProposal.validations} validación(es)`
+        : entry.detectedProposal.state === 'applying'
+          ? 'preparación guiada en curso'
+          : 'propuesta detectada inactiva; vuelve a analizar para usarla';
+    return `<li><strong>${escapeHtml(entry.projectName)}</strong><span>${entry.terminalAvailable ? 'Terminal autorizada disponible independientemente de los perfiles' : 'Terminal general no disponible'} · perfiles revisados disponibles: ${entry.reviewed.processes} servidor(es), ${entry.reviewed.validations} validación(es), ${entry.reviewed.browser} navegador(es) · ${escapeHtml(proposal)}</span></li>`;
+  }).join('')}</ul><p class="dependency-note">Una propuesta detectada no es un perfil revisado y no se ejecuta hasta su revisión local.</p></details>`;
   if (activeCount === 0 && group === 'all' && !analysisUnavailable) {
-    return `<div class="empty-state compact-empty"><strong>${kind === 'browsers' ? 'Sin navegadores locales activos' : kind === 'resources' ? 'Sin recursos de desarrollo activos' : 'Sin entornos activos'}</strong><p>Los recursos iniciados por ChatGPT aparecerán aquí.</p></div>`;
+    return `${taskBatchNotice}${availabilityNotice}<div class="empty-state compact-empty"><strong>${kind === 'browsers' ? 'Sin navegadores locales activos' : kind === 'resources' ? 'Sin recursos de desarrollo activos' : 'Sin entornos activos'}</strong><p>Los recursos iniciados por ChatGPT aparecerán aquí.</p></div>`;
   }
-  if (activeCount === 0) return analysisNotice;
+  if (activeCount === 0) return `${analysisNotice}${taskBatchNotice}${availabilityNotice}`;
   const terminalGroups = new Map<string, Array<NonNullable<DevelopmentActivity['terminals']>[number]>>();
   for (const terminal of developmentActivity.terminals ?? []) {
     const terminalGroup = terminalGroups.get(terminal.projectId) ?? [];
     terminalGroup.push(terminal);
     terminalGroups.set(terminal.projectId, terminalGroup);
   }
+  const batchedAnalysisJobIds = new Set((developmentActivity.taskBatches ?? []).flatMap((batch) =>
+    batch.children.flatMap((child) => child.analysisJobId ?? [])));
   const rows = [
-    ...(kind === 'browsers' ? [] : (developmentActivity.jobs ?? []).map((job) => {
+    ...(kind === 'browsers' ? [] : taskBatchRowsHtml()),
+    ...(kind === 'browsers' ? [] : (developmentActivity.jobs ?? []).filter((job) => !batchedAnalysisJobIds.has(job.jobId)).map((job) => {
       const workspace = workspaces.find((candidate) => candidate.id === job.workspaceId);
       const active = ['queued', 'running', 'waiting_resource', 'cancel_requested'].includes(job.state);
       const stateClass = job.state === 'completed' ? 'state-ok' : job.state === 'failed' || job.state === 'source_changed' || job.state === 'interrupted' ? 'state-denied' : '';
@@ -1358,6 +1496,9 @@ function developmentActivityHtml(kind: 'all' | 'browsers' | 'resources' = 'all',
     ...(kind === 'browsers' ? [] : [...terminalGroups.values()].map((entries) => {
       const project = entries[0];
       if (project === undefined) return '';
+      const disclosureKey = `project:${project.projectId}`;
+      const panelId = activityDomId('activity-project', project.projectId);
+      const expanded = activityItemExpanded(disclosureKey, true);
       const terminals = entries.map((entry, index) => {
         const listenerRows = entry.listeners.length === 0
           ? '<p class="runtime-empty">Iniciada; esperando un puerto verificado.</p>'
@@ -1369,7 +1510,7 @@ function developmentActivityHtml(kind: 'all' | 'browsers' | 'resources' = 'all',
           }).join('')}</ul>`;
         return `<section class="runtime-terminal"><div class="runtime-heading"><div><strong>Terminal ${index + 1}</strong><span>${entry.trustMode === 'full-host' ? 'Control total' : 'Agente en proyecto'} · desde ${new Date(entry.startedAt).toLocaleTimeString()}</span></div><span class="state-pill state-ok">${TERMINAL_STATE_LABELS[entry.state]}</span></div>${listenerRows}<div class="runtime-footer"><details><summary>Detalles técnicos</summary><code>${escapeHtml(entry.projectId)} · ${escapeHtml(entry.sessionId)}</code></details><button type="button" class="danger" data-terminal-stop="${escapeHtml(entry.sessionId)}" data-project-id="${escapeHtml(entry.projectId)}">Detener terminal</button></div></section>`;
       }).join('');
-      return `<li class="runtime-item runtime-project"><div class="runtime-heading runtime-project-heading"><div><strong>${escapeHtml(project.projectName)}</strong><span>${entries.length} terminal(es) activa(s)</span></div><span class="state-pill state-ok">En ejecución</span></div><div class="runtime-terminal-list">${terminals}</div><p class="dependency-note">“Abrir en mi navegador” crea una ventana local fuera del control de ChatGPT. El puerto se vuelve a verificar antes de abrirla.</p></li>`;
+      return `<li class="runtime-item runtime-project"><div class="runtime-heading runtime-project-heading"><div><strong>${escapeHtml(project.projectName)}</strong><span>${entries.length} terminal(es) activa(s)</span></div><div class="actions"><span class="state-pill state-ok">En ejecución</span><button type="button" class="disclosure-toggle compact-disclosure-toggle" data-activity-item-toggle="${escapeHtml(disclosureKey)}" aria-expanded="${expanded}" aria-controls="${panelId}">${expanded ? 'Ocultar terminales' : 'Mostrar terminales'}</button></div></div><div id="${panelId}" class="runtime-project-panel" ${expanded ? '' : 'hidden'}><div class="runtime-terminal-list">${terminals}</div><p class="dependency-note">“Abrir en mi navegador” crea una ventana local fuera del control de ChatGPT. El puerto se vuelve a verificar antes de abrirla.</p></div></li>`;
     })),
     ...(kind === 'browsers' ? [] : developmentActivity.applications.map((entry) => `<li><strong>Aplicación · ${escapeHtml(entry.applicationName)}</strong><span>${entry.services.filter((service) => service.state === 'ready').length}/${entry.services.length} servicios listos · ${escapeHtml(entry.state)}</span></li>`)),
     ...(kind === 'browsers' ? [] : developmentActivity.processes.map((entry) => {
@@ -1406,10 +1547,21 @@ function developmentActivityHtml(kind: 'all' | 'browsers' | 'resources' = 'all',
       return `<li class="browser-activity-row"><div><span class="source-pill">LOCAL</span><strong>Navegador · ${escapeHtml(entry.profile)}</strong></div><span>${escapeHtml(workspace?.name ?? entry.workspaceId)} · ${escapeHtml(entry.path)} · ${state}${liveViewerState}</span>${motion}${motionReceiptHtml(entry.lastMotionCapture)}${presentation}${viewportControls}${actions}</li>`;
     })),
   ];
-  return `${analysisNotice}<ul class="readiness-list">${rows.join('')}</ul>`;
+  return `${analysisNotice}${taskBatchNotice}${availabilityNotice}<ul class="readiness-list">${rows.join('')}</ul>`;
 }
 
 function bindDevelopmentHumanControlActions(): void {
+  bindActivityItemDisclosureActions();
+  document.querySelectorAll<HTMLButtonElement>('[data-task-cancel]').forEach((button) => {
+    button.addEventListener('click', () => {
+      const workspaceId = button.dataset['workspaceId'] ?? '';
+      const batchId = button.dataset['taskCancel'] ?? '';
+      const localId = button.dataset['taskChild'];
+      void withBusyButton(button, 'Cancelando…', () => window.desktop.cancelTaskBatch(workspaceId, batchId, localId))
+        .then(() => refreshDevelopmentActivity())
+        .catch((error) => showFeedback('error', `No se pudo cancelar: ${errorMessage(error)}`));
+    });
+  });
   document.querySelectorAll<HTMLButtonElement>('[data-analysis-cancel]').forEach((button) => {
     button.addEventListener('click', () => {
       const workspaceId = button.dataset['workspaceId'] ?? '';
@@ -1790,51 +1942,138 @@ function bindAuditListActions(): void {
   });
 }
 
-function activityRuntimeHtml(): string {
-  const browserCount = developmentActivity.browsers.filter((entry) => entry.state === 'running').length +
+function activityCounts(): { browsers: number; resources: number; active: number; attention: number } {
+  const browsers = developmentActivity.browsers.filter((entry) => entry.state === 'running').length +
     webActivity.filter((entry) => entry.state === 'running').length;
-  const attentionCount = developmentActivity.browsers.filter((entry) => entry.state === 'running' &&
+  const resources = developmentActivity.processes.length + developmentActivity.applications.length +
+    (developmentActivity.terminals?.length ?? 0) + activeAnalysisJobCount();
+  const attention = developmentActivity.browsers.filter((entry) => entry.state === 'running' &&
     ['waiting_for_human', 'human_control', 'returning_to_agent'].includes(entry.controlState)).length +
     webActivity.filter((entry) => entry.state === 'running' &&
       ['waiting_for_human', 'human_control', 'returning_to_agent'].includes(entry.controlState)).length;
-  const attention = attentionCount === 0 ? '' : `<div class="attention-card attention-error"><div><strong>${attentionCount} navegador(es) requieren tu intervención</strong><p>ChatGPT está pausado en esas sesiones.</p></div>${activityFilter === 'resources' ? '<button type="button" data-activity-filter="browsers">Mostrar navegadores</button>' : ''}</div>`;
+  return { browsers, resources, active: browsers + resources, attention };
+}
+
+function activityAttentionHtml(): string {
+  const { attention } = activityCounts();
+  if (attention === 0) return '';
+  return `<div class="attention-card attention-error activity-intervention" role="status"><div><strong>${attention} navegador(es) requieren tu intervención</strong><p>ChatGPT está pausado en esas sesiones. Este aviso permanece visible aunque contraigas la actividad.</p></div><button type="button" data-activity-filter="browsers">Ver intervención</button></div>`;
+}
+
+function activityRuntimeHtml(): string {
+  const { browsers: browserCount } = activityCounts();
   const browserContent = browserCount === 0
     ? `<div class="empty-state compact-empty"><strong>Sin navegadores activos</strong><p>Los navegadores iniciados por ChatGPT aparecerán aquí.</p></div>${webActivityHtml('regular', false)}`
     : `${developmentActivityHtml('browsers', 'attention')}${webActivityHtml('attention', false)}${developmentActivityHtml('browsers', 'regular')}${webActivityHtml('regular', false)}`;
-  if (activityFilter === 'browsers') return `${attention}${browserContent}`;
-  if (activityFilter === 'resources') return `${attention}${developmentActivityHtml('resources')}`;
-  return `${attention}<div class="activity-group"><h3>Navegadores</h3>${browserContent}</div><div class="activity-group"><h3>Recursos de desarrollo</h3>${developmentActivityHtml('resources')}</div>`;
+  if (activityFilter === 'browsers') return browserContent;
+  if (activityFilter === 'resources') return developmentActivityHtml('resources');
+  return `<div class="activity-group"><h3>Navegadores</h3>${browserContent}</div><div class="activity-group"><h3>Recursos de desarrollo</h3>${developmentActivityHtml('resources')}</div>`;
+}
+
+function activityDisclosureToggleHtml(section: ActivitySectionId, panelId: string): string {
+  const expanded = activityDisclosureState[section];
+  return `<button type="button" id="activity-toggle-${section}" class="disclosure-toggle" data-activity-section-toggle="${section}" aria-expanded="${expanded}" aria-controls="${panelId}"><span aria-hidden="true" class="disclosure-chevron">${expanded ? '▾' : '▸'}</span>${expanded ? 'Ocultar' : 'Mostrar'}</button>`;
+}
+
+function pruneActivityExpandedItems(): void {
+  const valid = new Set<string>([
+    ...(developmentActivity.taskBatches ?? []).map((batch) => `batch:${batch.batchId}`),
+    ...new Set((developmentActivity.terminals ?? []).map((terminal) => `project:${terminal.projectId}`)),
+  ]);
+  for (const key of activityExpandedItems.keys()) {
+    if (!valid.has(key)) activityExpandedItems.delete(key);
+  }
+}
+
+function updateAutomaticActivityDisclosure(): void {
+  if (!activityDisclosureCustomized) activityDisclosureState.runtime = activityCounts().active > 0;
+}
+
+function bindActivityDisclosureActions(): void {
+  document.querySelectorAll<HTMLButtonElement>('[data-activity-section-toggle]').forEach((button) => {
+    button.addEventListener('click', () => {
+      const section = button.dataset['activitySectionToggle'];
+      if (section !== 'runtime' && section !== 'technicalLog' && section !== 'documents' && section !== 'audit') return;
+      activityDisclosureState = { ...activityDisclosureState, [section]: !activityDisclosureState[section] };
+      saveActivityDisclosureState();
+      render();
+      document.querySelector<HTMLButtonElement>(`#activity-toggle-${section}`)?.focus();
+    });
+  });
+  document.querySelector<HTMLButtonElement>('#activity-collapse-all')?.addEventListener('click', () => {
+    activityDisclosureState = { runtime: false, technicalLog: false, documents: false, audit: false };
+    for (const key of activityExpandedItems.keys()) activityExpandedItems.set(key, false);
+    saveActivityDisclosureState();
+    render();
+    document.querySelector<HTMLButtonElement>('#activity-collapse-all')?.focus();
+  });
+  document.querySelector<HTMLButtonElement>('#activity-show-active')?.addEventListener('click', () => {
+    const activeBatchIds = new Set((developmentActivity.taskBatches ?? [])
+      .filter((batch) => ['queued', 'running', 'cancel_requested'].includes(batch.state))
+      .map((batch) => `batch:${batch.batchId}`));
+    for (const key of activityExpandedItems.keys()) activityExpandedItems.set(key, key.startsWith('project:') || activeBatchIds.has(key));
+    activityDisclosureState = { runtime: activityCounts().active > 0, technicalLog: false, documents: false, audit: false };
+    saveActivityDisclosureState();
+    render();
+    document.querySelector<HTMLButtonElement>('#activity-show-active')?.focus();
+  });
+}
+
+function bindActivityItemDisclosureActions(): void {
+  document.querySelectorAll<HTMLButtonElement>('[data-activity-item-toggle]').forEach((button) => {
+    button.addEventListener('click', () => {
+      const key = button.dataset['activityItemToggle'];
+      const panelId = button.getAttribute('aria-controls');
+      if (key === undefined || panelId === null) return;
+      const expanded = button.getAttribute('aria-expanded') !== 'true';
+      activityExpandedItems.set(key, expanded);
+      button.setAttribute('aria-expanded', String(expanded));
+      button.textContent = key.startsWith('project:')
+        ? expanded ? 'Ocultar terminales' : 'Mostrar terminales'
+        : expanded ? 'Ocultar pasos' : 'Mostrar pasos';
+      const panel = document.getElementById(panelId);
+      if (panel !== null) panel.hidden = !expanded;
+    });
+  });
 }
 
 function activitySectionHtml(): string {
-  const resourceCount = developmentActivity.processes.length + developmentActivity.applications.length + (developmentActivity.terminals?.length ?? 0) + (developmentActivity.jobs?.length ?? 0);
-  const browserCount = developmentActivity.browsers.filter((entry) => entry.state === 'running').length + webActivity.filter((entry) => entry.state === 'running').length;
-  const activeCount = resourceCount + browserCount;
+  const counts = activityCounts();
+  const stoppableCount = developmentActivity.processes.length + developmentActivity.applications.length +
+    (developmentActivity.terminals?.length ?? 0) + developmentActivity.browsers.length;
   return `
-    <div class="section-heading"><div><p class="eyebrow">Actividad</p><h2>Actividad en curso</h2><p>Observa y controla navegadores locales o de Internet sin cambiar de sección.</p></div><span class="state-pill">${activeCount} activo(s)</span></div>
+    <div class="section-heading activity-page-heading"><div><p class="eyebrow">Actividad</p><h2>Actividad en curso</h2><p>Observa y controla navegadores locales o de Internet sin cambiar de sección.</p></div><div class="actions"><span class="state-pill">${counts.active} activo(s)</span><button type="button" id="activity-collapse-all">Contraer todo</button><button type="button" id="activity-show-active">Mostrar activos</button></div></div>
     <div data-pending-approvals>${pendingApprovalsHtml()}</div>
-    <div class="surface-card">
-      <div class="card-heading"><div><h3>Sesiones y recursos</h3><p>La etiqueta LOCAL o INTERNET identifica el aislamiento de cada navegador.</p></div><div class="actions"><button type="button" id="refresh-development">Actualizar</button><button type="button" id="stop-all-development" class="danger" ${resourceCount + developmentActivity.browsers.length === 0 ? 'disabled' : ''} title="Cierra terminales, procesos, aplicaciones y navegadores locales; las sesiones de Internet se cierran individualmente">Detener entorno de desarrollo</button></div></div>
-      <div class="activity-filters" role="group" aria-label="Filtrar actividad"><button type="button" id="activity-filter-all" data-activity-filter="all" ${activityFilter === 'all' ? 'aria-pressed="true" class="primary"' : 'aria-pressed="false"'}>Todo</button><button type="button" id="activity-filter-browsers" data-activity-filter="browsers" ${activityFilter === 'browsers' ? 'aria-pressed="true" class="primary"' : 'aria-pressed="false"'}>Navegadores</button><button type="button" id="activity-filter-resources" data-activity-filter="resources" ${activityFilter === 'resources' ? 'aria-pressed="true" class="primary"' : 'aria-pressed="false"'}>Recursos</button></div>
-      <div id="development-activity">${activityRuntimeHtml()}</div>
-    </div>
-    <div class="surface-card">
-      <label>Buscar en la actividad<input type="search" id="log-search" value="${escapeHtml(logFilter)}" placeholder="error, conexión, perfil…" /></label>
-      <div class="actions"><button type="button" id="copy-diagnostic">Copiar diagnóstico</button><button type="button" id="export-diagnostic">Exportar .txt</button><button type="button" id="clear-logs" ${tunnelLogs.length === 0 ? 'disabled' : ''}>Limpiar vista</button></div>
-      <details class="advanced-panel" ${logFilter === '' ? '' : 'open'}><summary>Log técnico filtrado</summary><div id="activity-log-container">${activityLogHtml()}</div></details>
-    </div>
-    <div class="surface-card audit-card">
-      <div class="card-heading"><div><h3>Cobertura documental</h3><p>Archivos y páginas preparados para ChatGPT. LocalBridge muestra la entrega técnica y no interpreta el contenido.</p></div></div>
-      <div id="document-coverage">${documentCoverageHtml()}</div>
-    </div>
-    <div class="surface-card audit-card">
-      <div class="card-heading"><div><h3>Auditoría local</h3><p>Operaciones permitidas, denegadas o fallidas, sin contenido de archivos.</p></div><button type="button" id="refresh-audit">Actualizar</button></div>
-      <div class="audit-filters">
-        <label>Proyecto<select id="audit-workspace"><option value="">Todos</option>${workspaces.map((workspace) => `<option value="${escapeHtml(workspace.id)}" ${auditFilters.workspaceId === workspace.id ? 'selected' : ''}>${escapeHtml(workspace.name)}</option>`).join('')}</select></label>
-        <label>Acción<select id="audit-action"><option value="">Todas</option>${Object.entries(AUDIT_ACTION_LABELS).map(([action, label]) => `<option value="${escapeHtml(action)}" ${auditFilters.action === action ? 'selected' : ''}>${escapeHtml(label)}</option>`).join('')}</select></label>
-        <label>Resultado<select id="audit-outcome"><option value="">Todos</option><option value="success" ${auditFilters.outcome === 'success' ? 'selected' : ''}>Correcto</option><option value="error" ${auditFilters.outcome === 'error' ? 'selected' : ''}>Error o denegado</option></select></label>
+    ${activityAttentionHtml()}
+    <div class="surface-card activity-disclosure-card">
+      <div class="card-heading activity-disclosure-heading"><div><h3>Sesiones y recursos</h3><p>La etiqueta LOCAL o INTERNET identifica el aislamiento de cada navegador.</p></div><div class="actions"><span class="state-pill">${counts.active} activo(s)</span><button type="button" id="refresh-development">Actualizar</button><button type="button" id="stop-all-development" class="danger" ${stoppableCount === 0 ? 'disabled' : ''} title="Cierra terminales, procesos, aplicaciones y navegadores locales; las sesiones de Internet se cierran individualmente">Detener entorno de desarrollo</button>${activityDisclosureToggleHtml('runtime', 'activity-runtime-panel')}</div></div>
+      <div id="activity-runtime-panel" ${activityDisclosureState.runtime ? '' : 'hidden'}>
+        <div class="activity-filters" role="group" aria-label="Filtrar actividad"><button type="button" id="activity-filter-all" data-activity-filter="all" ${activityFilter === 'all' ? 'aria-pressed="true" class="primary"' : 'aria-pressed="false"'}>Todo</button><button type="button" id="activity-filter-browsers" data-activity-filter="browsers" ${activityFilter === 'browsers' ? 'aria-pressed="true" class="primary"' : 'aria-pressed="false"'}>Navegadores</button><button type="button" id="activity-filter-resources" data-activity-filter="resources" ${activityFilter === 'resources' ? 'aria-pressed="true" class="primary"' : 'aria-pressed="false"'}>Recursos</button></div>
+        <div id="development-activity">${activityRuntimeHtml()}</div>
       </div>
-      <div id="audit-events">${auditEventsHtml()}</div>
+    </div>
+    <div class="surface-card activity-disclosure-card">
+      <div class="card-heading activity-disclosure-heading"><div><h3>Log técnico</h3><p>Filtra o exporta el diagnóstico local con secretos redactados.</p></div><div class="actions"><span class="state-pill">${tunnelLogs.length} línea(s)</span>${activityDisclosureToggleHtml('technicalLog', 'activity-technical-log-panel')}</div></div>
+      <div id="activity-technical-log-panel" class="activity-disclosure-panel" ${activityDisclosureState.technicalLog ? '' : 'hidden'}>
+        <label>Buscar en la actividad<input type="search" id="log-search" value="${escapeHtml(logFilter)}" placeholder="error, conexión, perfil…" /></label>
+        <div class="actions"><button type="button" id="copy-diagnostic">Copiar diagnóstico</button><button type="button" id="export-diagnostic">Exportar .txt</button><button type="button" id="clear-logs" ${tunnelLogs.length === 0 ? 'disabled' : ''}>Limpiar vista</button></div>
+        <div id="activity-log-container" class="activity-log-panel">${activityLogHtml()}</div>
+      </div>
+    </div>
+    <div class="surface-card audit-card activity-disclosure-card">
+      <div class="card-heading activity-disclosure-heading"><div><h3>Cobertura documental</h3><p>Archivos y páginas preparados para ChatGPT. LocalBridge muestra la entrega técnica y no interpreta el contenido.</p></div><div class="actions"><span class="state-pill">${documentAuditEvents.length} evento(s)</span>${activityDisclosureToggleHtml('documents', 'activity-documents-panel')}</div></div>
+      <div id="activity-documents-panel" class="activity-disclosure-panel" ${activityDisclosureState.documents ? '' : 'hidden'}><div id="document-coverage">${documentCoverageHtml()}</div></div>
+    </div>
+    <div class="surface-card audit-card activity-disclosure-card">
+      <div class="card-heading activity-disclosure-heading"><div><h3>Auditoría local</h3><p>Operaciones permitidas, denegadas o fallidas, sin contenido de archivos.</p></div><div class="actions"><span class="state-pill">${auditEvents.length} evento(s)</span><button type="button" id="refresh-audit">Actualizar</button>${activityDisclosureToggleHtml('audit', 'activity-audit-panel')}</div></div>
+      <div id="activity-audit-panel" class="activity-disclosure-panel" ${activityDisclosureState.audit ? '' : 'hidden'}>
+        <div class="audit-filters">
+          <label>Proyecto<select id="audit-workspace"><option value="">Todos</option>${workspaces.map((workspace) => `<option value="${escapeHtml(workspace.id)}" ${auditFilters.workspaceId === workspace.id ? 'selected' : ''}>${escapeHtml(workspace.name)}</option>`).join('')}</select></label>
+          <label>Acción<select id="audit-action"><option value="">Todas</option>${Object.entries(AUDIT_ACTION_LABELS).map(([action, label]) => `<option value="${escapeHtml(action)}" ${auditFilters.action === action ? 'selected' : ''}>${escapeHtml(label)}</option>`).join('')}</select></label>
+          <label>Resultado<select id="audit-outcome"><option value="">Todos</option><option value="success" ${auditFilters.outcome === 'success' ? 'selected' : ''}>Correcto</option><option value="error" ${auditFilters.outcome === 'error' ? 'selected' : ''}>Error o denegado</option></select></label>
+        </div>
+        <div id="audit-events">${auditEventsHtml()}</div>
+      </div>
     </div>
     ${browserViewerHtml()}
   `;
@@ -1865,7 +2104,7 @@ function settingsSectionHtml(): string {
       <h3>Qué datos salen del equipo</h3>
       <p><strong>Permanece local:</strong> claves cifradas, rutas absolutas, auditoría y contenido que no solicite una tool.</p>
       <p><strong>Por el túnel:</strong> únicamente resultados de tools autorizadas para el proyecto y la operación solicitados.</p>
-      <div class="actions"><button type="button" data-external="tunnels">Administrar o revocar túneles</button><button type="button" id="forget-key-trust" ${keySaved ? '' : 'disabled'}>Olvidar clave de este perfil</button></div>
+      <div class="actions"><button type="button" data-external="tunnels">Administrar o revocar túneles</button><button type="button" id="forget-key-trust" ${tunnelKeyState.status === 'absent' ? 'disabled' : ''}>Olvidar clave de este perfil</button></div>
     </div>
     <form id="behavior-settings-form" class="surface-card">
       <label class="permission-option"><input type="checkbox" name="minimizeToTray" ${settingsDraft.minimizeToTray ? 'checked' : ''}/><span><strong>Mantener en la bandeja</strong><small>Minimizar o cerrar la ventana mantiene el túnel activo. “Salir” cierra todo explícitamente.</small></span></label>
@@ -2166,10 +2405,10 @@ function validateTunnelId(form: HTMLFormElement): boolean {
   return false;
 }
 
-function validateRuntimeKey(): boolean {
+function validateRuntimeKey(allowStored = false): boolean {
   const input = document.querySelector<HTMLInputElement>('#api-key');
   if (input === null) return false;
-  if (apiKeyDraft !== '') {
+  if (apiKeyDraft !== '' || (allowStored && tunnelKeyState.status === 'available')) {
     clearFieldError(input, 'runtime-key-error');
     return true;
   }
@@ -2361,9 +2600,9 @@ function adoptOnboardingSnapshot(snapshot: OnboardingViewSnapshot): void {
 async function adoptSettings(next: DesktopSettings): Promise<void> {
   settings = next;
   settingsDraft = { ...next };
-  apiKeyDraft = (await window.desktop.getSavedTunnelKey()) ?? '';
-  storedApiKey = apiKeyDraft;
-  keySaved = apiKeyDraft !== '';
+  apiKeyDraft = '';
+  tunnelKeyState = await window.desktop.getTunnelKeyState();
+  keySaved = tunnelKeyState.status === 'available';
   diagnosticOutput = '';
   onboardingTunnelReady = false;
   render();
@@ -2421,6 +2660,8 @@ async function refreshDevelopmentActivity(shouldRender = true): Promise<void> {
     lastProblem = `No se pudo leer la actividad de desarrollo: ${errorMessage(error)}`;
     developmentActivity = { processes: [], browsers: [], applications: [], terminals: [], jobs: [] };
   }
+  pruneActivityExpandedItems();
+  updateAutomaticActivityDisclosure();
   if (browserViewerSessionId !== undefined && !developmentActivity.browsers.some((entry) =>
     entry.sessionId === browserViewerSessionId && entry.state === 'running')) {
     stopBrowserViewer();
@@ -3223,8 +3464,13 @@ function attachHandlers(): void {
     const filter = button.dataset['activityFilter'];
     if (filter !== 'all' && filter !== 'browsers' && filter !== 'resources') return;
     activityFilter = filter;
+    if (button.closest('.activity-intervention') !== null) {
+      activityDisclosureState = { ...activityDisclosureState, runtime: true };
+      saveActivityDisclosureState();
+    }
     render();
   }));
+  bindActivityDisclosureActions();
   document.querySelector<HTMLButtonElement>('#stop-all-development')?.addEventListener('click', (event) => {
     const button = event.currentTarget as HTMLButtonElement;
     stopBrowserViewer();
@@ -3585,6 +3831,10 @@ function attachHandlers(): void {
 
   document.querySelector<HTMLInputElement>('#log-search')?.addEventListener('input', (event) => {
     logFilter = (event.target as HTMLInputElement).value;
+    if (logFilter !== '' && !activityDisclosureState.technicalLog) {
+      activityDisclosureState = { ...activityDisclosureState, technicalLog: true };
+      saveActivityDisclosureState();
+    }
     const container = document.querySelector<HTMLDivElement>('#activity-log-container');
     if (container !== null) container.innerHTML = activityLogHtml();
   });
@@ -3915,6 +4165,10 @@ function attachHandlers(): void {
     updateRuntimeKeyStatusUi();
   });
 
+  document.querySelector<HTMLInputElement>('#remember-tunnel-key')?.addEventListener('change', (event) => {
+    rememberTunnelKey = (event.target as HTMLInputElement).checked;
+  });
+
   document.querySelector('#prepare-profile')?.addEventListener('click', () => {
     void (async () => {
       try {
@@ -3950,16 +4204,19 @@ function attachHandlers(): void {
           showFeedback('error', diagnosticFailureMessage(result.output));
           return;
         }
+        if (result.keyPersistence === 'remembered') {
+          tunnelKeyState = { status: 'available' };
+          keySaved = true;
+          apiKeyDraft = '';
+        }
         if (onboardingResult !== undefined) {
           adoptOnboardingSnapshot(onboardingResult.snapshot);
-          storedApiKey = apiKeyDraft;
-          keySaved = true;
-        } else if (apiKeyDraft !== storedApiKey) {
-          await window.desktop.saveTunnelKey(apiKeyDraft);
-          storedApiKey = apiKeyDraft;
-          keySaved = true;
         }
-        showFeedback('success', 'Diagnóstico completado sin fallos. La clave quedó guardada y cifrada.');
+        if (result.keyPersistence === 'failed') {
+          showFeedback('warning', 'Diagnóstico correcto; la clave no pudo guardarse y se pedirá al reiniciar.');
+        } else {
+          showFeedback('success', 'Diagnóstico completado sin fallos. La clave quedó guardada y cifrada.');
+        }
       } catch (error) {
         diagnosticOutput = '';
         onboardingTunnelReady = false;
@@ -3976,17 +4233,34 @@ function attachHandlers(): void {
   document.querySelector('#connect-tunnel')?.addEventListener('click', () => {
     void (async () => {
       try {
-        if (settingsForm === null || !validateTunnelId(settingsForm) || !validateRuntimeKey()) return;
+        if (settingsForm === null || !validateTunnelId(settingsForm) || !validateRuntimeKey(true)) return;
         await window.desktop.saveSettings(settingsDraft);
         settings = { ...settingsDraft };
-        await window.desktop.connectTunnel(apiKeyDraft);
+        const hadStoredKey = tunnelKeyState.status === 'available';
+        const suppliedNewKey = apiKeyDraft !== '';
+        const result = await window.desktop.connectTunnel({
+          ...(apiKeyDraft === '' ? {} : { apiKey: apiKeyDraft }),
+          remember: rememberTunnelKey,
+        });
         effectiveGitApprovalMode = settingsDraft.gitApprovalMode;
-        showFeedback(
-          'success',
-          apiKeyDraft === storedApiKey
-            ? 'Conexión iniciada.'
-            : 'Conexión iniciada con una clave sin guardar. Cuando desconectes, usa Diagnosticar para validarla y guardarla.',
-        );
+        apiKeyDraft = '';
+        if (result.remembered) {
+          tunnelKeyState = { status: 'available' };
+          keySaved = true;
+        } else if (!hadStoredKey) {
+          tunnelKeyState = { status: 'absent' };
+          keySaved = false;
+        }
+        showFeedback(result.warningCode === 'KEY_STORE_WRITE_FAILED' ? 'warning' : 'success',
+          result.warningCode === 'KEY_STORE_WRITE_FAILED'
+            ? hadStoredKey
+              ? 'Conectado; la clave nueva no pudo guardarse y la clave anterior se conserva.'
+              : 'Conectado; la clave no pudo guardarse y se pedirá al reiniciar.'
+            : result.remembered
+              ? 'Conectado. La clave está guardada y cifrada para este perfil.'
+              : suppliedNewKey && hadStoredKey
+                ? 'Conectado con una clave temporal; la clave guardada anterior se conserva.'
+                : 'Conectado con una clave temporal para esta sesión.');
       } catch (error) {
         showFeedback('error', safeTunnelErrorMessage(error, 'conexión'));
       }
@@ -4009,8 +4283,8 @@ function attachHandlers(): void {
       try {
         await window.desktop.forgetTunnelKey();
         keySaved = false;
+        tunnelKeyState = { status: 'absent' };
         apiKeyDraft = '';
-        storedApiKey = '';
         showFeedback('success', 'Clave guardada eliminada.');
       } catch (error) {
         showFeedback('error', `No se pudo olvidar la clave: ${errorMessage(error)}`);
@@ -4022,8 +4296,8 @@ function attachHandlers(): void {
       try {
         await window.desktop.forgetTunnelKey();
         keySaved = false;
+        tunnelKeyState = { status: 'absent' };
         apiKeyDraft = '';
-        storedApiKey = '';
         showFeedback('success', 'Clave de este perfil eliminada del equipo.');
       } catch (error) {
         showFeedback('error', `No se pudo olvidar la clave: ${errorMessage(error)}`);
@@ -4094,7 +4368,7 @@ void (async () => {
         .listWebActivity()
         .then((value) => ({ value }))
         .catch((error: unknown) => ({ error })),
-      window.desktop.getSavedTunnelKey(),
+      window.desktop.getTunnelKeyState(),
     ]);
     tunnelStatus = initialStatus;
     effectiveGitApprovalMode = initialEffectiveGitApprovalMode;
@@ -4136,11 +4410,11 @@ void (async () => {
     if ('value' in initialWebProfilesResult) webProfiles = initialWebProfilesResult.value;
     else webProfilesError = errorMessage(initialWebProfilesResult.error);
     if ('value' in initialWebActivityResult) webActivity = initialWebActivityResult.value;
-    if (savedKey !== undefined) {
-      apiKeyDraft = savedKey;
-      storedApiKey = savedKey;
-      keySaved = true;
-    }
+    pruneActivityExpandedItems();
+    updateAutomaticActivityDisclosure();
+    tunnelKeyState = savedKey;
+    keySaved = savedKey.status === 'available';
+    apiKeyDraft = '';
     isInitializing = false;
     render();
     schedulePendingApprovalExpiry();

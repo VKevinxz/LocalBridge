@@ -23,3 +23,5 @@ if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $scriptsRoot 'verify-electron-web-controller.ps1')
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+& powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $scriptsRoot 'verify-electron-key-persistence.ps1')
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

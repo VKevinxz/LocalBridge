@@ -1,10 +1,17 @@
 [CmdletBinding()]
 param(
-    [string]$RootPath = (Split-Path -Parent $PSScriptRoot)
+    [string]$RootPath
 )
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
+
+if ([string]::IsNullOrWhiteSpace($RootPath)) {
+    if ([string]::IsNullOrWhiteSpace($PSScriptRoot)) {
+        throw 'Cannot resolve the repository root because PSScriptRoot is unavailable.'
+    }
+    $RootPath = Split-Path -Parent $PSScriptRoot
+}
 
 $root = [IO.Path]::GetFullPath($RootPath)
 $rootManifestPath = Join-Path $root 'package.json'

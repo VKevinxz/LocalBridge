@@ -36,6 +36,18 @@ import { buildFilteredEnv, killProcessTree, type GitApprovalMode } from "@localb
 
 export type TunnelStatus = "disconnected" | "connecting" | "connected" | "error";
 
+export type TunnelConnectionWaitCode =
+  | "TUNNEL_CONNECTION_FAILED"
+  | "TUNNEL_CONNECTION_CANCELLED"
+  | "TUNNEL_CONNECTION_TIMEOUT";
+
+export class TunnelConnectionWaitError extends Error {
+  constructor(readonly code: TunnelConnectionWaitCode) {
+    super(code);
+    this.name = "TunnelConnectionWaitError";
+  }
+}
+
 /** Tiempo mínimo vivo para tratar una muerte como caída transitoria en vez de configuración rota. */
 export const MIN_UPTIME_FOR_AUTO_RECONNECT_MS = 10_000;
 /** Reintentos automáticos antes de rendirse y dejar el estado en "error". */
@@ -95,6 +107,11 @@ export class TunnelSupervisor {
   private lastConnectOptions: TunnelConnectOptions | undefined;
   private reconnectAttempt = 0;
   private reconnectTimer: NodeJS.Timeout | undefined;
+  private readonly connectionWaiters = new Set<{
+    readonly resolve: () => void;
+    readonly reject: (error: TunnelConnectionWaitError) => void;
+    readonly timer: NodeJS.Timeout;
+  }>();
 
   constructor(
     private readonly callbacks: TunnelSupervisorCallbacks = {},
@@ -118,6 +135,27 @@ export class TunnelSupervisor {
       : undefined;
   }
 
+  waitForConnection(timeoutMs = 45_000): Promise<void> {
+    if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 120_000) {
+      throw new Error("timeout de conexión fuera de rango");
+    }
+    if (this.status === "connected") return Promise.resolve();
+    if (this.status === "error") return Promise.reject(new TunnelConnectionWaitError("TUNNEL_CONNECTION_FAILED"));
+    if (this.status !== "connecting") return Promise.reject(new TunnelConnectionWaitError("TUNNEL_CONNECTION_CANCELLED"));
+
+    return new Promise((resolve, reject) => {
+      const waiter = {
+        resolve,
+        reject,
+        timer: this.setTimeoutFn(() => {
+          this.connectionWaiters.delete(waiter);
+          reject(new TunnelConnectionWaitError("TUNNEL_CONNECTION_TIMEOUT"));
+        }, timeoutMs),
+      };
+      this.connectionWaiters.add(waiter);
+    });
+  }
+
   connect(options: TunnelConnectOptions): void {
     if (this.status === "connecting" || this.status === "connected") {
       throw new Error(`ya hay una conexión en curso (estado: ${this.status})`);
@@ -136,12 +174,14 @@ export class TunnelSupervisor {
     }
 
     if (this.child === undefined) {
+      this.lastConnectOptions = undefined;
       this.setStatus("disconnected");
       return;
     }
 
     this.killTreeFn(this.child, this.isWindows);
     this.child = undefined;
+    this.lastConnectOptions = undefined;
     this.setStatus("disconnected");
   }
 
@@ -187,6 +227,7 @@ export class TunnelSupervisor {
 
     child.on("error", (error) => {
       this.child = undefined;
+      this.lastConnectOptions = undefined;
       this.setStatus("error", error.message);
     });
 
@@ -217,6 +258,7 @@ export class TunnelSupervisor {
         aliveMs < MIN_UPTIME_FOR_AUTO_RECONNECT_MS
           ? `tunnel-client terminó inesperadamente (code=${code ?? "null"}, signal=${signal ?? "null"})`
           : `tunnel-client terminó inesperadamente tras ${this.reconnectAttempt} reintento(s) automático(s) fallido(s) (code=${code ?? "null"}, signal=${signal ?? "null"})`;
+      this.lastConnectOptions = undefined;
       this.setStatus("error", reason);
     });
   }
@@ -238,6 +280,17 @@ export class TunnelSupervisor {
 
   private setStatus(status: TunnelStatus, detail?: string): void {
     this.status = status;
+    if (status === "connected" || status === "error" || status === "disconnected") {
+      const waiters = [...this.connectionWaiters];
+      this.connectionWaiters.clear();
+      for (const waiter of waiters) {
+        this.clearTimeoutFn(waiter.timer);
+        if (status === "connected") waiter.resolve();
+        else waiter.reject(new TunnelConnectionWaitError(
+          status === "error" ? "TUNNEL_CONNECTION_FAILED" : "TUNNEL_CONNECTION_CANCELLED",
+        ));
+      }
+    }
     this.callbacks.onStatusChange?.(status, detail);
   }
 }

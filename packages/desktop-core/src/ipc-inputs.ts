@@ -31,6 +31,11 @@ export const analysisJobTargetInputSchema = z.object({
   workspaceId: workspaceIdInputSchema,
   jobId: z.string().regex(/^job_[a-f0-9]{24}$/),
 }).strict();
+export const taskBatchTargetInputSchema = z.object({
+  workspaceId: workspaceIdInputSchema,
+  batchId: z.string().regex(/^batch_[a-f0-9]{24}$/),
+  localId: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/).optional(),
+}).strict();
 export const applicationIdInputSchema = localApplicationSchema.shape.id;
 export const browserSessionIdInputSchema = z.string().regex(/^session_[a-f0-9]{24}$/);
 export const displayIdInputSchema = z.string().regex(/^-?\d{1,20}$/);
@@ -160,6 +165,12 @@ export const tunnelApiKeyInputSchema = z
   .string()
   .max(16_384)
   .refine((value) => value.trim().length > 0, "la clave no puede estar vacía");
+
+export const tunnelConnectInputSchema = z.object({
+  apiKey: tunnelApiKeyInputSchema.optional(),
+  remember: z.boolean(),
+}).strict();
+export type TunnelConnectInput = z.infer<typeof tunnelConnectInputSchema>;
 
 export const externalDestinationSchema = z.enum(["tunnels", "runtimeKeys", "chatgptConnectors"]);
 export type ExternalDestination = z.infer<typeof externalDestinationSchema>;

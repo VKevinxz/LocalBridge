@@ -34,9 +34,17 @@ function client(ctx: ToolContext) {
   if (ctx.developmentClient === undefined) throw new LocalBridgeError("FEATURE_UNAVAILABLE");
   return ctx.developmentClient;
 }
-function mapBrokerError(error: unknown): unknown {
+function mapBrokerError(error: unknown, rateLimit?: Record<string, unknown>): unknown {
   if (!(error instanceof DevelopmentBrokerError)) return error;
-  if ((ERROR_CODES as readonly string[]).includes(error.code)) return new LocalBridgeError(error.code as ErrorCode);
+  if ((ERROR_CODES as readonly string[]).includes(error.code)) {
+    const causeCode = error.causeCode !== undefined && (ERROR_CODES as readonly string[]).includes(error.causeCode)
+      ? error.causeCode
+      : undefined;
+    return new LocalBridgeError(error.code as ErrorCode, {
+      ...(causeCode === undefined ? {} : { causeCode }),
+      ...(error.code === "RATE_LIMITED" && rateLimit !== undefined ? { rateLimit } : {}),
+    });
+  }
   return new LocalBridgeError("INTERNAL_ERROR");
 }
 
@@ -54,7 +62,7 @@ function audit(ctx: ToolContext, tool: string, riskLevel: string, projectId: str
 export function registerTerminalStartTool(server: McpServer, ctx: ToolContext): void {
   server.registerTool("terminal.start", {
     title: "Start a trusted project terminal",
-    description: "Starts an interactive local terminal for a project using the trust level chosen in LocalBridge. It cannot choose a root, shell, environment or trust mode. Guided projects and unavailable sandboxes fail closed. Full-host mode has the same authority as the signed-in Windows user. Do not use terminal tools for Git operations supported by git.*; prefer structured git.* and web.download tools when available. For an ad-hoc development server, bind to 127.0.0.1 or ::1 unless the user explicitly requested LAN access; wildcard binds such as 0.0.0.0 and :: may trigger the Windows Firewall and expose the service to the local network. Multi-repository projects use repositoryPath from project.list.",
+    description: "Starts an interactive local terminal for a project using the trust level chosen in LocalBridge. Call terminal.list first and reuse a running session when it belongs to the same ongoing task. A detected setup proposal or missing reviewed process profile does not block a separately authorized full-host terminal. It cannot choose a root, shell, environment or trust mode. Guided projects and unavailable sandboxes fail closed. Full-host mode has the same authority as the signed-in Windows user. Do not use terminal tools for Git operations supported by git.*; prefer structured git.* and web.download tools when available. For an ad-hoc development server, bind to 127.0.0.1 or ::1 unless the user explicitly requested LAN access; wildcard binds such as 0.0.0.0 and :: may trigger the Windows Firewall and expose the service to the local network. Multi-repository projects use repositoryPath from project.list.",
     inputSchema: z.object({ projectId: projectIdSchema, operationId: operationIdSchema }).strict(),
     outputSchema: terminalSummarySchema,
     annotations: { readOnlyHint: false, idempotentHint: true, destructiveHint: true, openWorldHint: true },
@@ -63,7 +71,10 @@ export function registerTerminalStartTool(server: McpServer, ctx: ToolContext): 
     try {
       return toolSuccess(terminalSummarySchema.parse(await client(ctx).call("terminal.start", { projectId, operationId })), { context: auditBase, logger: ctx.logger });
     } catch (error) {
-      return toolError(mapBrokerError(error), ctx.logger, { tool: "terminal.start", projectId }, auditBase);
+      return toolError(mapBrokerError(error, {
+        resource: "terminal-sessions", scope: "project",
+        recoveryTool: "terminal.list", action: "list-and-reuse",
+      }), ctx.logger, { tool: "terminal.start", projectId }, auditBase);
     }
   });
 }
@@ -72,7 +83,7 @@ export function registerTerminalListTool(server: McpServer, ctx: ToolContext): v
   const outputSchema = z.object({ sessions: z.array(terminalSummarySchema).max(256) }).strict();
   server.registerTool("terminal.list", {
     title: "List project terminal sessions",
-    description: "Lists retained terminal sessions for one locally authorized project so a reconnected client can resume reading or stop them. It exposes no PID, root, environment or command history.",
+    description: "Lists retained terminal sessions for one locally authorized project so a reconnected client or another conversation can resume reading or deliberately stop them. Reuse a compatible running session rather than starting a duplicate. running means the shell remains alive; it does not mean the last command is idle, complete or successful. It exposes no PID, root, environment or command history.",
     inputSchema: z.object({ projectId: projectIdSchema }).strict(),
     outputSchema,
     annotations: { readOnlyHint: true, idempotentHint: true, destructiveHint: false, openWorldHint: false },
@@ -112,19 +123,24 @@ export function registerTerminalReadTool(server: McpServer, ctx: ToolContext): v
     nextCursor: z.number().int().nonnegative(),
     truncatedBeforeCursor: z.boolean(),
     minimumBytesToProgress: z.number().int().min(1).max(4).optional(),
+    waitOutcome: z.enum(["immediate", "output", "terminal-ended", "deadline"]),
+    waitedMs: z.number().int().nonnegative(),
   }).strict();
   server.registerTool("terminal.read", {
     title: "Read bounded terminal output",
-    description: "Reads a cursor-based bounded window from a LocalBridge terminal. Control sequences are sanitized and old output may be explicitly truncated.",
-    inputSchema: z.object({ projectId: projectIdSchema, sessionId: sessionIdSchema, cursor: z.number().int().nonnegative().default(0), maxBytes: z.number().int().min(1).max(65_536).default(65_536) }).strict(),
+    description: "Reads a cursor-based bounded window from a LocalBridge terminal. By default it returns immediately. Set waitMs to wait briefly for new output, terminal completion, revocation or the deadline; after waking LocalBridge rereads from the supplied cursor, so another client never consumes this client's output. A terminal that remains running and quiet does not prove a command finished. Control sequences are sanitized and old output may be explicitly truncated.",
+    inputSchema: z.object({ projectId: projectIdSchema, sessionId: sessionIdSchema, cursor: z.number().int().nonnegative().default(0), maxBytes: z.number().int().min(1).max(65_536).default(65_536), waitMs: z.number().int().min(0).max(20_000).default(0) }).strict(),
     outputSchema,
     annotations: { readOnlyHint: true, idempotentHint: true, destructiveHint: false, openWorldHint: false },
-  }, async ({ projectId, sessionId, cursor, maxBytes }) => {
+  }, async ({ projectId, sessionId, cursor, maxBytes, waitMs }) => {
     const auditBase = audit(ctx, "terminal.read", "R1", projectId, sessionId);
     try {
-      return toolSuccess(outputSchema.parse(await client(ctx).call("terminal.read", { projectId, sessionId, cursor, maxBytes })), { context: auditBase, logger: ctx.logger });
+      return toolSuccess(outputSchema.parse(await client(ctx).call("terminal.read", { projectId, sessionId, cursor, maxBytes, waitMs })), { context: auditBase, logger: ctx.logger });
     } catch (error) {
-      return toolError(mapBrokerError(error), ctx.logger, { tool: "terminal.read", projectId, sessionId }, auditBase);
+      return toolError(mapBrokerError(error, {
+        resource: "terminal-output-waits", scope: "session",
+        recoveryTool: "terminal.read", action: "immediate-read",
+      }), ctx.logger, { tool: "terminal.read", projectId, sessionId }, auditBase);
     }
   });
 }
@@ -133,7 +149,7 @@ export function registerTerminalStatusTool(server: McpServer, ctx: ToolContext):
   const outputSchema = z.object({ session: terminalSummarySchema, listeners: z.array(listenerSchema).max(128) }).strict();
   server.registerTool("terminal.status", {
     title: "Read terminal status and verified listeners",
-    description: "Returns terminal state and listeners proven to belong to its Job Object. Report bindScope=wildcard to the user because it listens beyond loopback; prefer 127.0.0.1 or ::1 for local development. It exposes no PID, root, environment or command history.",
+    description: "Returns terminal state and current listeners proven to belong to its Job Object. Use current listenerRef values when opening a project browser; do not reuse an old port after ownership changes. running means the terminal shell is alive, not that the last command is idle, complete or successful. Report bindScope=wildcard to the user because it listens beyond loopback; prefer 127.0.0.1 or ::1 for local development. It exposes no PID, root, environment or command history.",
     inputSchema: z.object({ projectId: projectIdSchema, sessionId: sessionIdSchema }).strict(),
     outputSchema,
     annotations: { readOnlyHint: true, idempotentHint: true, destructiveHint: false, openWorldHint: false },

@@ -72,9 +72,9 @@ describe('1. listar workspace', () => {
     };
 
     expect(listed.profileAvailability).toEqual({
-      validations: [{ name: 'test', available: true }],
-      processes: [{ name: 'dev', available: false, blockedReason: 'automation-review-required' }],
-      browser: [{ name: 'web', available: false, blockedReason: 'automation-review-required' }],
+      validations: [{ name: 'test', source: 'reviewed', available: true }],
+      processes: [{ name: 'dev', source: 'reviewed', available: false, blockedReason: 'automation-review-required' }],
+      browser: [{ name: 'web', source: 'reviewed', available: false, blockedReason: 'automation-review-required' }],
     });
   });
 });

@@ -56,7 +56,9 @@ límites de un workspace Guiado.
 Cada perfil de conexión tiene un tunnel ID público, un directorio de `tunnel-client` y un
 archivo de clave cifrada independientes. Cambiar de perfil exige desconectar primero. Un
 blob DPAPI no es portable: otra cuenta de Windows u otra PC debe introducir una clave
-nueva.
+nueva. **Conectar** puede recordar una clave solo después de comprobar la conexión; el
+campo queda vacío al reabrir porque el valor descifrado nunca se devuelve a la interfaz.
+La opción **Recordar en este equipo** puede desactivarse para una conexión efímera.
 
 ## Exportar e importar
 

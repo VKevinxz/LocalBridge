@@ -1,6 +1,6 @@
 # Instalar LocalBridge en cinco minutos
 
-El árbol local de LocalBridge corresponde al candidato `v1.7.0` para Windows x64. La última
+El árbol local de LocalBridge corresponde al candidato `v1.8.1` para Windows x64. La última
 preview publicada sigue siendo `v1.2.1.2`; usa únicamente artefactos de Releases o un
 `win-unpacked` generado y verificado desde este mismo árbol.
 
@@ -51,7 +51,7 @@ Comprueba la conexión con una solicitud sencilla:
 
 > Valida la conexión de LocalBridge y enumera los proyectos disponibles sin modificar nada.
 
-La respuesta debe indicar `ready`, versión `1.7.0` para el candidato local y protocolo
+La respuesta debe indicar `ready`, versión `1.8.1` para el candidato local y protocolo
 `2026-07-28`.
 
 ## 4. Primera prueba segura

@@ -74,7 +74,7 @@ describe("SEC-189..198 — vista web local pasiva", () => {
     expect(server).not.toContain("web.showLiveViewer");
     expect(server).not.toContain("web.hideLiveViewer");
     expect(workspaceTypes).not.toContain("webLiveViewer");
-    expect(protocol).toContain("DEVELOPMENT_BROKER_PROTOCOL = 19 as const");
+    expect(protocol).toContain("DEVELOPMENT_BROKER_PROTOCOL = 22 as const");
   });
 
   it("SEC-195 el handoff retira el visor y la devolución no lo reabre", async () => {
