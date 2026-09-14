@@ -57,6 +57,8 @@ const MAX_WRITE_BYTES = 64 * 1024;
 const MAX_CONTROL_BUFFER_BYTES = 16 * 1024;
 const MAX_SESSION_MS = 8 * 60 * 60 * 1000;
 const LISTENER_STALE_MS = 1_500;
+const MAX_READ_WAITERS_GLOBAL = 64;
+const MAX_READ_WAITERS_PER_SESSION = 8;
 const TERMINAL_SECRET_NAME = /^(?:LOCALBRIDGE_|CONTROL_PLANE_API_KEY$|ELECTRON_|NODE_OPTIONS$)/i;
 
 export type TerminalState = "running" | "exited" | "stopped" | "revoked" | "timed_out";
@@ -155,6 +157,7 @@ interface MutableTerminal {
   controlBuffer: string;
   originHintBuffer: string;
   readonly originHints: Map<number, Set<string>>;
+  readonly readWaiters: Set<() => void>;
   exitCode?: number;
 }
 
@@ -254,6 +257,7 @@ export class TerminalSupervisor {
   private readonly writeOperations = new Map<string, { sessionId: string; digest: string; nextCursor: number }>();
   private readonly platform: NodeJS.Platform;
   private readonly now: () => number;
+  private activeReadWaiters = 0;
 
   constructor(private readonly options: TerminalSupervisorOptions) {
     this.platform = options.platform ?? process.platform;
@@ -345,6 +349,11 @@ export class TerminalSupervisor {
       if (removed !== undefined) entry.outputBytes -= Buffer.byteLength(removed.text);
     }
     this.options.onProjectActivity?.(entry.projectId);
+    this.notifyReadWaiters(entry);
+  }
+
+  private notifyReadWaiters(entry: MutableTerminal): void {
+    for (const resolve of entry.readWaiters) resolve();
   }
 
   private listenerSnapshot(entry: MutableTerminal, line: string): void {
@@ -482,6 +491,7 @@ export class TerminalSupervisor {
       controlBuffer: "",
       originHintBuffer: "",
       originHints: new Map(),
+      readWaiters: new Set(),
     };
     this.entries.set(sessionId, entry);
     if (operationKey !== undefined) this.operations.set(operationKey, sessionId);
@@ -496,6 +506,7 @@ export class TerminalSupervisor {
       entry.listeners.clear();
       clearTimeout(entry.timer);
       entry.resolveClose();
+      this.notifyReadWaiters(entry);
     });
     child.once("close", (code) => {
       if (entry.state === "running") entry.state = "exited";
@@ -504,6 +515,7 @@ export class TerminalSupervisor {
       entry.listeners.clear();
       clearTimeout(entry.timer);
       entry.resolveClose();
+      this.notifyReadWaiters(entry);
     });
     const ready = await Promise.race([
       entry.readyPromise.then(() => true),
@@ -542,10 +554,7 @@ export class TerminalSupervisor {
     return { session: summary(entry), nextCursor };
   }
 
-  async read(projectId: string, sessionId: string, cursor: number, maxBytes: number) {
-    const { project, trust } = await this.sessionAuthority(projectId);
-    const entry = this.entry(projectId, sessionId);
-    this.requireSessionAuthority(entry, project, trust);
+  private readWindow(entry: MutableTerminal, cursor: number, maxBytes: number) {
     const firstCursor = entry.output[0]?.cursor ?? entry.nextCursor;
     let nextCursor = Math.max(cursor, firstCursor);
     let used = 0;
@@ -573,6 +582,50 @@ export class TerminalSupervisor {
       nextCursor: output.length === 0 && minimumBytesToProgress === undefined ? Math.max(cursor, entry.nextCursor) : nextCursor,
       truncatedBeforeCursor: cursor < firstCursor,
       ...(minimumBytesToProgress === undefined ? {} : { minimumBytesToProgress }),
+    };
+  }
+
+  async read(projectId: string, sessionId: string, cursor: number, maxBytes: number, waitMs = 0) {
+    const { project, trust } = await this.sessionAuthority(projectId);
+    const entry = this.entry(projectId, sessionId);
+    this.requireSessionAuthority(entry, project, trust);
+    const startedAt = this.now();
+    const immediate = this.readWindow(entry, cursor, maxBytes);
+    if (immediate.entries.length > 0 || immediate.minimumBytesToProgress !== undefined || waitMs === 0 || entry.state !== "running") {
+      return {
+        ...immediate,
+        waitOutcome: entry.state !== "running" && immediate.entries.length === 0 ? "terminal-ended" as const : "immediate" as const,
+        waitedMs: 0,
+      };
+    }
+    if (this.activeReadWaiters >= MAX_READ_WAITERS_GLOBAL || entry.readWaiters.size >= MAX_READ_WAITERS_PER_SESSION) {
+      brokerError("RATE_LIMITED", "Se alcanzó la capacidad de esperas de salida de terminal; la lectura inmediata sigue disponible.");
+    }
+    await new Promise<void>((resolve) => {
+      let settled = false;
+      const finish = (): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        entry.readWaiters.delete(finish);
+        this.activeReadWaiters = Math.max(0, this.activeReadWaiters - 1);
+        resolve();
+      };
+      const timer = setTimeout(finish, waitMs);
+      timer.unref();
+      this.activeReadWaiters += 1;
+      entry.readWaiters.add(finish);
+      // La suscripción se instala antes de esta segunda observación: no se
+      // pierde salida que llegue entre el primer read y el registro del waiter.
+      if (entry.nextCursor > immediate.nextCursor || entry.state !== "running") finish();
+    });
+    const currentAuthority = await this.sessionAuthority(projectId);
+    this.requireSessionAuthority(entry, currentAuthority.project, currentAuthority.trust);
+    const result = this.readWindow(entry, cursor, maxBytes);
+    return {
+      ...result,
+      waitOutcome: result.entries.length > 0 ? "output" as const : entry.state !== "running" ? "terminal-ended" as const : "deadline" as const,
+      waitedMs: Math.max(0, this.now() - startedAt),
     };
   }
 
@@ -667,6 +720,7 @@ export class TerminalSupervisor {
     const entry = this.entries.get(sessionId);
     if (entry === undefined || entry.state !== "running") return;
     entry.state = state;
+    this.notifyReadWaiters(entry);
     entry.finishedAtMs ??= this.now();
     entry.listeners.clear();
     entry.child.kill();

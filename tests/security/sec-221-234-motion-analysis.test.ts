@@ -149,10 +149,10 @@ describe('SEC-221..234 — análisis temporal y fidelidad del visor', () => {
   it('SEC-234 conserva el catálogo histórico tras las extensiones aditivas de v1.7.0', async () => {
     const protocolTest = await source('tests/protocol/server.test.ts');
     const packagedTest = await source('tests/integration/packaged-desktop-server.test.ts');
-    expect(DEVELOPMENT_BROKER_PROTOCOL).toBe(19);
+    expect(DEVELOPMENT_BROKER_PROTOCOL).toBe(22);
     for (const name of ['web.motion.inspect', 'browser.motion.inspect', 'web.motion.capture', 'browser.motion.capture', 'visual.motion.compare']) {
       expect(protocolTest).toContain(`'${name}'`);
     }
-    expect(packagedTest).toContain('toHaveLength(100)');
+    expect(packagedTest).toContain('toHaveLength(113)');
   });
 });

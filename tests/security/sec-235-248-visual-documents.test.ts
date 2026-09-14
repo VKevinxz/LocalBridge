@@ -219,8 +219,8 @@ describe("SEC-235..248 — lectura visual de documentos", () => {
   it("SEC-247 conserva las tools documentales R2 dentro del catálogo aditivo", async () => {
     await start();
     const listed = await harness!.client.listTools();
-    expect(listed.tools).toHaveLength(100);
-    expect(new Set(listed.tools.map((tool) => tool.name)).size).toBe(100);
+    expect(listed.tools).toHaveLength(113);
+    expect(new Set(listed.tools.map((tool) => tool.name)).size).toBe(113);
     for (const name of ["document.read", "document.render", "image.read", "git.commit", "web.download", "browser.screenshot"]) {
       expect(listed.tools.some((tool) => tool.name === name), name).toBe(true);
     }
@@ -244,6 +244,6 @@ describe("SEC-235..248 — lectura visual de documentos", () => {
     expect(builder).toContain("from: out/server");
     expect(builder).toContain('"*.wasm"');
     expect(packaged).toContain("document.render");
-    expect(packaged).toContain("toHaveLength(100)");
+    expect(packaged).toContain("toHaveLength(113)");
   });
 });

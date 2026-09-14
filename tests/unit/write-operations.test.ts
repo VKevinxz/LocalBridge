@@ -437,7 +437,7 @@ describe('moveWorkspaceFile — file.move', () => {
       sha256: hash,
     });
     expect(await readFile(path.join(workspace.root, 'assets', 'large-destination.bin'))).toEqual(bytes);
-  });
+  }, 30_000);
 
   it('crea los directorios intermedios del destino que falten', async () => {
     const ws = buildWorkspace({ rootPath: workspace.root, permissions: { read: true, write: false, overwrite: true, gitRead: false, validations: false, gitWrite: false } });

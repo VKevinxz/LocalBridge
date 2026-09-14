@@ -4,7 +4,7 @@ import path from 'node:path';
 
 import { afterEach, describe, expect, it } from 'vitest';
 
-import { startDevelopmentBroker, type RunningDevelopmentBroker } from '@localbridge/development';
+import { DevelopmentBrokerError, startDevelopmentBroker, type RunningDevelopmentBroker } from '@localbridge/development';
 import { queryAuditEvents } from '@localbridge/audit';
 import { TARGET_PROTOCOL_REVISION } from '@localbridge/shared';
 
@@ -13,13 +13,166 @@ import { buildWorkspace, writeRegistryFile } from '../helpers/fixtures.js';
 import { createHarness, type Harness } from '../helpers/harness.js';
 
 let harness: Harness | undefined;
+let secondHarness: Harness | undefined;
 let broker: RunningDevelopmentBroker | undefined;
 
 afterEach(async () => {
   await harness?.close();
+  await secondHarness?.close();
   await broker?.close();
   harness = undefined;
+  secondHarness = undefined;
   broker = undefined;
+});
+
+describe('descubrimiento y capacidad de navegadores', () => {
+  it('dos clientes redescubren la misma sesión y RATE_LIMITED indica cómo reutilizar', async () => {
+    const configPath = path.join(os.tmpdir(), `localbridge-browser-capacity-${randomUUID()}`, 'workspaces.json');
+    await writeRegistryFile(configPath, [buildWorkspace({
+      id: 'ws_capacity', rootPath: os.tmpdir(),
+      permissions: { read: true, write: false, overwrite: false, gitRead: false, validations: false, gitWrite: false, browserRead: true },
+    })]);
+    const session = {
+      sessionId: `session_${'9'.repeat(24)}`, profile: 'app', state: 'running' as const, title: 'Fixture', path: '/',
+      startedAt: '2026-09-12T00:00:00.000Z', controlState: 'agent_control' as const,
+      viewport: { width: 1920, height: 1080, mobile: false },
+    };
+    broker = await startDevelopmentBroker({ handler: async ({ method }) => {
+      if (method === 'browser.list') return [session];
+      if (method === 'browser.start') throw new DevelopmentBrokerError('RATE_LIMITED', 'capacity reached');
+      throw new DevelopmentBrokerError('INVALID_INPUT', 'unexpected method');
+    } });
+    const harnessOptions = {
+      pinProtocol: TARGET_PROTOCOL_REVISION,
+      workspaceConfigPath: configPath,
+      developmentBrokerEndpoint: broker.endpoint,
+      developmentBrokerToken: broker.token,
+    };
+    harness = await createHarness(harnessOptions);
+    secondHarness = await createHarness(harnessOptions);
+
+    const [firstList, secondList] = await Promise.all([
+      callToolJson(harness.client, 'browser.list', { workspaceId: 'ws_capacity' }),
+      callToolJson(secondHarness.client, 'browser.list', { workspaceId: 'ws_capacity' }),
+    ]);
+    expect(firstList.parsed).toEqual(secondList.parsed);
+    expect(firstList.parsed).toMatchObject({ sessions: [{ sessionId: session.sessionId, state: 'running' }] });
+
+    const limited = await callToolJson(secondHarness.client, 'browser.start', {
+      workspaceId: 'ws_capacity', profile: 'app', operationId: 'capacity_5',
+    });
+    expect(limited.isError).toBe(true);
+    expect(limited.parsed['error']).toMatchObject({
+      code: 'RATE_LIMITED', recoverable: true,
+      rateLimit: {
+        resource: 'local-browser-sessions', scope: 'global', capacity: 4,
+        recoveryTool: 'browser.list', action: 'list-and-reuse',
+      },
+    });
+  });
+});
+
+describe('inspección CSS acotada vía MCP', () => {
+  it('atraviesa MCP y broker sin aceptar selectores, JavaScript ni valores de campos', async () => {
+    const configPath = path.join(os.tmpdir(), `localbridge-browser-inspect-${randomUUID()}`, 'workspaces.json');
+    await writeRegistryFile(configPath, [buildWorkspace({
+      id: 'ws_inspect', rootPath: os.tmpdir(),
+      permissions: {
+        read: true, write: false, overwrite: false, gitRead: false, validations: false, gitWrite: false,
+        browserRead: true,
+      },
+    })]);
+    const calls: Array<{ method: string; params: unknown }> = [];
+    const inspection = {
+      target: 'element' as const,
+      rect: { x: 10, y: 20, width: 120, height: 40 },
+      styles: { color: 'rgb(1, 2, 3)' },
+      variables: { '--accent': '#123456' },
+      state: { attached: true, visible: true, enabled: true, focusable: true, active: false, role: 'button', name: 'Theme' },
+    };
+    broker = await startDevelopmentBroker({ handler: async (request) => {
+      calls.push(request);
+      return request.method === 'browser.inspect'
+        ? { sessionId: `session_${'a'.repeat(24)}`, ...inspection }
+        : { sessionId: `websession_${'b'.repeat(24)}`, tabId: `webtab_${'c'.repeat(24)}`, ...inspection };
+    } });
+    harness = await createHarness({
+      pinProtocol: TARGET_PROTOCOL_REVISION, workspaceConfigPath: configPath,
+      developmentBrokerEndpoint: broker.endpoint, developmentBrokerToken: broker.token,
+    });
+
+    const local = await callToolJson(harness.client, 'browser.inspect', {
+      workspaceId: 'ws_inspect', sessionId: `session_${'a'.repeat(24)}`,
+      target: 'element', snapshotId: `snapshot_${'d'.repeat(20)}`, elementRef: `element_${'e'.repeat(20)}`,
+      cssProperties: ['color'], cssVariables: ['--accent'],
+    });
+    const external = await callToolJson(harness.client, 'web.inspect', {
+      sessionId: `websession_${'b'.repeat(24)}`, tabId: `webtab_${'c'.repeat(24)}`,
+      target: 'element', snapshotId: `websnapshot_${'d'.repeat(20)}`, elementRef: `webelement_${'e'.repeat(20)}`,
+      cssProperties: ['color'], cssVariables: ['--accent'],
+    });
+    expect(local.isError).toBe(false);
+    expect(external.isError).toBe(false);
+    expect(local.parsed).toMatchObject(inspection);
+    expect(external.parsed).toMatchObject(inspection);
+    expect(calls.map((call) => call.method)).toEqual(['browser.inspect', 'web.inspect']);
+
+    const injected = await harness.client.callTool({
+      name: 'browser.inspect',
+      arguments: {
+        workspaceId: 'ws_inspect', sessionId: `session_${'a'.repeat(24)}`, target: 'active',
+        cssProperties: ['color'], cssVariables: [], selector: 'input[type=password]', script: 'document.cookie',
+      },
+    });
+    expect(injected.isError).toBe(true);
+    expect(calls).toHaveLength(2);
+    expect(JSON.stringify(calls)).not.toMatch(/selector|script|password|cookie/i);
+  });
+});
+
+describe('eventos y recarga de navegador vía MCP', () => {
+  it('transporta épocas y argumentos estructurados y exige un recibo para recargar', async () => {
+    const configPath = path.join(os.tmpdir(), `localbridge-browser-events-${randomUUID()}`, 'workspaces.json');
+    await writeRegistryFile(configPath, [buildWorkspace({
+      id: 'ws_events', rootPath: os.tmpdir(),
+      permissions: { read: true, write: false, overwrite: false, gitRead: false, validations: false, gitWrite: false, browserRead: true },
+    })]);
+    const calls: Array<{ method: string; params: unknown }> = [];
+    broker = await startDevelopmentBroker({ handler: async (request) => {
+      calls.push(request);
+      if (request.method === 'browser.events') return {
+        events: [{ cursor: 0, type: 'console', level: 'log', message: 'fixture', navigationEpoch: 3,
+          arguments: [{ kind: 'object', ref: 'object_1', properties: [{ name: 'lazy', kind: 'accessor' }], truncated: false }] }],
+        nextCursor: 128, truncatedBeforeCursor: false, navigationEpoch: 3,
+      };
+      return {
+        sessionId: `session_${'a'.repeat(24)}`, profile: 'app', state: 'running', title: 'Fixture', path: '/',
+        startedAt: '2026-09-12T00:00:00.000Z', controlState: 'agent_control',
+        viewport: { width: 1920, height: 1080, mobile: false },
+      };
+    } });
+    harness = await createHarness({ pinProtocol: TARGET_PROTOCOL_REVISION, workspaceConfigPath: configPath,
+      developmentBrokerEndpoint: broker.endpoint, developmentBrokerToken: broker.token });
+
+    const events = await callToolJson(harness.client, 'browser.events', {
+      workspaceId: 'ws_events', sessionId: `session_${'a'.repeat(24)}`, cursor: 0, maxBytes: 4096, scope: 'current-navigation',
+    });
+    const reload = await callToolJson(harness.client, 'browser.reload', {
+      workspaceId: 'ws_events', sessionId: `session_${'a'.repeat(24)}`, mode: 'ignore-cache', operationId: 'reload_1',
+    });
+    expect(events.isError).toBe(false);
+    expect(events.parsed).toMatchObject({ navigationEpoch: 3, events: [{ navigationEpoch: 3, arguments: [{ kind: 'object' }] }] });
+    expect(reload.isError).toBe(false);
+    expect(calls).toEqual([
+      expect.objectContaining({ method: 'browser.events', params: expect.objectContaining({ scope: 'current-navigation' }) }),
+      expect.objectContaining({ method: 'browser.reload', params: expect.objectContaining({ mode: 'ignore-cache', operationId: 'reload_1' }) }),
+    ]);
+    const missingReceipt = await harness.client.callTool({ name: 'browser.reload', arguments: {
+      workspaceId: 'ws_events', sessionId: `session_${'a'.repeat(24)}`, mode: 'normal',
+    } });
+    expect(missingReceipt.isError).toBe(true);
+    expect(calls).toHaveLength(2);
+  });
 });
 
 describe('tools web de solo lectura vía broker privado', () => {

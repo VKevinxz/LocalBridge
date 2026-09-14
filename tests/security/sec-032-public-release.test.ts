@@ -91,10 +91,15 @@ describe('SEC-032 — publicación fail-closed', () => {
 
   it('la auditoría nunca imprime el contenido potencialmente secreto', async () => {
     const script = await source('scripts/audit-public-history.ps1');
+    const snapshotAudit = await source('scripts/audit-public-snapshot.ps1');
+    const manifest = await source('public-snapshot.json');
 
     expect(script).toContain('git grep -I -l');
     expect(script).not.toContain('git grep -I -n');
     expect(script).toContain('Findings list file names only');
+    expect(script).toContain('tunnel-keys/[^/]+\\.enc$');
+    expect(snapshotAudit).toContain("'.enc'");
+    expect(manifest).toContain('".enc"');
   });
 
   it('fija por blob exacto el único secreto sintético permitido', async () => {

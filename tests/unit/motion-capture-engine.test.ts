@@ -85,11 +85,23 @@ describe('captura temporal', () => {
 
     expect(result).toMatchObject({ frameCount: 3, width: 1920, height: 1080, captureMode: 'stepped' });
     expect([...files.keys()]).toEqual([
-      'frames/frame-000.png', 'frames/frame-001.png', 'frames/frame-002.png', 'contact-sheet.png', 'manifest.json',
+      'frames/frame-000.png', 'frames/frame-001.png', 'frames/frame-002.png', 'contact-sheet.png', 'manifest.json', 'quality.json',
     ]);
     const captureCalls = browser.commands.filter((entry) => entry.method === 'Page.captureScreenshot');
     expect(captureCalls).toHaveLength(4);
     expect(captureCalls.every((entry) => entry.params?.['optimizeForSpeed'] === false)).toBe(true);
+    const manifestBytes = files.get('manifest.json');
+    const qualityBytes = files.get('quality.json');
+    if (manifestBytes === undefined || qualityBytes === undefined) throw new Error('motion metadata missing');
+    const quality = JSON.parse(qualityBytes.toString('utf8')) as {
+      manifestSha256: string;
+      samples: Array<{ requestAtMs: number; receivedAtMs: number; persistDurationMs: number; observedScrollBefore: { y: number }; observedScrollAfter: { y: number } }>;
+    };
+    expect(quality.manifestSha256).toBe(createHash('sha256').update(manifestBytes).digest('hex'));
+    expect(quality.samples).toHaveLength(3);
+    expect(quality.samples.every((sample) => sample.receivedAtMs >= sample.requestAtMs && sample.persistDurationMs >= 0)).toBe(true);
+    expect(quality.samples.map((sample) => sample.observedScrollBefore.y)).toEqual([0, 250, 500]);
+    expect(quality.samples.map((sample) => sample.observedScrollAfter.y)).toEqual([0, 250, 500]);
   });
 
   it('hace preflight antes de desplazar cuando un frame no cabe', async () => {

@@ -65,6 +65,22 @@ describe('SEC-027 — frontera privilegiada de Electron', () => {
     expect(supervisor).not.toContain('env: { ...process.env');
   });
 
+  it('mantiene la credencial cifrada fuera del renderer y expone solo su estado', async () => {
+    const main = await source('apps/desktop/src/main/index.ts');
+    const preload = await source('apps/desktop/src/preload/index.ts');
+    const renderer = await source('apps/desktop/src/renderer/src/main.ts');
+
+    expect(main).toContain('ipcMain.handle("tunnel:getKeyState"');
+    expect(main).toContain('publicStoredTunnelKeyState(loaded)');
+    expect(main).not.toContain('ipcMain.handle("tunnel:getSavedKey"');
+    expect(main).not.toContain('ipcMain.handle("tunnel:saveKey"');
+    expect(preload).toContain('getTunnelKeyState(): Promise<StoredTunnelKeyState>');
+    expect(preload).not.toContain('getSavedTunnelKey');
+    expect(preload).not.toContain('saveTunnelKey');
+    expect(renderer).not.toContain("localStorage.setItem('tunnel");
+    expect(renderer).not.toContain('tunnelKeyState.value');
+  });
+
   it('fija fuses de producción e integridad de ASAR', async () => {
     const builder = await source('apps/desktop/electron-builder.yml');
 

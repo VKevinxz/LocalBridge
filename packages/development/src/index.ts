@@ -13,6 +13,23 @@ export {
   type AnalysisResultItem,
 } from './analysis-job-supervisor.js';
 export {
+  TASK_BATCH_LIMITS,
+  TaskBatchSupervisor,
+  type TaskBatchRequest,
+  type TaskBatchSnapshot,
+  type TaskBatchState,
+  type TaskBatchSupervisorOptions,
+  type TaskChildRequest,
+  type TaskChildSnapshot,
+  type TaskChildState,
+  type TaskFailurePolicy,
+  type TaskOperationKind,
+  type TaskResourceReceipt,
+  type TaskTiming,
+  type TaskValidationContext,
+  type TaskValidationResult,
+} from './task-batch-supervisor.js';
+export {
   DevelopmentBrokerClient,
   DevelopmentBrokerError,
   startDevelopmentBroker,
@@ -27,6 +44,8 @@ export {
   BROKER_TOKEN_PATTERN,
   BrokerFrameDecoder,
   DEVELOPMENT_BROKER_PROTOCOL,
+  BROWSER_INSPECTABLE_CSS_PROPERTIES,
+  BROWSER_KEY_ALLOWLIST,
   MAX_BROKER_FRAME_BYTES,
   brokerMethodSchemas,
   brokerRequestEnvelopeSchema,
@@ -93,3 +112,8 @@ export {
   technicalTerminalOrigin,
   type TerminalOriginListener,
 } from './terminal-origin.js';
+export {
+  MAX_RUNTIME_RESOURCE_WAITERS,
+  RuntimeResourceCoordinator,
+  runtimeResourceKey,
+} from './runtime-resource-coordinator.js';

@@ -33,8 +33,12 @@ async function main(): Promise<void> {
     listProfiles: async () => [profile],
     reconciliationIntervalMs: 50,
     onCaptureDiagnostic: (event) => captureDiagnostics.push({ ...event }),
+    preflightDownload: async (input) => {
+      if (input.path === "evidence/preflight-fail.png") throw new LocalBridgeError("FILE_ALREADY_EXISTS");
+    },
     saveDownload: async (input) => {
       if (input.path === "evidence/too-large.png") throw new LocalBridgeError("FILE_TOO_LARGE");
+      if (input.path === "evidence/disk-fail.png") throw new LocalBridgeError("INTERNAL_ERROR");
       const bytes = Buffer.from(input.bytes);
       savedEvidence.push({ path: input.path, mimeType: input.mimeType, bytes });
       return { path: input.path, sha256: createHash("sha256").update(bytes).digest("hex"), size: bytes.length, created: true };
@@ -208,18 +212,51 @@ async function main(): Promise<void> {
     if (!crossIdBlocked) throw new Error("se aceptó un ID de browser.* en web.*");
 
     const internals = controller as unknown as {
-      entries: Map<string, { activeAgentOperations: number; delegatedExpiresAt?: number; tabs: Map<string, { tabId: string; window: BrowserWindow; content: WebContentsView; currentViewport: { width: number; height: number; mobile: boolean } }> }>;
+      entries: Map<string, { activeAgentOperations: number; delegatedExpiresAt?: number; partition: string; tabs: Map<string, { tabId: string; window: BrowserWindow; content: WebContentsView; currentViewport: { width: number; height: number; mobile: boolean } }> }>;
       createTab(entry: unknown, destination?: URL, humanMode?: boolean): Promise<{ tabId: string; window: BrowserWindow; content: WebContentsView }>;
       installDebugger(contents: Electron.WebContents, viewport: { width: number; height: number; mobile: boolean }): Promise<void>;
     };
     const entry = internals.entries.get(first.session.sessionId);
     const firstManagedTab = entry?.tabs.get(first.tab.tabId);
     if (entry === undefined || firstManagedTab === undefined) throw new Error("no se recuperó la pestaña administrada");
+    const reloadContents = firstManagedTab.content.webContents as unknown as {
+      id: number; getURL(): string; loadURL(url: string): Promise<void>; reload(): void; reloadIgnoringCache(): void;
+    };
+    const originalReloadGetUrl = reloadContents.getURL.bind(reloadContents);
+    const originalReload = reloadContents.reload.bind(reloadContents);
+    const originalReloadIgnoringCache = reloadContents.reloadIgnoringCache.bind(reloadContents);
+    const reloadContentId = reloadContents.id;
+    const reloadPartition = entry.partition;
+    let reloadCalls = 0;
+    reloadContents.getURL = () => "https://example.com/reload-fixture";
+    reloadContents.reload = () => { reloadCalls += 1; void reloadContents.loadURL("about:blank"); };
+    reloadContents.reloadIgnoringCache = () => { reloadCalls += 1; void reloadContents.loadURL("about:blank"); };
+    let webReload;
+    try {
+      webReload = await controller.reload(first.session.sessionId, first.tab.tabId, "ignore-cache", "web_reload_1");
+    } finally {
+      reloadContents.getURL = originalReloadGetUrl;
+      reloadContents.reload = originalReload;
+      reloadContents.reloadIgnoringCache = originalReloadIgnoringCache;
+    }
+    const webReloadReplay = await controller.reload(first.session.sessionId, first.tab.tabId, "ignore-cache", "web_reload_1");
+    let webReloadConflict = false;
+    try { await controller.reload(first.session.sessionId, first.tab.tabId, "normal", "web_reload_1"); }
+    catch (error) { webReloadConflict = error instanceof Error && "code" in error && error.code === "IDEMPOTENCY_CONFLICT"; }
+    if (reloadCalls !== 1 || webReload.tabId !== first.tab.tabId || webReloadReplay.tabId !== first.tab.tabId || !webReloadConflict ||
+        reloadContents.id !== reloadContentId || entry.partition !== reloadPartition ||
+        webReload.viewport.width !== 1920 || webReload.viewport.height !== 1080) {
+      throw new Error("web.reload no conservó pestaña, partición, viewport o idempotencia");
+    }
     await firstManagedTab.content.webContents.executeJavaScript(`
-      document.body.innerHTML = '<img src="https://example.com/hero.png?token=secret#fragment" alt="Hero firmado"><video aria-label="Vídeo fixture" style="display:block;width:1px;height:1px" poster="data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 width=%221920%22 height=%221080%22%3E%3Crect width=%221920%22 height=%221080%22 fill=%22%23123456%22/%3E%3C/svg%3E"></video><button id="once">Ejecutar una vez</button><button id="uncertain">Efecto incierto</button><input id="upload" type="file" aria-label="Archivo directo"><label for="upload">Elegir archivo</label><button id="indirect">Archivo indirecto</button><button id="delayed-file">Archivo tardío</button><a id="download" href="data:text/plain,ok" download="fixture.txt">Descarga nativa</a>';
+      document.documentElement.style.setProperty('--fixture-accent', '#12a4b8');
+      document.body.innerHTML = '<img src="https://example.com/hero.png?token=secret#fragment" alt="Hero firmado"><video aria-label="Vídeo fixture" style="display:block;width:1px;height:1px" poster="data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 width=%221920%22 height=%221080%22%3E%3Crect width=%221920%22 height=%221080%22 fill=%22%23123456%22/%3E%3C/svg%3E"></video><button id="once" style="color:rgb(1, 2, 3)">Ejecutar una vez</button><button id="toast">Show toast</button><div id="toast-state" aria-live="polite"></div><button id="uncertain">Efecto incierto</button><input id="upload" type="file" aria-label="Archivo directo"><label for="upload">Elegir archivo</label><input id="secret" type="password" aria-label="Secret"><div role="menu" aria-label="Fixture menu"><button role="menuitem" id="menu-one">Menu one</button><button role="menuitem" id="menu-two">Menu two</button></div><button id="indirect">Archivo indirecto</button><button id="delayed-file">Archivo tardío</button><button id="stable-target" style="transform:translateX(0);transition:transform 450ms ease">Stable target</button><a id="download" href="data:text/plain,ok" download="fixture.txt">Descarga nativa</a>';
       globalThis.__once = 0; globalThis.__uncertain = 0;
       document.querySelector('#once').addEventListener('click', () => { globalThis.__once += 1; });
       document.querySelector('#uncertain').addEventListener('click', () => { globalThis.__uncertain += 1; });
+      globalThis.__toastClicks = 0; document.querySelector('#toast').addEventListener('click', () => { globalThis.__toastClicks += 1; document.querySelector('#toast-state').textContent = 'Toast visible'; setTimeout(() => { document.querySelector('#toast-state').textContent = ''; }, 5000); });
+      document.querySelector('#menu-one').addEventListener('keydown', (event) => { if (event.key === 'ArrowDown') document.querySelector('#menu-two').focus(); if (event.key === 'ArrowRight') document.querySelector('#secret').focus(); });
+      document.querySelector('#menu-two').addEventListener('keydown', (event) => { if (event.key === 'Enter') document.body.dataset.menuActivated = 'true'; });
       document.querySelector('#indirect').addEventListener('click', () => document.querySelector('#upload').click());
       document.querySelector('#delayed-file').addEventListener('click', () => setTimeout(() => document.querySelector('#upload').click(), 250));
     `, true);
@@ -311,6 +348,39 @@ async function main(): Promise<void> {
     if (captureDiagnostics.some((event) => Object.keys(event).some((key) => /data|content|url/i.test(key)))) {
       throw new Error("la telemetría de captura incluyó contenido o URL");
     }
+    const actionPreflightSnapshot = await controller.snapshot(first.session.sessionId, first.tab.tabId, 12, 100);
+    const actionPreflightToast = actionPreflightSnapshot.nodes.find((node) => node.name === "Show toast")?.elementRef;
+    if (actionPreflightToast === undefined) throw new Error("web action toast reference missing");
+    let webPreflightRejected = false;
+    try {
+      await controller.actionCapture(first.session.sessionId, first.tab.tabId, actionPreflightSnapshot.snapshotId, actionPreflightToast,
+        { kind: "click" }, { kind: "delay", settleMs: 20 }, { kind: "save", workspaceId: "ws_evidence", path: "evidence/preflight-fail.png" }, "web_action_preflight");
+    } catch (error) {
+      webPreflightRejected = error instanceof Error && "code" in error && error.code === "FILE_ALREADY_EXISTS";
+    }
+    if (!webPreflightRejected || await firstManagedTab.content.webContents.executeJavaScript("globalThis.__toastClicks", true) !== 0) {
+      throw new Error("web.action.capture clicked before destination preflight succeeded");
+    }
+    const webActionSnapshot = await controller.snapshot(first.session.sessionId, first.tab.tabId, 12, 100);
+    const webToastRef = webActionSnapshot.nodes.find((node) => node.name === "Show toast")?.elementRef;
+    if (webToastRef === undefined) throw new Error("web action toast reference missing after preflight");
+    const webActionArgs = [first.session.sessionId, first.tab.tabId, webActionSnapshot.snapshotId, webToastRef,
+      { kind: "click" as const }, { kind: "delay" as const, settleMs: 180 }, { kind: "inline" as const }, "web_action_once"] as const;
+    const [webAction, webActionConcurrent] = await Promise.all([controller.actionCapture(...webActionArgs), controller.actionCapture(...webActionArgs)]);
+    if (JSON.stringify(webAction) !== JSON.stringify(webActionConcurrent) || webAction.captureState !== "complete" || typeof webAction.dataBase64 !== "string" ||
+        await firstManagedTab.content.webContents.executeJavaScript("globalThis.__toastClicks", true) !== 1 ||
+        await firstManagedTab.content.webContents.executeJavaScript("document.querySelector('#toast-state').textContent", true) !== "Toast visible") {
+      throw new Error("web.action.capture did not coalesce or preserve toast evidence");
+    }
+    const webDiskSnapshot = await controller.snapshot(first.session.sessionId, first.tab.tabId, 12, 100);
+    const webDiskToast = webDiskSnapshot.nodes.find((node) => node.name === "Show toast")?.elementRef;
+    if (webDiskToast === undefined) throw new Error("web disk failure toast reference missing");
+    const webDiskFailure = await controller.actionCapture(first.session.sessionId, first.tab.tabId, webDiskSnapshot.snapshotId, webDiskToast,
+      { kind: "click" }, { kind: "delay", settleMs: 20 }, { kind: "save", workspaceId: "ws_evidence", path: "evidence/disk-fail.png" }, "web_action_disk_fail");
+    const webDiskReplay = await controller.actionCapture(first.session.sessionId, first.tab.tabId, webDiskSnapshot.snapshotId, webDiskToast,
+      { kind: "click" }, { kind: "delay", settleMs: 20 }, { kind: "save", workspaceId: "ws_evidence", path: "evidence/disk-fail.png" }, "web_action_disk_fail");
+    if (webDiskFailure.captureState !== "failed" || webDiskFailure.failureCode !== "INTERNAL_ERROR" || JSON.stringify(webDiskFailure) !== JSON.stringify(webDiskReplay) ||
+        await firstManagedTab.content.webContents.executeJavaScript("globalThis.__toastClicks", true) !== 2) throw new Error("web failed capture replayed its click");
     let deterministicSaveErrorPreserved = false;
     try {
       await controller.saveScreenshot(first.session.sessionId, first.tab.tabId, "ws_evidence", "evidence/too-large.png", "save_too_large");
@@ -329,10 +399,40 @@ async function main(): Promise<void> {
     if (!directHumanRequired) throw new Error("el input de archivo directo no exigió control humano");
     const nativeDownload = await controller.click(first.session.sessionId, first.tab.tabId, clickSnapshot.snapshotId, nativeDownloadRef, "native_download");
     if (nativeDownload.applied || nativeDownload.effect !== "native_download_blocked") throw new Error("la descarga nativa se reportó como aplicada");
-    const onceRef = clickSnapshot.nodes.find((node) => node.name === "Ejecutar una vez")?.elementRef;
+    const menuOne = clickSnapshot.nodes.find((node) => node.name === 'Menu one')?.elementRef;
+    if (menuOne === undefined) throw new Error('web menu sequence reference missing');
+    const menuSequence = await controller.keyboardSequence(first.session.sessionId, first.tab.tabId, clickSnapshot.snapshotId,
+      menuOne, ['ArrowDown', 'Enter'], 'web_keyboard_menu');
+    if (menuSequence.actionState !== 'complete' || menuSequence.keysSent !== 2 ||
+        await firstManagedTab.content.webContents.executeJavaScript("document.body.dataset.menuActivated", true) !== 'true') {
+      throw new Error(`web moving-focus sequence failed: ${JSON.stringify(menuSequence)}`);
+    }
+    const sensitiveSequenceSnapshot = await controller.snapshot(first.session.sessionId, first.tab.tabId, 12, 100);
+    const sensitiveMenuOne = sensitiveSequenceSnapshot.nodes.find((node) => node.name === 'Menu one')?.elementRef;
+    if (sensitiveMenuOne === undefined) throw new Error('web sensitive sequence reference missing');
+    const sensitiveSequence = await controller.keyboardSequence(first.session.sessionId, first.tab.tabId, sensitiveSequenceSnapshot.snapshotId,
+      sensitiveMenuOne, ['ArrowRight', 'Enter'], 'web_keyboard_sensitive');
+    if (sensitiveSequence.actionState !== 'partial' || sensitiveSequence.keysSent !== 1 || sensitiveSequence.stoppedReason !== 'sensitive_focus') {
+      throw new Error(`web sequence did not stop before sensitive focus: ${JSON.stringify(sensitiveSequence)}`);
+    }
+    const postSequenceSnapshot = await controller.snapshot(first.session.sessionId, first.tab.tabId, 12, 100);
+    const onceRef = postSequenceSnapshot.nodes.find((node) => node.name === "Ejecutar una vez")?.elementRef;
     if (onceRef === undefined) throw new Error("snapshot no produjo referencia para el botón");
-    const firstClick = await controller.click(first.session.sessionId, first.tab.tabId, clickSnapshot.snapshotId, onceRef, "click_once");
-    const repeatedClick = await controller.click(first.session.sessionId, first.tab.tabId, clickSnapshot.snapshotId, onceRef, "click_once");
+    const inspection = await controller.inspect(first.session.sessionId, first.tab.tabId, 'element', postSequenceSnapshot.snapshotId,
+      onceRef, ['color', 'font-family'], ['--fixture-accent']);
+    if (inspection.styles.color !== 'rgb(1, 2, 3)' || inspection.variables['--fixture-accent'] !== '#12a4b8' ||
+        inspection.state.name !== 'Ejecutar una vez' || inspection.rect.width <= 0) {
+      throw new Error(`web.inspect no devolvió evidencia CSS acotada: ${JSON.stringify(inspection)}`);
+    }
+    const stableRef = postSequenceSnapshot.nodes.find((node) => node.name === 'Stable target')?.elementRef;
+    if (stableRef === undefined) throw new Error('web stable target reference missing');
+    await firstManagedTab.content.webContents.executeJavaScript("document.querySelector('#stable-target').style.transform='translateX(40px)'", true);
+    const stableWait = await controller.wait(first.session.sessionId, first.tab.tabId, {
+      kind: 'stable', snapshotId: postSequenceSnapshot.snapshotId, elementRef: stableRef, intervalMs: 150, tolerancePx: 0.25,
+    }, 2_000);
+    if (stableWait.waitedMs < 150) throw new Error('web stable wait returned before the required interval');
+    const firstClick = await controller.click(first.session.sessionId, first.tab.tabId, postSequenceSnapshot.snapshotId, onceRef, "click_once");
+    const repeatedClick = await controller.click(first.session.sessionId, first.tab.tabId, postSequenceSnapshot.snapshotId, onceRef, "click_once");
     const onceCount = await firstManagedTab.content.webContents.executeJavaScript("globalThis.__once", true) as number;
     if (JSON.stringify(firstClick) !== JSON.stringify(repeatedClick) || onceCount !== 1) {
       throw new Error("el reintento de clic repitió el efecto");
@@ -671,6 +771,7 @@ async function main(): Promise<void> {
       failedReturnReportsReason: true,
       ephemeralSession: true,
       idempotentStart: true,
+      reloadPreservesTabPartitionAndViewport: true,
       privateDestinationBlocked: true,
       browserIdsSeparated: true,
       tabReferencesSeparated: true,

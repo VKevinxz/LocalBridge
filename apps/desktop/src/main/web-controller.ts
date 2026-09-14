@@ -19,11 +19,13 @@ import { startWebEgressProxy, type RunningWebEgressProxy } from "./web-egress-pr
 import { createDownloadedResourceStreamValidator, resolveDownloadedResourceDestination, validateDownloadedResource } from "./web-download-policy.js";
 import { assertWebDownloadFits, remainingWebDownloadBytes } from "./web-download-quota.js";
 import { didNavigationReachDestination } from "./web-navigation-outcome.js";
+import { reloadManagedWebContents, type BrowserReloadMode } from "./browser-reload.js";
 import {
   isWebEgressHostAllowed,
   isWebNavigationHostAllowed,
   normalizePublicHttpsUrl,
 } from "./web-network-policy.js";
+import { dispatchBoundedBrowserKey, inspectActiveBrowserKeyboardTarget, inspectResolvedBrowserElement, sampleResolvedBrowserElement, visualSamplesEqual, waitForResolvedBrowserElementStability } from "./browser-element-inspection.js";
 import { resolveViewerPresentation, type ViewerPresentationMode } from "./live-viewer-presentation.js";
 
 const MAX_GLOBAL_WEB_SESSIONS = 4;
@@ -112,7 +114,8 @@ export type WebWaitCondition =
   | { readonly kind: "load" }
   | { readonly kind: "url"; readonly value: string; readonly operator: "equals" | "contains" }
   | { readonly kind: "title"; readonly value: string; readonly operator: "equals" | "contains" }
-  | { readonly kind: "text"; readonly value: string; readonly state: "present" | "absent" };
+  | { readonly kind: "text"; readonly value: string; readonly state: "present" | "absent" }
+  | { readonly kind: "stable"; readonly snapshotId: string; readonly elementRef: string; readonly intervalMs: number; readonly tolerancePx: number };
 
 interface ElementBinding {
   readonly backendNodeId: number;
@@ -217,6 +220,14 @@ interface OperationRecord {
   causeCode?: string;
 }
 
+interface CompositeOperationRecord {
+  readonly fingerprint: string;
+  readonly sessionId: string;
+  state: "pending" | "complete" | "uncertain";
+  result?: unknown;
+  completion?: Promise<unknown>;
+}
+
 export interface WebControllerOptions {
   readonly loadProfile: (webProfileId: string) => Promise<WebProfile | undefined>;
   readonly listProfiles: () => Promise<readonly WebProfile[]>;
@@ -283,6 +294,13 @@ export interface WebControllerOptions {
     readonly mimeType: string;
     readonly maximumBytes: number;
   }) => Promise<{ path: string; sha256: string; size: number; created: true }>;
+  readonly preflightDownload?: (input: {
+    readonly webProfileId: string;
+    readonly profileRevision: string;
+    readonly workspaceId: string;
+    readonly path: string;
+    readonly maximumBytes: number;
+  }) => Promise<void>;
   readonly saveDownloadStream?: (input: {
     readonly webProfileId: string;
     readonly profileRevision: string;
@@ -503,6 +521,7 @@ async function settle(): Promise<void> {
 export class WebController {
   private readonly entries = new Map<string, ManagedWebSession>();
   private readonly operations = new Map<string, OperationRecord>();
+  private readonly compositeOperations = new Map<string, CompositeOperationRecord>();
   private readonly reconciliationTimer: NodeJS.Timeout;
   private humanSessionId: string | undefined;
   private liveViewer: WebLiveViewerSelection | undefined;
@@ -1373,6 +1392,41 @@ export class WebController {
     }
   }
 
+  async reload(sessionId: string, tabId: string, mode: BrowserReloadMode, operationId: string): Promise<WebTabSummary> {
+    const entry = await this.requireSession(sessionId);
+    const key = this.operationKey(entry, operationId);
+    const fp = fingerprint(["web.reload", tabId, mode]);
+    const previous = this.previousOperation<WebTabSummary>(key, fp);
+    if (previous !== undefined) return previous;
+    let effectStarted = false;
+    const record: OperationRecord = { fingerprint: fp, sessionId, state: "pending" };
+    try {
+      return await this.withAgentOperation(entry, async () => {
+        const tab = this.requireTab(entry, tabId);
+        const current = this.assertNavigation(entry, tab.content.webContents.getURL());
+        if (current.href === "") fail("WEB_DESTINATION_BLOCKED", "La pestaña no tiene un destino recargable.");
+        return this.withTabWriter(entry, tab, async () => {
+          this.rememberOperation(key, record);
+          try {
+            effectStarted = true;
+            await reloadManagedWebContents(tab.content.webContents, mode);
+          } catch {
+            record.state = "uncertain";
+            fail("WEB_EFFECT_UNCERTAIN", "La recarga web pudo completarse antes del fallo; vuelve a observar la pestaña.");
+          }
+          this.invalidate(tab);
+          const result = tabSummary(entry, tab);
+          record.state = "complete";
+          record.result = result;
+          return result;
+        });
+      });
+    } catch (error) {
+      if (!effectStarted && key !== undefined) this.operations.delete(key);
+      throw error;
+    }
+  }
+
   async back(sessionId: string, tabId: string, operationId?: string): Promise<WebTabSummary> {
     const entry = await this.requireSession(sessionId);
     return this.withAgentOperation(entry, async () => {
@@ -1531,24 +1585,65 @@ export class WebController {
     fail("WEB_CAPTURE_TOO_LARGE", "La captura supera el presupuesto seguro del broker.");
   }
 
-  async screenshot(sessionId: string, tabId: string) {
+  async screenshot(sessionId: string, tabId: string, settleMs = 0) {
     const entry = await this.requireSession(sessionId);
-    return this.withAgentOperation(entry, async () => this.captureScreenshotData(this.requireTab(entry, tabId)));
+    return this.withAgentOperation(entry, async () => {
+      if (settleMs > 0) await new Promise((resolve) => setTimeout(resolve, settleMs));
+      this.ensureAgentControl(entry);
+      return this.captureScreenshotData(this.requireTab(entry, tabId));
+    });
   }
 
-  async saveScreenshot(sessionId: string, tabId: string, workspaceId: string, destinationPath: string, operationId: string) {
+  async inspect(
+    sessionId: string,
+    tabId: string,
+    target: 'element' | 'active',
+    snapshotId: string | undefined,
+    elementRef: string | undefined,
+    cssProperties: readonly string[],
+    cssVariables: readonly string[],
+  ) {
+    const entry = await this.requireSession(sessionId, "read");
+    return this.withAgentOperation(entry, async () => {
+      const tab = this.requireTab(entry, tabId);
+      let objectId: string | undefined;
+      if (target === 'element') {
+        if (snapshotId === undefined || elementRef === undefined) fail("INVALID_INPUT", "La inspección web requiere snapshotId y elementRef.");
+        const binding = this.resolveElement(tab, snapshotId, elementRef);
+        const nodeId = await this.resolveNode(tab, binding);
+        const resolved = await tab.content.webContents.debugger.sendCommand("DOM.resolveNode", { nodeId }) as { object?: { objectId?: string } };
+        objectId = resolved.object?.objectId;
+      } else {
+        const resolved = await tab.content.webContents.debugger.sendCommand("Runtime.evaluate", {
+          expression: "document.activeElement",
+        }) as { result?: { objectId?: string } };
+        objectId = resolved.result?.objectId;
+      }
+      if (objectId === undefined) fail("ELEMENT_NOT_INTERACTABLE", "No hay un elemento activo que se pueda inspeccionar.");
+      try {
+        const inspection = await inspectResolvedBrowserElement(tab.content.webContents, objectId, cssProperties, cssVariables);
+        return { sessionId, tabId, target, ...inspection };
+      } finally {
+        await tab.content.webContents.debugger.sendCommand("Runtime.releaseObject", { objectId }).catch(() => undefined);
+      }
+    });
+  }
+
+  async saveScreenshot(sessionId: string, tabId: string, workspaceId: string, destinationPath: string, operationId: string, settleMs = 0) {
     const entry = await this.requireSession(sessionId, "download");
     return this.withAgentOperation(entry, async () => {
       const tab = this.requireTab(entry, tabId);
       if (this.options.saveDownload === undefined) fail("FEATURE_UNAVAILABLE", "El guardado de evidencia visual no está disponible.");
       const key = this.operationKey(entry, operationId);
-      const fp = fingerprint(["web.screenshot.save", tabId, workspaceId, destinationPath]);
+      const fp = fingerprint(["web.screenshot.save", tabId, workspaceId, destinationPath, settleMs]);
       const previous = this.previousOperation(key, fp);
       if (previous !== undefined) return previous;
       const record: OperationRecord = { fingerprint: fp, sessionId, state: "pending" };
       this.rememberOperation(key, record);
       let saveStarted = false;
       try {
+        if (settleMs > 0) await new Promise((resolve) => setTimeout(resolve, settleMs));
+        this.ensureAgentControl(entry);
         // The bytes stay in the desktop process and only the receipt crosses the
         // broker, so preserve lossless PNG evidence instead of applying the
         // transport-size JPEG fallback used by web.screenshot.
@@ -1679,6 +1774,7 @@ export class WebController {
             totalSize: saved.totalSize,
             fileCount: saved.fileCount,
             manifestPath: `${saved.path}/${saved.value.manifest.path}`,
+            qualityPath: `${saved.path}/${saved.value.quality.path}`,
             contactSheetPath: `${saved.path}/${saved.value.contactSheet.path}`,
             frameCount: saved.value.frameCount,
             width: saved.value.width,
@@ -2006,6 +2102,22 @@ export class WebController {
     }
   }
 
+  /**
+   * Admisión sin efectos para task.runMany. Comprueba que la sesión, pestaña y
+   * referencia opaca pertenecen todavía al mismo documento autorizado.
+   */
+  async preflightDownloadReference(sessionId: string, tabId: string, resourceRef: string): Promise<void> {
+    const entry = await this.requireSession(sessionId, "download");
+    const tab = this.requireTab(entry, tabId);
+    const resource = tab.resources.get(resourceRef);
+    if (resource === undefined || resource.generation !== tab.generation) {
+      fail("WEB_RESOURCE_NOT_FOUND", "La referencia de descarga ya no está vigente.");
+    }
+    if (this.options.saveDownloadStream === undefined || entry.browserSession === undefined) {
+      fail("FEATURE_UNAVAILABLE", "El guardado de descargas no está disponible.");
+    }
+  }
+
   private resolveElement(tab: ManagedWebTab, snapshotId: string, elementRef: string): ElementBinding {
     const snapshot = tab.snapshot;
     if (snapshot === undefined || snapshot.snapshotId !== snapshotId || snapshot.generation !== tab.generation) {
@@ -2285,8 +2397,7 @@ export class WebController {
       try {
         await tab.content.webContents.debugger.sendCommand("DOM.focus", { nodeId });
         effectStarted = true;
-        await tab.content.webContents.debugger.sendCommand("Input.dispatchKeyEvent", { type: "rawKeyDown", key: keyValue, code: keyValue });
-        await tab.content.webContents.debugger.sendCommand("Input.dispatchKeyEvent", { type: "keyUp", key: keyValue, code: keyValue });
+        await dispatchBoundedBrowserKey(tab.content.webContents, keyValue);
         await settle();
         this.invalidate(tab);
         const result = { sessionId, tabId, applied: true as const, snapshotInvalidated: true as const };
@@ -2303,6 +2414,224 @@ export class WebController {
       }
     });
     });
+  }
+
+  async keyboardSequence(sessionId: string, tabId: string, snapshotId: string, elementRef: string, keys: readonly string[], operationId: string) {
+    const entry = await this.requireSession(sessionId, "interact");
+    const operationKey = `${sessionId}:${operationId}`;
+    const fp = fingerprint(["web.keyboard.sequence", tabId, snapshotId, elementRef, ...keys]);
+    const existing = this.compositeOperations.get(operationKey);
+    if (existing !== undefined) {
+      if (existing.fingerprint !== fp) fail("IDEMPOTENCY_CONFLICT", "El operationId ya representa otra operación compuesta.");
+      if (existing.state === "complete") return existing.result;
+      if (existing.state === "uncertain") fail("WEB_EFFECT_UNCERTAIN", "La secuencia web anterior quedó en estado incierto.");
+      fail("RATE_LIMITED", "La misma secuencia web sigue en curso.");
+    }
+    return this.withAgentOperation(entry, async () => {
+      const tab = this.requireTab(entry, tabId);
+      const binding = this.resolveElement(tab, snapshotId, elementRef);
+      return this.withTabWriter(entry, tab, async () => {
+        await tab.content.webContents.debugger.sendCommand("Page.bringToFront");
+        const nodeId = await this.resolveNode(tab, binding);
+        try { await tab.content.webContents.debugger.sendCommand("DOM.focus", { nodeId }); }
+        catch { fail("ELEMENT_NOT_INTERACTABLE", "El elemento web no puede recibir el foco del teclado."); }
+        const focused = await inspectActiveBrowserKeyboardTarget(tab.content.webContents);
+        if (isSensitiveInput({ inputType: focused.inputType, autocomplete: focused.autocomplete, identity: focused.identity })) {
+          fail("SENSITIVE_INPUT_BLOCKED", "La secuencia web no puede comenzar en un campo sensible.");
+        }
+        const record: CompositeOperationRecord = { fingerprint: fp, sessionId, state: "pending" };
+        this.compositeOperations.set(operationKey, record);
+        while (this.compositeOperations.size > MAX_OPERATIONS) this.compositeOperations.delete(this.compositeOperations.keys().next().value as string);
+        let keysSent = 0;
+        const initialGeneration = tab.generation;
+        const finish = (actionState: "complete" | "partial" | "uncertain", stoppedReason?: "sensitive_focus" | "document_changed" | "target_unavailable" | "dispatch_failed") => {
+          if (keysSent > 0) this.invalidate(tab);
+          const result = {
+            sessionId, tabId, requestedKeys: keys.length, keysSent, actionState,
+            snapshotInvalidated: keysSent > 0,
+            ...(stoppedReason === undefined ? {} : { stoppedReason }),
+          };
+          record.state = "complete"; record.result = result;
+          return result;
+        };
+        for (let index = 0; index < keys.length; index += 1) {
+          this.ensureAgentControl(entry);
+          if (index > 0) {
+            if (tab.generation !== initialGeneration) return finish("partial", "document_changed");
+            const active = await inspectActiveBrowserKeyboardTarget(tab.content.webContents);
+            if (!active.connected || !active.visible || !active.enabled) return finish("partial", "target_unavailable");
+            if (isSensitiveInput({ inputType: active.inputType, autocomplete: active.autocomplete, identity: active.identity })) {
+              return finish("partial", "sensitive_focus");
+            }
+          }
+          const currentKey = keys[index] as string;
+          try {
+            await dispatchBoundedBrowserKey(tab.content.webContents, currentKey);
+            keysSent += 1;
+          } catch {
+            return finish("uncertain", "dispatch_failed");
+          }
+          if (index + 1 < keys.length) await new Promise((resolve) => setTimeout(resolve, 20));
+        }
+        await settle();
+        return finish("complete");
+      });
+    });
+  }
+
+  async actionCapture(
+    sessionId: string,
+    tabId: string,
+    snapshotId: string,
+    elementRef: string,
+    action: { readonly kind: "click" } | { readonly kind: "key"; readonly key: string },
+    wait: { readonly kind: "delay"; readonly settleMs: number } | { readonly kind: "stable"; readonly intervalMs: number; readonly tolerancePx: number; readonly timeoutMs: number; readonly allowUnstable: boolean },
+    output: { readonly kind: "inline" } | { readonly kind: "save"; readonly workspaceId: string; readonly path: string },
+    operationId: string,
+  ) {
+    const entry = await this.requireSession(sessionId, "interact");
+    const operationKey = `${sessionId}:${operationId}`;
+    const fp = fingerprint(["web.action.capture", tabId, snapshotId, elementRef, JSON.stringify(action), JSON.stringify(wait), JSON.stringify(output)]);
+    const existing = this.compositeOperations.get(operationKey);
+    if (existing !== undefined) {
+      if (existing.fingerprint !== fp) fail("IDEMPOTENCY_CONFLICT", "El operationId ya representa otra operación compuesta.");
+      if (existing.state === "complete") return existing.result;
+      if (existing.completion !== undefined) return existing.completion;
+      fail("WEB_EFFECT_UNCERTAIN", "La acción web compuesta anterior no tiene un recibo recuperable.");
+    }
+    if (output.kind === "save") {
+      const current = await this.requireProfile(entry.webProfileId, "download");
+      if (profileRevision(current) !== entry.profileRevision) fail("CAPABILITY_DISABLED", "El perfil cambió antes de preparar la evidencia.");
+      if (!output.path.toLowerCase().endsWith(".png")) fail("INVALID_INPUT", "La evidencia debe guardarse como PNG.");
+      if (this.options.preflightDownload === undefined || this.options.saveDownload === undefined) fail("FEATURE_UNAVAILABLE", "El guardado de evidencia web no está disponible.");
+      await this.options.preflightDownload({ webProfileId: entry.webProfileId, profileRevision: entry.profileRevision,
+        workspaceId: output.workspaceId, path: output.path, maximumBytes: current.limits.maxDownloadBytes });
+    }
+    const raced = this.compositeOperations.get(operationKey);
+    if (raced !== undefined) {
+      if (raced.fingerprint !== fp) fail("IDEMPOTENCY_CONFLICT", "El operationId ya representa otra operación compuesta.");
+      if (raced.state === "complete") return raced.result;
+      if (raced.completion !== undefined) return raced.completion;
+      fail("RATE_LIMITED", "La misma acción web compuesta se está preparando.");
+    }
+    const record: CompositeOperationRecord = { fingerprint: fp, sessionId, state: "pending" };
+    this.compositeOperations.set(operationKey, record);
+    while (this.compositeOperations.size > MAX_OPERATIONS) this.compositeOperations.delete(this.compositeOperations.keys().next().value as string);
+    let effectStarted = false;
+    let actionCompleted = false;
+    const run = this.withAgentOperation(entry, async () => {
+      const tab = this.requireTab(entry, tabId);
+      return this.withTabWriter(entry, tab, async () => {
+      await tab.content.webContents.debugger.sendCommand("Page.bringToFront");
+      let objectId: string | undefined;
+      try {
+        const binding = this.resolveElement(tab, snapshotId, elementRef);
+        const nodeId = await this.resolveNode(tab, binding);
+        const resolved = await tab.content.webContents.debugger.sendCommand("DOM.resolveNode", { nodeId }) as { object?: { objectId?: string } };
+        objectId = resolved.object?.objectId;
+        if (objectId === undefined) fail("STALE_SNAPSHOT", "El elemento web ya no existe.");
+        let effect: "effect_pending" | "navigation_started" | "native_download_blocked" | "dialog_blocked" | undefined;
+        if (action.kind === "key") {
+          try { await tab.content.webContents.debugger.sendCommand("DOM.focus", { nodeId }); }
+          catch { fail("ELEMENT_NOT_INTERACTABLE", "El elemento web no puede recibir el foco del teclado."); }
+          const focused = await inspectActiveBrowserKeyboardTarget(tab.content.webContents);
+          if (isSensitiveInput({ inputType: focused.inputType, autocomplete: focused.autocomplete, identity: focused.identity })) {
+            fail("SENSITIVE_INPUT_BLOCKED", "La acción no puede enviar teclas a un campo sensible.");
+          }
+          effectStarted = true;
+          await dispatchBoundedBrowserKey(tab.content.webContents, action.key);
+        } else {
+          const classified = await tab.content.webContents.debugger.sendCommand("Runtime.callFunctionOn", {
+            objectId,
+            functionDeclaration: `function () { if (!(this instanceof Element) || !this.isConnected) return 'stale'; const input=this instanceof HTMLInputElement?this:null; const label=this instanceof HTMLLabelElement?this:this.closest('label'); const labelled=label&&label.control instanceof HTMLInputElement?label.control:null; const link=this instanceof HTMLAnchorElement?this:this.closest('a'); if ((input&&input.type==='file')||(labelled&&labelled.type==='file')) return 'file'; if (link instanceof HTMLAnchorElement&&link.hasAttribute('download')) return 'download'; const rect=this.getBoundingClientRect(),style=getComputedStyle(this); if(rect.width<=0||rect.height<=0||style.display==='none'||style.visibility==='hidden'||this.getAttribute('aria-disabled')==='true'||('disabled' in this&&this.disabled)) return 'blocked'; return 'ready'; }`,
+            returnByValue: true,
+          }) as { result?: { value?: string } };
+          if (classified.result?.value === "file") fail("HUMAN_ACTION_REQUIRED", "La selección de archivos requiere control humano local.");
+          if (classified.result?.value === "download") {
+            effect = "native_download_blocked";
+          } else {
+            if (classified.result?.value !== "ready") fail("ELEMENT_NOT_INTERACTABLE", "El elemento web no puede recibir clic.");
+            const blockedDownloadBefore = tab.blockedDownloadSequence;
+            const blockedDialogBefore = tab.blockedDialogSequence;
+            const fileChooserBefore = tab.fileChooserSequence;
+            const urlBefore = tab.content.webContents.getURL();
+            effectStarted = true;
+            await tab.content.webContents.debugger.sendCommand("Runtime.callFunctionOn", {
+              objectId, functionDeclaration: "function () { this.click(); }", userGesture: true,
+            });
+            if (tab.fileChooserSequence > fileChooserBefore) fail("HUMAN_ACTION_REQUIRED", "La página abrió un selector de archivos que requiere control humano local.");
+            effect = tab.blockedDownloadSequence > blockedDownloadBefore ? "native_download_blocked"
+              : tab.blockedDialogSequence > blockedDialogBefore ? "dialog_blocked"
+                : tab.content.webContents.getURL() !== urlBefore || tab.state === "loading" ? "navigation_started" : "effect_pending";
+          }
+        }
+        actionCompleted = true;
+        let stable = true;
+        let waitedMs = 0;
+        if (wait.kind === "delay") {
+          const startedAt = Date.now(); const deadline = startedAt + wait.settleMs;
+          while (Date.now() < deadline) { this.ensureAgentControl(entry); await new Promise((resolve) => setTimeout(resolve, Math.min(50, Math.max(1, deadline - Date.now())))); }
+          waitedMs = Date.now() - startedAt;
+        } else {
+          const stability = await waitForResolvedBrowserElementStability(tab.content.webContents, objectId, {
+            intervalMs: wait.intervalMs, tolerancePx: wait.tolerancePx, timeoutMs: wait.timeoutMs,
+            validate: () => this.ensureAgentControl(entry),
+          }).catch(() => ({ stable: false, waitedMs: wait.timeoutMs }));
+          stable = stability.stable; waitedMs = stability.waitedMs;
+          if (!stable && !wait.allowUnstable) {
+            this.invalidate(tab);
+            const result = { sessionId, tabId, actionState: "complete" as const, captureState: "unstable" as const,
+              waitedMs, snapshotInvalidated: true, ...(effect === undefined ? {} : { effect }) };
+            record.state = "complete"; record.result = result;
+            return result;
+          }
+        }
+        this.ensureAgentControl(entry);
+        try {
+          const captured = await this.captureScreenshotData(tab, output.kind === "inline", operationId);
+          this.ensureAgentControl(entry);
+          this.invalidate(tab);
+          if (output.kind === "inline") {
+            const result = { sessionId, tabId, actionState: "complete" as const, captureState: stable ? "complete" as const : "unstable" as const,
+              waitedMs, snapshotInvalidated: true, ...(effect === undefined ? {} : { effect }), mimeType: captured.mimeType,
+              dataBase64: captured.dataBase64, width: captured.width, height: captured.height, fallbackUsed: captured.fallbackUsed };
+            record.state = "complete"; record.result = result;
+            return result;
+          }
+          const bytes = Buffer.from(captured.dataBase64, "base64");
+          const mimeType = validateDownloadedResource(output.path, captured.mimeType, bytes);
+          const current = await this.requireProfile(entry.webProfileId, "download");
+          if (profileRevision(current) !== entry.profileRevision) fail("CAPABILITY_DISABLED", "El perfil cambió durante la captura.");
+          const saved = await this.options.saveDownload!({ webProfileId: entry.webProfileId, profileRevision: entry.profileRevision,
+            workspaceId: output.workspaceId, path: output.path, bytes, mimeType, maximumBytes: current.limits.maxDownloadBytes });
+          const result = { sessionId, tabId, actionState: "complete" as const, captureState: stable ? "complete" as const : "unstable" as const,
+            waitedMs, snapshotInvalidated: true, ...(effect === undefined ? {} : { effect }), mimeType: "image/png" as const,
+            width: captured.width, height: captured.height, fallbackUsed: false as const, receipt: saved };
+          record.state = "complete"; record.result = result;
+          return result;
+        } catch (error) {
+          this.invalidate(tab);
+          const result = { sessionId, tabId, actionState: "complete" as const, captureState: "failed" as const,
+            waitedMs, snapshotInvalidated: true, ...(effect === undefined ? {} : { effect }),
+            failureCode: error instanceof LocalBridgeError || error instanceof DevelopmentBrokerError ? error.code : "INTERNAL_ERROR" };
+          record.state = "complete"; record.result = result;
+          return result;
+        }
+      } catch (error) {
+        if (!effectStarted) { this.compositeOperations.delete(operationKey); throw error; }
+        this.invalidate(tab);
+        const result = { sessionId, tabId, actionState: actionCompleted ? "complete" as const : "uncertain" as const,
+          captureState: "skipped" as const, waitedMs: 0, snapshotInvalidated: true,
+          failureCode: error instanceof LocalBridgeError || error instanceof DevelopmentBrokerError ? error.code : "INTERNAL_ERROR" };
+        record.state = "complete"; record.result = result;
+        return result;
+      } finally {
+        if (objectId !== undefined) await tab.content.webContents.debugger.sendCommand("Runtime.releaseObject", { objectId }).catch(() => undefined);
+      }
+      });
+    });
+    record.completion = run;
+    return run;
   }
 
   async scroll(sessionId: string, tabId: string, direction: "up" | "down" | "left" | "right", amount: number, operationId?: string) {
@@ -2393,6 +2722,7 @@ export class WebController {
       const current = tab.content.webContents.getTitle();
       return condition.operator === "equals" ? current === condition.value : current.includes(condition.value);
     }
+    if (condition.kind === "stable") return false;
     const evaluated = await tab.content.webContents.debugger.sendCommand("Runtime.evaluate", {
       expression: `(document.body?.innerText ?? '').includes(${JSON.stringify(condition.value)})`, returnByValue: true,
     }) as { result?: { value?: boolean } };
@@ -2406,6 +2736,29 @@ export class WebController {
     const tab = this.requireTab(entry, tabId);
     const startedAt = Date.now();
     const deadline = startedAt + timeoutMs;
+    if (condition.kind === "stable") {
+      let previous: Awaited<ReturnType<typeof sampleResolvedBrowserElement>> | undefined;
+      let stableSince = startedAt;
+      do {
+        this.ensureAgentControl(entry);
+        const binding = this.resolveElement(tab, condition.snapshotId, condition.elementRef);
+        const nodeId = await this.resolveNode(tab, binding);
+        const resolved = await tab.content.webContents.debugger.sendCommand("DOM.resolveNode", { nodeId }) as { object?: { objectId?: string } };
+        const objectId = resolved.object?.objectId;
+        if (objectId === undefined) fail("STALE_SNAPSHOT", "El elemento web ya no existe.");
+        let current: Awaited<ReturnType<typeof sampleResolvedBrowserElement>>;
+        try { current = await sampleResolvedBrowserElement(tab.content.webContents, objectId); }
+        finally { await tab.content.webContents.debugger.sendCommand("Runtime.releaseObject", { objectId }).catch(() => undefined); }
+        const now = Date.now();
+        if (previous === undefined || !visualSamplesEqual(previous, current, condition.tolerancePx)) stableSince = now;
+        else if (now - stableSince >= condition.intervalMs) {
+          return { sessionId, tabId, satisfied: true as const, conditionKind: condition.kind, waitedMs: now - startedAt };
+        }
+        previous = current;
+        await new Promise((resolveDelay) => setTimeout(resolveDelay, Math.min(50, Math.max(1, deadline - Date.now()))));
+      } while (Date.now() < deadline);
+      fail("TIMEOUT", "El elemento web no mantuvo geometría, color y transición estables durante el intervalo solicitado.");
+    }
     do {
       if (await this.conditionSatisfied(tab, condition)) {
         return { sessionId, tabId, satisfied: true as const, conditionKind: condition.kind, waitedMs: Date.now() - startedAt };
@@ -2709,6 +3062,7 @@ export class WebController {
       entry.closeReason = closeReason;
       if (entry.controlTimer !== undefined) clearTimeout(entry.controlTimer);
       if (this.humanSessionId === entry.sessionId) this.humanSessionId = undefined;
+      for (const [key, value] of this.compositeOperations) if (value.sessionId === entry.sessionId) this.compositeOperations.delete(key);
       this.options.releaseHumanControl?.(entry.sessionId);
       for (const tab of entry.tabs.values()) {
         tab.state = "closed";

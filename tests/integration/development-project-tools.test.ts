@@ -95,6 +95,33 @@ describe("tools cerradas de proyectos asistidos", () => {
     });
   });
 
+  it("separa una propuesta detectada de los perfiles revisados sin bloquear Control total", async () => {
+    const configPath = path.join(os.tmpdir(), `localbridge-project-availability-${randomUUID()}`, "workspaces.json");
+    await writeRegistryFile(configPath, [buildWorkspace({ id: "ws_project", rootPath: os.tmpdir() })]);
+    broker = await startDevelopmentBroker({ handler: async () => ({
+      projects: [{
+        ...project,
+        execution: { trustMode: "full-host" as const, terminalAvailable: true },
+        automation: {
+          reviewedProfiles: { processes: [], validations: [], browser: [] },
+          detectedProposal: { state: "detected-awaiting-review" as const, processCount: 1, validationCount: 2 },
+        },
+      }],
+    }) });
+    harness = await createHarness({ pinProtocol: TARGET_PROTOCOL_REVISION, workspaceConfigPath: configPath, developmentBrokerEndpoint: broker.endpoint, developmentBrokerToken: broker.token });
+
+    const listed = await callToolJson(harness.client, "project.list", {});
+
+    expect(listed.isError).toBe(false);
+    expect((listed.parsed["projects"] as Array<Record<string, unknown>>)[0]).toMatchObject({
+      execution: { trustMode: "full-host", terminalAvailable: true },
+      automation: {
+        reviewedProfiles: { processes: [], validations: [], browser: [] },
+        detectedProposal: { state: "detected-awaiting-review", processCount: 1, validationCount: 2 },
+      },
+    });
+  });
+
   it("rechaza campos para crear, aprobar, ejecutar o inyectar comandos", async () => {
     await setup();
     for (const payload of [

@@ -15,20 +15,29 @@ afterEach(async () => {
 });
 
 describe('SEC-249..260 — runtime de artefactos grandes v1.7.0', () => {
-  it('SEC-249 mantiene las 91 tools previas y agrega nueve al final', async () => {
+  it('SEC-249 mantiene las 100 tools de v1.7.0 y agrega trece tools cerradas de v1.8.0', async () => {
     harness = await createHarness({ pinProtocol: TARGET_PROTOCOL_REVISION });
     const tools = (await harness.client.listTools(undefined, { cacheMode: 'bypass' })).tools;
-    expect(tools).toHaveLength(100);
-    expect(new Set(tools.map((tool) => tool.name)).size).toBe(100);
-    expect(tools.slice(91).map((tool) => tool.name)).toEqual([
+    const names = tools.map((tool) => tool.name);
+    const v18Names = new Set([
+      'browser.inspect', 'browser.keyboard.sequence', 'browser.action.capture', 'browser.reload',
+      'web.inspect', 'web.keyboard.sequence', 'web.action.capture', 'web.reload',
+      'task.runMany', 'task.list', 'task.statusMany', 'task.waitMany', 'task.cancelMany',
+    ]);
+    const v17Names = names.filter((name) => !v18Names.has(name));
+    expect(tools).toHaveLength(113);
+    expect(new Set(names).size).toBe(113);
+    expect(v17Names).toHaveLength(100);
+    expect(v17Names.slice(91)).toEqual([
       'analysis.list', 'analysis.status', 'analysis.cancel', 'artifact.inspect',
       'artifact.hash', 'artifact.text.read', 'binary.inspect', 'document.process',
       'web.download.start',
     ]);
+    expect(new Set(names.filter((name) => v18Names.has(name)))).toEqual(v18Names);
   });
 
-  it('SEC-250 fija broker 19 y schemas estrictos para las operaciones nuevas', () => {
-    expect(DEVELOPMENT_BROKER_PROTOCOL).toBe(19);
+  it('SEC-250 conserva schemas estrictos de artefactos bajo broker 22', () => {
+    expect(DEVELOPMENT_BROKER_PROTOCOL).toBe(22);
     expect(() => parseBrokerParams('analysis.list', {
       workspaceId: 'ws_demo', cursor: 0, limit: 20, rootPath: 'C:\\private',
     })).toThrow();

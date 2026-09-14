@@ -226,11 +226,13 @@ export class AnalysisJobSupervisor {
   private readonly controllers = new Map<string, AbortController>();
   private readonly runningByWorkspace = new Map<string, number>();
   private scheduling = false;
+  private rescheduleRequested = false;
   private closed = false;
   private readonly retentionMs: number;
   private readonly maxQueuedJobs: number;
   private readonly maxGlobalRunningJobs: number;
   private readonly now: () => Date;
+  private readonly listeners = new Set<() => void>();
 
   constructor(private readonly options: AnalysisJobSupervisorOptions) {
     this.retentionMs = options.retentionMs ?? 7 * 24 * 60 * 60 * 1000;
@@ -307,6 +309,7 @@ export class AnalysisJobSupervisor {
       db.close();
     }
     this.options.onChange?.();
+    for (const listener of this.listeners) listener();
   }
 
   private saveCompleted(job: MutableJob): void {
@@ -323,6 +326,13 @@ export class AnalysisJobSupervisor {
       db.close();
     }
     this.options.onChange?.();
+    for (const listener of this.listeners) listener();
+  }
+
+  /** Suscripción local de Desktop; no consume resultados ni cambia cursores. */
+  subscribe(listener: () => void): () => void {
+    this.listeners.add(listener);
+    return () => this.listeners.delete(listener);
   }
 
   private rememberResult(job: MutableJob, items: readonly AnalysisResultItem[]): void {
@@ -486,9 +496,19 @@ export class AnalysisJobSupervisor {
   }
 
   private schedule(): void {
-    if (this.scheduling || this.closed) return;
+    if (this.closed) return;
+    if (this.scheduling) {
+      this.rescheduleRequested = true;
+      return;
+    }
     this.scheduling = true;
-    queueMicrotask(() => void this.drain().finally(() => { this.scheduling = false; }));
+    queueMicrotask(() => void this.drain().finally(() => {
+      this.scheduling = false;
+      if (this.rescheduleRequested) {
+        this.rescheduleRequested = false;
+        this.schedule();
+      }
+    }));
   }
 
   private async drain(): Promise<void> {

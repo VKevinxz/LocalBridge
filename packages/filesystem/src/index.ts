@@ -27,6 +27,7 @@ export { createWorkspaceFile, type FileCreateResult } from "./create.js";
 export {
   createWorkspaceBinaryFile,
   createWorkspaceBinaryFileFromChunks,
+  preflightWorkspaceBinaryFileCreate,
   type WorkspaceBinaryCreateOptions,
   type WorkspaceBinaryCreateResult,
   type WorkspaceBinaryStreamWriter,

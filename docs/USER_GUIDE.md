@@ -192,11 +192,45 @@ LocalBridge no hace force-push.
 La vista **Actividad** muestra navegadores LOCAL/INTERNET, procesos, terminales y operaciones
 auditadas. **Cerrar recursos locales** conserva su alcance de desarrollo y no termina una
 investigación; cada sesión de Internet se cierra desde su propia tarjeta. El contador refleja
-recursos activos. El detalle técnico permanece plegado. **Copiar diagnóstico** redacta
-información sensible, pero debes revisarla antes de compartirla.
+recursos activos. En 1.8.1, **Sesiones y recursos**, **Log técnico**, **Cobertura documental**
+y **Auditoría local** se muestran u ocultan por separado. **Contraer todo** reduce el ruido
+sin detener procesos; **Mostrar activos** abre el trabajo en curso. Los avisos que requieren
+tu intervención permanecen visibles incluso con los detalles contraídos. Los lotes y grupos
+de terminales tienen su propio control. **Copiar diagnóstico** redacta información sensible,
+pero debes revisarla antes de compartirla.
+
+En **Conexión**, **Recordar en este equipo** conserva la clave cifrada después de una
+conexión válida. Al volver a abrir, el campo permanece vacío: LocalBridge reutiliza la clave
+desde el proceso principal sin mostrarla. Desactiva la opción para una conexión temporal o
+usa **Olvidar clave** para retirar el blob del perfil activo.
 
 Nunca publiques claves, rutas personales, contenido de proyectos, bases SQLite ni archivos
 de configuración de LocalBridge.
+
+## Trabajo simultáneo y continuidad
+
+Puedes pedir el objetivo en lenguaje cotidiano; no necesitas nombrar herramientas ni
+decidir cuántos procesos usar. Por ejemplo:
+
+> Mientras analizas estos documentos, levanta mi proyecto y ejecuta las comprobaciones que
+> puedan avanzar juntas. Después compara localhost con la página original. Muéstrame lo que
+> vaya terminando y deja el servidor y los navegadores abiertos.
+
+LocalBridge puede agrupar análisis, descargas observadas y validaciones ya revisadas. Las
+tareas independientes avanzan dentro de la capacidad existente; una dependencia espera a
+su resultado. Actividad muestra cada grupo y explica si un hijo espera una dependencia,
+capacidad o un recurso. Esto no crea permisos, perfiles, sesiones ni confirmaciones nuevas.
+
+Un lote pertenece al workspace autorizado, no al chat. Desde otra conversación con el
+mismo acceso, ChatGPT puede listar los lotes recientes y continuar consultando sus IDs sin
+duplicar trabajo. Puedes cancelar una comprobación individual desde Actividad. Esa acción
+no detiene el servidor, navegador o terminal reutilizados; sus controles siguen separados.
+
+Las validaciones del mismo workspace se ordenan porque pueden compartir cachés y salidas.
+Dos workspaces distintos y dos navegadores independientes sí pueden avanzar juntos. Una
+captura motion se hace de una en una para conservar memoria y una interpretación clara de
+la evidencia. “Terminado” indica el final del hijo; el resultado también muestra si tuvo
+éxito, qué cobertura alcanzó y si el contenido retenido sigue disponible.
 
 ## Cerrar y revocar
 

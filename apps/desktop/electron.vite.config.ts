@@ -19,6 +19,7 @@ const LOCALBRIDGE_PACKAGES = [
   '@localbridge/mcp-server',
   '@localbridge/permissions',
   '@localbridge/shared',
+  '@localbridge/validation',
   '@localbridge/workspace',
 ];
 

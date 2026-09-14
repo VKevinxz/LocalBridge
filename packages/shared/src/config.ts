@@ -12,7 +12,7 @@ import { LOG_LEVELS, type LogLevel } from './logger.js';
  * Debe coincidir con la versión de `package.json`; hay un test que lo comprueba
  * para que no se separen silenciosamente.
  */
-export const SERVER_VERSION = '1.7.0';
+export const SERVER_VERSION = '1.8.1';
 
 export const SERVER_NAME = 'localbridge-mcp';
 

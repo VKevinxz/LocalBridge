@@ -54,7 +54,7 @@ try {
       expression: `(async () => {
       const onboarding = await window.desktop.getOnboardingSnapshot();
       const webProfiles = await window.desktop.getWebProfiles();
-      const savedKey = await window.desktop.getSavedTunnelKey();
+      const savedKey = await window.desktop.getTunnelKeyState();
       return {
         bodyText: document.body.innerText,
         status: onboarding.state.status,
@@ -63,7 +63,10 @@ try {
           && typeof webProfiles === 'object'
           && typeof webProfiles.state === 'string'
           && Array.isArray(webProfiles.document?.profiles),
-        savedKeyContract: savedKey === undefined || typeof savedKey === 'string'
+        savedKeyContract: savedKey !== null
+          && typeof savedKey === 'object'
+          && ['available', 'absent', 'encryption-unavailable', 'unreadable', 'io-error'].includes(savedKey.status)
+          && !Object.hasOwn(savedKey, 'value')
       };
       })()`,
       awaitPromise: true,

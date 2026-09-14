@@ -7,6 +7,7 @@
   --navy: #10243e;
   --navy-soft: #193653;
   --teal: #087f73;
+  --accent: var(--teal);
   --teal-light: #d9f4ef;
   --amber: #9a5b00;
   --amber-light: #fff1d6;
@@ -795,9 +796,49 @@ input[readonly] {
   font-size: 13px;
 }
 
+.task-batch-row {
+  border-left: 4px solid var(--accent);
+}
+
+.task-child-list {
+  display: grid;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.task-child-row {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: #f8fafc;
+}
+
+.task-child-row > div:first-child {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.task-child-row span,
+.task-child-row code {
+  overflow-wrap: anywhere;
+}
+
 .runtime-project-heading {
   padding-bottom: 10px;
   border-bottom: 1px solid var(--line);
+}
+
+.runtime-project-panel {
+  display: grid;
+  gap: 12px;
 }
 
 .runtime-terminal-list {
@@ -961,11 +1002,75 @@ input[readonly] {
   gap: 8px;
 }
 
+.availability-summary {
+  margin: 12px 0;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: #fbfcfe;
+}
+
+.availability-summary > summary {
+  cursor: pointer;
+  font-weight: 700;
+}
+
+.availability-summary .readiness-list {
+  margin-top: 10px;
+}
+
 .activity-filters {
   display: flex;
   flex-wrap: wrap;
   gap: 8px;
   margin: 14px 0;
+}
+
+.activity-disclosure-card + .activity-disclosure-card {
+  margin-top: 16px;
+}
+
+.activity-disclosure-heading {
+  align-items: center;
+}
+
+.activity-disclosure-heading .actions,
+.activity-page-heading .actions {
+  justify-content: flex-end;
+}
+
+.activity-disclosure-panel {
+  display: grid;
+  gap: 14px;
+  padding-top: 16px;
+  border-top: 1px solid var(--line);
+}
+
+.disclosure-toggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  white-space: nowrap;
+}
+
+.compact-disclosure-toggle {
+  padding: 7px 10px;
+}
+
+.disclosure-chevron {
+  width: 1em;
+  color: var(--teal);
+  font-weight: 900;
+  text-align: center;
+}
+
+.activity-log-panel {
+  min-height: 72px;
+}
+
+.activity-intervention {
+  margin-top: 16px;
 }
 
 .activity-group + .activity-group {
@@ -1557,6 +1662,12 @@ input[readonly] {
   background: #e5f7f3;
 }
 
+.feedback-warning {
+  border-color: #d59112;
+  background: #fff8e7;
+  color: #6f4700;
+}
+
 .feedback-error {
   border-color: #efabb4;
   color: #8c2632;
@@ -1723,6 +1834,11 @@ input[readonly] {
   .runtime-footer {
     flex-direction: column;
     align-items: stretch;
+  }
+
+  .activity-disclosure-heading .actions,
+  .activity-page-heading .actions {
+    justify-content: flex-start;
   }
 
   .section-heading > button,

@@ -36,6 +36,8 @@ import type {
   OnboardingSnapshot,
   WebProfile,
   WebProfileStoreSnapshot,
+  StoredTunnelKeyState,
+  TunnelConnectInput,
 } from "@localbridge/desktop-core";
 
 export type {
@@ -54,7 +56,22 @@ export type {
   TunnelStatus,
   WebProfile,
   WebProfileStoreSnapshot,
+  StoredTunnelKeyState,
+  TunnelConnectInput,
 };
+
+export interface TunnelPersistenceResult {
+  readonly keyPersistence?: "remembered" | "failed";
+  readonly warningCode?: "KEY_STORE_WRITE_FAILED";
+}
+
+export type TunnelDiagnosisResult = TunnelDoctorResult & TunnelPersistenceResult;
+
+export interface TunnelConnectResult {
+  readonly connected: true;
+  readonly remembered: boolean;
+  readonly warningCode?: "KEY_STORE_WRITE_FAILED";
+}
 
 export interface DesktopApi {
   getOnboardingSnapshot(): Promise<OnboardingViewSnapshot>;
@@ -62,7 +79,7 @@ export interface DesktopApi {
   nextOnboarding(): Promise<OnboardingViewSnapshot>;
   backOnboarding(): Promise<OnboardingViewSnapshot>;
   checkOnboardingRuntime(): Promise<{ report: RuntimeReadinessReport; snapshot: OnboardingViewSnapshot }>;
-  diagnoseOnboardingConnection(apiKey: string): Promise<{ report: TunnelDoctorResult; snapshot: OnboardingViewSnapshot }>;
+  diagnoseOnboardingConnection(apiKey: string): Promise<{ report: TunnelDiagnosisResult; snapshot: OnboardingViewSnapshot }>;
   pickOnboardingProjectFolder(): Promise<{ folder: OnboardingFolderSummary; snapshot: OnboardingViewSnapshot } | undefined>;
   setOnboardingAccess(input: OnboardingAccessDraft): Promise<OnboardingViewSnapshot>;
   completeOnboarding(input: OnboardingCompletionDraft): Promise<OnboardingViewSnapshot & { project: ProjectCatalogRecord }>;
@@ -98,6 +115,7 @@ export interface DesktopApi {
   detectProjectCommands(rootPath: string): Promise<DetectedCommand[]>;
   listDevelopmentActivity(): Promise<DevelopmentActivity>;
   cancelAnalysisJob(workspaceId: string, jobId: string): Promise<void>;
+  cancelTaskBatch(workspaceId: string, batchId: string, localId?: string): Promise<void>;
   stopAllDevelopmentActivity(): Promise<void>;
   openTerminalListener(projectId: string, terminalSessionId: string, listenerRef: string): Promise<void>;
   copyTerminalListener(projectId: string, terminalSessionId: string, listenerRef: string): Promise<void>;
@@ -156,9 +174,9 @@ export interface DesktopApi {
   pickTunnelBinary(): Promise<string | undefined>;
   pickTunnelProfileDir(): Promise<string | undefined>;
 
-  connectTunnel(apiKey: string): Promise<void>;
+  connectTunnel(input: TunnelConnectInput): Promise<TunnelConnectResult>;
   initializeTunnelProfile(): Promise<void>;
-  diagnoseTunnel(apiKey: string): Promise<TunnelDoctorResult>;
+  diagnoseTunnel(apiKey: string): Promise<TunnelDiagnosisResult>;
   disconnectTunnel(): Promise<void>;
   getTunnelStatus(): Promise<TunnelStatus>;
   getEffectiveGitApprovalMode(): Promise<DesktopSettings["gitApprovalMode"] | undefined>;
@@ -166,8 +184,7 @@ export interface DesktopApi {
   onTunnelLog(callback: (line: string, stream: "stdout" | "stderr") => void): () => void;
 
   /** Cifrada con el almacén del sistema operativo — ver secure-key-store.ts. */
-  getSavedTunnelKey(): Promise<string | undefined>;
-  saveTunnelKey(apiKey: string): Promise<void>;
+  getTunnelKeyState(): Promise<StoredTunnelKeyState>;
   forgetTunnelKey(): Promise<void>;
 }
 
@@ -263,9 +280,51 @@ export interface AdoptDevelopmentProjectDraft {
 }
 
 export interface DevelopmentActivity {
+  readonly availability?: ReadonlyArray<{
+    readonly projectId: string;
+    readonly projectName: string;
+    readonly terminalAvailable: boolean;
+    readonly reviewed: {
+      readonly processes: number;
+      readonly validations: number;
+      readonly browser: number;
+    };
+    readonly detectedProposal: {
+      readonly state: 'none' | 'detected-awaiting-review' | 'applying' | 'detected-inactive';
+      readonly processes: number;
+      readonly validations: number;
+    };
+  }>;
   readonly analysisAvailability?:
     | { readonly available: true }
     | { readonly available: false; readonly reason: 'journal-unavailable' };
+  readonly taskBatchAvailability?:
+    | { readonly available: true }
+    | { readonly available: false; readonly reason: 'journal-unavailable' };
+  readonly taskBatches?: ReadonlyArray<{
+    readonly batchId: string;
+    readonly workspaceId: string;
+    readonly operationId: string;
+    readonly state: 'queued' | 'running' | 'cancel_requested' | 'cancelled' | 'completed' | 'partial' | 'failed' | 'interrupted';
+    readonly revision: number;
+    readonly createdAt: string;
+    readonly updatedAt: string;
+    readonly deliveryMs: number;
+    readonly children: ReadonlyArray<{
+      readonly localId: string;
+      readonly operationKind: 'artifact.inspect' | 'artifact.hash' | 'artifact.text.read' | 'binary.inspect' | 'document.process' | 'web.download.start' | 'validation.run';
+      readonly sourcePath?: string;
+      readonly state: 'admitted' | 'waiting_dependency' | 'waiting_resource' | 'running' | 'cancel_requested' | 'cancelled' | 'completed' | 'failed' | 'skipped_dependency' | 'interrupted';
+      readonly stage: string;
+      readonly effectState: 'not_started' | 'applied' | 'not_applied' | 'uncertain';
+      readonly coverage: 'unknown' | 'supported' | 'partial' | 'unsupported' | 'source_changed';
+      readonly timing: { readonly admissionMs: number; readonly dependencyWaitMs: number; readonly capacityWaitMs: number; readonly lockWaitMs: number; readonly lockHoldMs: number; readonly executionMs: number; readonly persistenceMs: number; readonly clientWaitMs: 0 };
+      readonly analysisJobId?: string;
+      readonly errorCode?: string;
+      readonly resultAvailable: boolean;
+      readonly resultExpired: boolean;
+    }>;
+  }>;
   readonly jobs?: ReadonlyArray<{
     readonly jobId: string;
     readonly operationId: string;
@@ -505,6 +564,9 @@ const api: DesktopApi = {
   detectProjectCommands: (rootPath) => ipcRenderer.invoke("workspaces:detectCommands", rootPath),
   listDevelopmentActivity: () => ipcRenderer.invoke("development:list"),
   cancelAnalysisJob: (workspaceId, jobId) => ipcRenderer.invoke("development:cancelAnalysis", { workspaceId, jobId }),
+  cancelTaskBatch: (workspaceId, batchId, localId) => ipcRenderer.invoke("development:cancelTaskBatch", {
+    workspaceId, batchId, ...(localId === undefined ? {} : { localId }),
+  }),
   stopAllDevelopmentActivity: () => ipcRenderer.invoke("development:stopAll"),
   openTerminalListener: (projectId, terminalSessionId, listenerRef) => ipcRenderer.invoke('development:openTerminalListener', {
     projectId, terminalSessionId, listenerRef,
@@ -590,7 +652,7 @@ const api: DesktopApi = {
   pickTunnelBinary: () => ipcRenderer.invoke("settings:pickTunnelBinary"),
   pickTunnelProfileDir: () => ipcRenderer.invoke("settings:pickTunnelProfileDir"),
 
-  connectTunnel: (apiKey) => ipcRenderer.invoke("tunnel:connect", apiKey),
+  connectTunnel: (input) => ipcRenderer.invoke("tunnel:connect", input),
   initializeTunnelProfile: () => ipcRenderer.invoke("tunnel:initializeProfile"),
   diagnoseTunnel: (apiKey) => ipcRenderer.invoke("tunnel:doctor", apiKey),
   disconnectTunnel: () => ipcRenderer.invoke("tunnel:disconnect"),
@@ -609,8 +671,7 @@ const api: DesktopApi = {
     return () => ipcRenderer.removeListener("tunnel:log", listener);
   },
 
-  getSavedTunnelKey: () => ipcRenderer.invoke("tunnel:getSavedKey"),
-  saveTunnelKey: (apiKey) => ipcRenderer.invoke("tunnel:saveKey", apiKey),
+  getTunnelKeyState: () => ipcRenderer.invoke("tunnel:getKeyState"),
   forgetTunnelKey: () => ipcRenderer.invoke("tunnel:forgetKey"),
 };
 

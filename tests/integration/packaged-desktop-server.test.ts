@@ -63,13 +63,21 @@ describe.skipIf(packagedResources === undefined)('servidor MCP autocontenido', (
       const gitTools = listed.tools.filter((tool) => tool.name.startsWith('git.'));
       const terminalTools = listed.tools.filter((tool) => ['terminal.start', 'terminal.write'].includes(tool.name));
       const webTools = listed.tools.filter((tool) => tool.name.startsWith('web.'));
+      const taskTools = listed.tools.filter((tool) => tool.name.startsWith('task.'));
 
       expect(result.structuredContent).toMatchObject({
         status: 'ready',
         version: productVersion,
       });
-      expect(listed.tools).toHaveLength(100);
-      expect(webTools).toHaveLength(27);
+      expect(listed.tools).toHaveLength(113);
+      expect(webTools).toHaveLength(31);
+      expect(taskTools.map((tool) => tool.name).toSorted()).toEqual([
+        'task.cancelMany',
+        'task.list',
+        'task.runMany',
+        'task.statusMany',
+        'task.waitMany',
+      ]);
       expect(listed.tools.some((tool) => tool.name === 'document.read')).toBe(true);
       expect(listed.tools.some((tool) => tool.name === 'document.render')).toBe(true);
       expect(listed.tools.some((tool) => tool.name === 'image.read')).toBe(true);

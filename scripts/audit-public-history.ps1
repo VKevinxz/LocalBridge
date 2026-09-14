@@ -6,7 +6,7 @@ if ($LASTEXITCODE -ne 0 -or $insideWorktree -ne 'true') {
   throw 'Run this script inside a Git worktree.'
 }
 
-$sensitivePathPattern = '(?i)(^|/)(\.env($|\.)|workspaces\.json$|desktop-settings\.json$|tunnel-key\.enc$|[^/]+\.(pfx|p12|pem|key|exe|zip)$)'
+$sensitivePathPattern = '(?i)(^|/)(\.env($|\.)|workspaces\.json$|desktop-settings\.json$|tunnel-key\.enc$|tunnel-keys/[^/]+\.enc$|[^/]+\.(pfx|p12|pem|key|exe|zip)$)'
 $secretPattern = '(-----BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY-----|gh[pousr]_[A-Za-z0-9]{20,}|sk-[A-Za-z0-9_-]{20,}|AKIA[A-Z0-9]{16})'
 $knownSyntheticFixtureBlobs = @{
   # Contiene deliberadamente un encabezado ficticio para probar la denylist.

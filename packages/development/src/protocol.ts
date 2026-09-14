@@ -4,7 +4,7 @@ import path from 'node:path';
 
 import { z } from 'zod';
 
-export const DEVELOPMENT_BROKER_PROTOCOL = 19 as const;
+export const DEVELOPMENT_BROKER_PROTOCOL = 22 as const;
 export const MAX_BROKER_FRAME_BYTES = 4 * 1024 * 1024;
 export const BROKER_TOKEN_PATTERN = /^[a-f0-9]{64}$/;
 export const BROKER_ID_PATTERN = /^[a-f0-9]{32}$/;
@@ -28,6 +28,19 @@ const webResourceRefSchema = z.string().regex(/^webresource_[a-f0-9]{20}$/);
 const browserSessionIdSchema = z.string().regex(/^session_[a-f0-9]{24}$/);
 const analysisJobIdSchema = z.string().regex(/^job_[a-f0-9]{24}$/);
 const analysisOperationIdSchema = z.string().min(1).max(128);
+const taskBatchIdSchema = z.string().regex(/^batch_[a-f0-9]{24}$/);
+const taskLocalIdSchema = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/);
+export const BROWSER_INSPECTABLE_CSS_PROPERTIES = [
+  'background-color', 'border-bottom-color', 'border-bottom-left-radius', 'border-bottom-right-radius',
+  'border-bottom-width', 'border-left-color', 'border-left-width', 'border-right-color', 'border-right-width',
+  'border-top-color', 'border-top-left-radius', 'border-top-right-radius', 'border-top-width', 'box-shadow',
+  'color', 'display', 'font-family', 'font-size', 'font-style', 'font-weight', 'height', 'letter-spacing',
+  'line-height', 'margin-bottom', 'margin-left', 'margin-right', 'margin-top', 'opacity', 'padding-bottom',
+  'padding-left', 'padding-right', 'padding-top', 'position', 'text-align', 'text-decoration-line',
+  'text-transform', 'transform', 'transition-delay', 'transition-duration', 'transition-property',
+  'visibility', 'width', 'z-index',
+] as const;
+export const BROWSER_KEY_ALLOWLIST = ['Enter', 'Escape', 'Tab', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'] as const;
 const relativePathSchema = z.string().min(1).max(4096).refine((value) =>
   !/^(?:[A-Za-z]:[\\/]|[\\/])/.test(value), "se requiere una ruta relativa").refine((value) =>
   !value.split(/[\\/]/).includes('..'), 'no se permite traversal');
@@ -71,11 +84,41 @@ const analysisStartParamsSchema = z.discriminatedUnion('operationKind', [
   }).strict(),
 ]);
 
+const taskChildDependencyFields = {
+  localId: taskLocalIdSchema,
+  dependsOn: z.array(taskLocalIdSchema).max(24).default([]),
+} as const;
+const taskChildSchema = z.discriminatedUnion('operationKind', [
+  z.object({ ...taskChildDependencyFields, operationKind: z.literal('artifact.inspect'), sourcePath: relativePathSchema, parameters: z.object({}).strict() }).strict(),
+  z.object({ ...taskChildDependencyFields, operationKind: z.literal('artifact.hash'), sourcePath: relativePathSchema, parameters: z.object({}).strict() }).strict(),
+  z.object({ ...taskChildDependencyFields, operationKind: z.literal('artifact.text.read'), sourcePath: relativePathSchema,
+    parameters: z.object({ cursor: z.string().max(512).optional(), maxChars: z.number().int().min(1_000).max(200_000).default(50_000) }).strict() }).strict(),
+  z.object({ ...taskChildDependencyFields, operationKind: z.literal('binary.inspect'), sourcePath: relativePathSchema,
+    parameters: z.object({ depth: z.enum(['quick', 'standard', 'deep']).default('standard') }).strict() }).strict(),
+  z.object({ ...taskChildDependencyFields, operationKind: z.literal('document.process'), sourcePath: relativePathSchema,
+    parameters: z.discriminatedUnion('mode', [
+      z.object({ mode: z.literal('read'), startPage: z.number().int().min(1).optional(), endPage: z.number().int().min(1).optional(), maxChars: z.number().int().min(1_000).max(200_000).default(50_000) }).strict(),
+      z.object({ mode: z.literal('render'), pages: z.array(z.number().int().min(1)).min(1).max(4), detail: z.enum(['standard', 'high']).default('standard') }).strict(),
+    ]) }).strict(),
+  z.object({ ...taskChildDependencyFields, operationKind: z.literal('web.download.start'), sourcePath: relativePathSchema,
+    parameters: z.object({ sessionId: webSessionIdSchema, tabId: webTabIdSchema, resourceRef: webResourceRefSchema }).strict() }).strict(),
+  z.object({ ...taskChildDependencyFields, operationKind: z.literal('validation.run'),
+    parameters: z.object({ profile: profileNameSchema }).strict() }).strict(),
+]);
+
 const workspaceParams = z.object({ workspaceId: workspaceIdSchema }).strict();
 const processIdParams = workspaceParams.extend({ processId: opaqueIdSchema }).strict();
 const sessionIdParams = workspaceParams.extend({ sessionId: opaqueIdSchema }).strict();
 const snapshotElementParams = sessionIdParams.extend({ snapshotId: opaqueIdSchema, elementRef: opaqueIdSchema }).strict();
-const browserConditionSchema = z.discriminatedUnion('kind', [
+const inspectionFields = {
+  target: z.enum(['element', 'active']).default('element'),
+  snapshotId: opaqueIdSchema.optional(),
+  elementRef: opaqueIdSchema.optional(),
+  cssProperties: z.array(z.enum(BROWSER_INSPECTABLE_CSS_PROPERTIES)).max(32)
+    .default(['color', 'background-color', 'font-family', 'font-size', 'font-weight']),
+  cssVariables: z.array(z.string().regex(/^--[A-Za-z0-9_-]{1,126}$/)).max(16).default([]),
+} as const;
+const browserAssertionConditionSchemas = [
   z.object({ kind: z.literal('path'), value: z.string().min(1).max(2048), operator: z.enum(['equals', 'contains']).default('equals') }).strict(),
   z.object({ kind: z.literal('title'), value: z.string().min(1).max(256), operator: z.enum(['equals', 'contains']).default('equals') }).strict(),
   z.object({ kind: z.literal('text'), value: z.string().min(1).max(512), state: z.enum(['present', 'absent']).default('present') }).strict(),
@@ -83,6 +126,22 @@ const browserConditionSchema = z.discriminatedUnion('kind', [
   z.object({ kind: z.literal('response'), path: z.string().min(1).max(2048).regex(/^\/(?!\/)/), status: z.number().int().min(100).max(599).optional(), afterCursor: z.number().int().nonnegative().default(0) }).strict(),
   z.object({ kind: z.literal('no-console-errors'), afterCursor: z.number().int().nonnegative().default(0) }).strict(),
   z.object({ kind: z.literal('dialog'), state: z.enum(['open', 'closed']) }).strict(),
+] as const;
+const browserAssertionConditionSchema = z.discriminatedUnion('kind', browserAssertionConditionSchemas);
+const browserWaitConditionSchema = z.discriminatedUnion('kind', [
+  ...browserAssertionConditionSchemas,
+  z.object({ kind: z.literal('stable'), snapshotId: opaqueIdSchema, elementRef: opaqueIdSchema,
+    intervalMs: z.number().int().min(100).max(2_000).default(300), tolerancePx: z.number().min(0).max(5).default(0.5) }).strict(),
+]);
+const actionCaptureWaitSchema = z.discriminatedUnion('kind', [
+  z.object({ kind: z.literal('delay'), settleMs: z.number().int().min(0).max(5_000).default(300) }).strict(),
+  z.object({ kind: z.literal('stable'), intervalMs: z.number().int().min(100).max(2_000).default(300),
+    tolerancePx: z.number().min(0).max(5).default(0.5), timeoutMs: z.number().int().min(100).max(5_000).default(2_000),
+    allowUnstable: z.boolean().default(false) }).strict(),
+]);
+const browserActionCaptureOutputSchema = z.discriminatedUnion('kind', [
+  z.object({ kind: z.literal('inline') }).strict(),
+  z.object({ kind: z.literal('save'), workspaceId: workspaceIdSchema, path: relativePathSchema }).strict(),
 ]);
 const browserStartParams = z.union([
   workspaceParams.extend({ profile: profileNameSchema, operationId: operationIdSchema }).strict(),
@@ -118,6 +177,8 @@ const webWaitConditionSchema = z.discriminatedUnion('kind', [
   z.object({ kind: z.literal('url'), value: z.string().min(1).max(4096), operator: z.enum(['equals', 'contains']).default('equals') }).strict(),
   z.object({ kind: z.literal('title'), value: z.string().min(1).max(256), operator: z.enum(['equals', 'contains']).default('contains') }).strict(),
   z.object({ kind: z.literal('text'), value: z.string().min(1).max(512), state: z.enum(['present', 'absent']).default('present') }).strict(),
+  z.object({ kind: z.literal('stable'), snapshotId: webSnapshotIdSchema, elementRef: webElementRefSchema,
+    intervalMs: z.number().int().min(100).max(2_000).default(300), tolerancePx: z.number().min(0).max(5).default(0.5) }).strict(),
 ]);
 const motionTrajectorySchema = z.object({
   axis: z.literal('y'),
@@ -189,10 +250,25 @@ export const brokerMethodSchemas = {
   'analysis.list': z.object({ workspaceId: workspaceIdSchema, cursor: z.number().int().nonnegative().default(0), limit: z.number().int().min(1).max(50).default(20) }).strict(),
   'analysis.status': z.object({ workspaceId: workspaceIdSchema, jobId: analysisJobIdSchema, cursor: z.number().int().nonnegative().default(0), maxItems: z.number().int().min(1).max(20).default(10) }).strict(),
   'analysis.cancel': z.object({ workspaceId: workspaceIdSchema, jobId: analysisJobIdSchema }).strict(),
+  'task.runMany': z.object({
+    workspaceId: workspaceIdSchema,
+    operationId: analysisOperationIdSchema,
+    children: z.array(taskChildSchema).min(1).max(24),
+    failurePolicy: z.enum(['continue', 'cancel_remaining']).default('continue'),
+  }).strict(),
+  'task.list': z.object({ workspaceId: workspaceIdSchema, cursor: cursorSchema, limit: z.number().int().min(1).max(50).default(20) }).strict(),
+  'task.statusMany': z.object({ workspaceId: workspaceIdSchema, batchId: taskBatchIdSchema,
+    localIds: z.array(taskLocalIdSchema).min(1).max(24).optional(), cursor: cursorSchema,
+    limit: z.number().int().min(1).max(20).default(20) }).strict(),
+  'task.waitMany': z.object({ workspaceId: workspaceIdSchema, batchId: taskBatchIdSchema,
+    afterRevision: z.number().int().nonnegative(), condition: z.enum(['changed', 'all_finished']).default('changed'),
+    waitMs: z.number().int().min(0).max(20_000).default(10_000) }).strict(),
+  'task.cancelMany': z.object({ workspaceId: workspaceIdSchema, batchId: taskBatchIdSchema,
+    localIds: z.array(taskLocalIdSchema).min(1).max(24).optional(), operationId: analysisOperationIdSchema }).strict(),
   'terminal.start': z.object({ projectId: projectIdSchema, operationId: operationIdSchema }).strict(),
   'terminal.list': z.object({ projectId: projectIdSchema }).strict(),
   'terminal.write': z.object({ projectId: projectIdSchema, sessionId: terminalIdSchema, text: z.string().min(1).max(65_536), operationId: operationIdSchema }).strict(),
-  'terminal.read': z.object({ projectId: projectIdSchema, sessionId: terminalIdSchema, cursor: cursorSchema, maxBytes: z.number().int().min(1).max(65_536).default(65_536) }).strict(),
+  'terminal.read': z.object({ projectId: projectIdSchema, sessionId: terminalIdSchema, cursor: cursorSchema, maxBytes: z.number().int().min(1).max(65_536).default(65_536), waitMs: z.number().int().min(0).max(20_000).default(0) }).strict(),
   'terminal.status': z.object({ projectId: projectIdSchema, sessionId: terminalIdSchema }).strict(),
   'terminal.stop': z.object({ projectId: projectIdSchema, sessionId: terminalIdSchema, operationId: operationIdSchema }).strict(),
   'application.start': z.object({ applicationId: applicationIdSchema, operationId: operationIdSchema }).strict(),
@@ -206,9 +282,10 @@ export const brokerMethodSchemas = {
   'browser.start': browserStartParams,
   'browser.list': workspaceParams,
   'browser.navigate': sessionIdParams.extend({ path: z.string().min(1).max(2048), operationId: operationIdSchema }).strict(),
+  'browser.reload': sessionIdParams.extend({ mode: z.enum(['normal', 'ignore-cache']).default('normal'), operationId: z.string().min(1).max(128) }).strict(),
   'browser.snapshot': sessionIdParams.extend({ maxDepth: z.number().int().min(1).max(20).default(12), maxElements: z.number().int().min(1).max(1000).default(500) }).strict(),
-  'browser.screenshot': sessionIdParams,
-  'browser.screenshot.save': sessionIdParams.extend({ path: relativePathSchema, operationId: z.string().min(1).max(128) }).strict(),
+  'browser.screenshot': sessionIdParams.extend({ settleMs: z.number().int().min(0).max(3_000).default(0) }).strict(),
+  'browser.screenshot.save': sessionIdParams.extend({ path: relativePathSchema, settleMs: z.number().int().min(0).max(3_000).default(0), operationId: z.string().min(1).max(128) }).strict(),
   'browser.motion.inspect': workspaceParams.extend({ sessionId: browserSessionIdSchema, maxAnimations: z.number().int().min(1).max(100).default(100) }).strict(),
   'browser.motion.capture': workspaceParams.extend({ sessionId: browserSessionIdSchema, ...motionCaptureFields }).strict(),
   // Emulación de viewport para probar diseño responsive (ADR-0042). Dimensiones
@@ -219,13 +296,32 @@ export const brokerMethodSchemas = {
     mobile: z.boolean().default(false),
     operationId: operationIdSchema,
   }).strict(),
-  'browser.events': sessionIdParams.extend({ cursor: cursorSchema, maxBytes: z.number().int().min(1).max(65_536).default(65_536) }).strict(),
-  'browser.assert': sessionIdParams.extend({ condition: browserConditionSchema }).strict(),
-  'browser.wait': sessionIdParams.extend({ condition: browserConditionSchema, timeoutMs: z.number().int().min(100).max(30_000).default(5_000) }).strict(),
+  'browser.events': sessionIdParams.extend({ cursor: cursorSchema, maxBytes: z.number().int().min(1).max(65_536).default(65_536), scope: z.enum(['history', 'current-navigation']).default('history') }).strict(),
+  'browser.inspect': sessionIdParams.extend(inspectionFields).strict().superRefine((value, context) => {
+    if (value.target === 'element' && (value.snapshotId === undefined || value.elementRef === undefined)) {
+      context.addIssue({ code: 'custom', message: 'snapshotId and elementRef are required for target element' });
+    }
+  }),
+  'browser.assert': sessionIdParams.extend({ condition: browserAssertionConditionSchema }).strict(),
+  'browser.wait': sessionIdParams.extend({ condition: browserWaitConditionSchema, timeoutMs: z.number().int().min(100).max(30_000).default(5_000) }).strict(),
   'browser.click': snapshotElementParams.extend({ operationId: operationIdSchema }).strict(),
   'browser.fill': snapshotElementParams.extend({ text: z.string().max(8192), operationId: operationIdSchema }).strict(),
   'browser.hover': snapshotElementParams.extend({ operationId: operationIdSchema }).strict(),
   'browser.press': snapshotElementParams.extend({ key: z.enum(['Enter', 'Escape', 'Tab', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight']), operationId: operationIdSchema }).strict(),
+  'browser.keyboard.sequence': snapshotElementParams.extend({
+    keys: z.array(z.enum(BROWSER_KEY_ALLOWLIST)).min(1).max(16),
+    operationId: z.string().min(1).max(128),
+  }).strict(),
+  'browser.action.capture': snapshotElementParams.extend({
+    action: z.discriminatedUnion('kind', [
+      z.object({ kind: z.literal('click') }).strict(),
+      z.object({ kind: z.literal('hover') }).strict(),
+      z.object({ kind: z.literal('key'), key: z.enum(BROWSER_KEY_ALLOWLIST) }).strict(),
+    ]),
+    wait: actionCaptureWaitSchema,
+    output: browserActionCaptureOutputSchema,
+    operationId: z.string().min(1).max(128),
+  }).strict(),
   'browser.scroll': sessionIdParams.extend({ direction: z.enum(['up', 'down', 'left', 'right']), amount: z.number().int().min(1).max(5000), operationId: operationIdSchema }).strict(),
   'browser.select': snapshotElementParams.extend({ value: z.string().max(1024), operationId: operationIdSchema }).strict(),
   'browser.drag': snapshotElementParams.extend({ targetElementRef: opaqueIdSchema, operationId: operationIdSchema }).strict(),
@@ -241,12 +337,19 @@ export const brokerMethodSchemas = {
   'web.open': webSessionParams.extend({ url: publicHttpsUrlSchema, operationId: operationIdSchema }).strict(),
   'web.close': webTabParams.extend({ operationId: operationIdSchema }).strict(),
   'web.navigate': webTabParams.extend({ url: publicHttpsUrlSchema, operationId: operationIdSchema }).strict(),
+  'web.reload': webTabParams.extend({ mode: z.enum(['normal', 'ignore-cache']).default('normal'), operationId: z.string().min(1).max(128) }).strict(),
   'web.back': webTabParams.extend({ operationId: operationIdSchema }).strict(),
   'web.snapshot': webTabParams.extend({ maxDepth: z.number().int().min(1).max(20).default(12), maxElements: z.number().int().min(1).max(1000).default(500) }).strict(),
-  'web.screenshot': webTabParams,
+  'web.inspect': webTabParams.extend(inspectionFields).strict().superRefine((value, context) => {
+    if (value.target === 'element' && (value.snapshotId === undefined || value.elementRef === undefined)) {
+      context.addIssue({ code: 'custom', message: 'snapshotId and elementRef are required for target element' });
+    }
+  }),
+  'web.screenshot': webTabParams.extend({ settleMs: z.number().int().min(0).max(3_000).default(0) }).strict(),
   'web.screenshot.save': webTabParams.extend({
     workspaceId: workspaceIdSchema,
     path: relativePathSchema,
+    settleMs: z.number().int().min(0).max(3_000).default(0),
     operationId: z.string().min(1).max(128),
   }).strict(),
   'web.motion.inspect': webTabParams.extend({ maxAnimations: z.number().int().min(1).max(100).default(100) }).strict(),
@@ -270,6 +373,19 @@ export const brokerMethodSchemas = {
   'web.select': webElementParams.extend({ value: z.string().max(1024), operationId: operationIdSchema }).strict(),
   'web.scroll': webTabParams.extend({ direction: z.enum(['up', 'down', 'left', 'right']), amount: z.number().int().min(1).max(5000), operationId: operationIdSchema }).strict(),
   'web.press': webElementParams.extend({ key: z.enum(['Enter', 'Escape', 'Tab', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight']), operationId: operationIdSchema }).strict(),
+  'web.keyboard.sequence': webElementParams.extend({
+    keys: z.array(z.enum(BROWSER_KEY_ALLOWLIST)).min(1).max(16),
+    operationId: z.string().min(1).max(128),
+  }).strict(),
+  'web.action.capture': webElementParams.extend({
+    action: z.discriminatedUnion('kind', [
+      z.object({ kind: z.literal('click') }).strict(),
+      z.object({ kind: z.literal('key'), key: z.enum(BROWSER_KEY_ALLOWLIST) }).strict(),
+    ]),
+    wait: actionCaptureWaitSchema,
+    output: browserActionCaptureOutputSchema,
+    operationId: z.string().min(1).max(128),
+  }).strict(),
   'web.wait': webTabParams.extend({ condition: webWaitConditionSchema, timeoutMs: z.number().int().min(100).max(30_000).default(5_000) }).strict(),
   'web.human.request': webSessionParams.extend({ reason: humanReasonSchema, operationId: z.string().min(1).max(128) }).strict(),
   'web.human.status': webSessionParams,

@@ -19,7 +19,7 @@ $forbiddenNames = [Collections.Generic.HashSet[string]]::new([StringComparer]::O
 @('.env', 'desktop-settings.json', 'tunnel-key.enc', 'workspaces.json') |
     ForEach-Object { [void]$forbiddenNames.Add($_) }
 $forbiddenExtensions = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
-@('.db', '.exe', '.key', '.p12', '.pem', '.pfx', '.zip') |
+@('.db', '.enc', '.exe', '.key', '.p12', '.pem', '.pfx', '.zip') |
     ForEach-Object { [void]$forbiddenExtensions.Add($_) }
 $internalDocPattern = '(?i)(^|/)(STATUS|MASTER_SPEC|PUBLICATION_AUDIT|RELEASE_CHECKLIST|GITHUB_SETUP|ROADMAP_PRODUCTO|TEST_PLAN|.*(?:_PLAN|_ANALYSIS|_COMPLETION_AUDIT|_TEST_GUIDE))\.md$|(^|/)docs/adr/'
 $secretPattern = '(-----BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY-----|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9_-]{20,}|AKIA[A-Z0-9]{16})'

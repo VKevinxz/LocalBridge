@@ -77,7 +77,7 @@ export function registerApplicationListTool(server: McpServer, ctx: ToolContext)
   })) });
   server.registerTool('application.list', {
     title: 'List locally reviewed applications',
-    description: 'Lists global LocalBridge applications and their reviewed service composition. It never returns commands, paths, URLs or ports and never changes configuration.',
+    description: 'Lists global LocalBridge applications and their service composition. Call it before application.start and choose only reviewState=reviewed. This lists definitions, not idle capacity or active runs; retain a returned runId and use application.status rather than starting a duplicate. It never returns commands, paths, URLs or ports and never changes configuration.',
     inputSchema: z.object({}).strict(),
     outputSchema,
     annotations: { readOnlyHint: true, idempotentHint: true, destructiveHint: false, openWorldHint: false },
@@ -115,7 +115,7 @@ export function registerApplicationListTool(server: McpServer, ctx: ToolContext)
 export function registerApplicationStartTool(server: McpServer, ctx: ToolContext): void {
   server.registerTool('application.start', {
     title: 'Start a reviewed local application',
-    description: 'Starts every fixed service profile in a reviewed LocalBridge application. It accepts only an opaque applicationId; commands, cwd, environment, services, URLs and ports cannot be supplied. Poll application.status until ready before opening the browser.',
+    description: 'Starts every fixed service profile in a reviewed LocalBridge application. Call application.list first, and reuse a known active runId from the ongoing task instead of duplicating the application. It accepts only an opaque applicationId; commands, cwd, environment, services, URLs and ports cannot be supplied. Poll application.status until ready before opening the browser.',
     inputSchema: z.object({ applicationId: applicationIdSchema, operationId: operationIdSchema }).strict(),
     outputSchema: runSchema,
     annotations: { readOnlyHint: false, idempotentHint: true, destructiveHint: false, openWorldHint: false },
@@ -134,7 +134,7 @@ export function registerApplicationStartTool(server: McpServer, ctx: ToolContext
 export function registerApplicationStatusTool(server: McpServer, ctx: ToolContext): void {
   server.registerTool('application.status', {
     title: 'Read an application run status',
-    description: 'Returns bounded readiness for a reviewed application run. It exposes no command, log content, PID, path or environment value.',
+    description: 'Returns bounded readiness for a reviewed application run and each service. starting, ready and stopping are active states, not idle capacity; keep using this run and its current services until an explicit stop or terminal state. It exposes no command, log content, PID, path or environment value.',
     inputSchema: z.object({ applicationId: applicationIdSchema, runId: runIdSchema }).strict(),
     outputSchema: runSchema,
     annotations: { readOnlyHint: true, idempotentHint: true, destructiveHint: false, openWorldHint: false },

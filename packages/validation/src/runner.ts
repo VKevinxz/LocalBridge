@@ -17,7 +17,7 @@ import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import path from "node:path";
 
-import { LocalBridgeError, buildFilteredEnv, killProcessTree } from "@localbridge/shared";
+import { LocalBridgeError, buildFilteredEnv, killProcessTree, killProcessTreeAndWait } from "@localbridge/shared";
 
 /** Presupuesto de ingeniería para un perfil real (test/build), más generoso que el de Git. */
 const VALIDATION_TIMEOUT_MS = 120_000;
@@ -35,6 +35,8 @@ export interface ValidationRunResult {
 
 export interface RunValidationOptions {
   cwd: string;
+  signal?: AbortSignal;
+  onStarted?: () => void;
 }
 
 /**
@@ -91,6 +93,7 @@ export async function runValidationCommand(
 
   const startedAt = Date.now();
   const isWindows = process.platform === "win32";
+  if (options.signal?.aborted === true) throw new LocalBridgeError("ANALYSIS_CANCELLED");
 
   // Ver `resolvesToWindowsScriptShim`: el shell solo se activa para el
   // `.cmd`/`.bat` concreto que lo necesita, nunca a ciegas para todo Windows.
@@ -111,6 +114,7 @@ export async function runValidationCommand(
       // hay equivalente vía `spawn`; se usa `taskkill /T` más abajo.
       detached: !isWindows,
     });
+    options.onStarted?.();
 
     const stdoutChunks: Buffer[] = [];
     const stderrChunks: Buffer[] = [];
@@ -119,6 +123,18 @@ export async function runValidationCommand(
     let truncated = false;
     let killedForTruncation = false;
     let settled = false;
+    let aborted = false;
+    let childClosed = false;
+    let resolveChildClosed!: () => void;
+    const childClosedPromise = new Promise<void>((childCloseResolve) => { resolveChildClosed = childCloseResolve; });
+
+    const finishAborted = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      options.signal?.removeEventListener("abort", abort);
+      reject(new LocalBridgeError("ANALYSIS_CANCELLED"));
+    };
 
     const timer = setTimeout(() => {
       if (settled) return;
@@ -126,6 +142,20 @@ export async function runValidationCommand(
       reject(new LocalBridgeError("TIMEOUT"));
       settled = true;
     }, VALIDATION_TIMEOUT_MS);
+    const abort = () => {
+      if (settled || aborted) return;
+      aborted = true;
+      void killProcessTreeAndWait(child, isWindows).then(async () => {
+        if (!childClosed) {
+          await Promise.race([
+            childClosedPromise,
+            new Promise<void>((timeoutResolve) => setTimeout(timeoutResolve, 1_000)),
+          ]);
+        }
+        finishAborted();
+      });
+    };
+    options.signal?.addEventListener("abort", abort, { once: true });
 
     /** Devuelve el nuevo total de bytes acumulados para ese flujo; el llamante lo guarda. */
     function handleChunk(chunk: Buffer, chunks: Buffer[], bytesSoFar: number): number {
@@ -156,13 +186,18 @@ export async function runValidationCommand(
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      options.signal?.removeEventListener("abort", abort);
       reject(isEnoent(error) ? new LocalBridgeError("COMMAND_NOT_ALLOWED") : new LocalBridgeError("INTERNAL_ERROR"));
     });
 
     child.on("close", (code) => {
+      childClosed = true;
+      resolveChildClosed();
+      if (aborted) return;
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      options.signal?.removeEventListener("abort", abort);
 
       resolve({
         exitCode: code ?? -1,

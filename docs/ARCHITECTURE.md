@@ -88,8 +88,10 @@ sesiones nuevas de investigación y los navegadores derivados de listeners usan 
 `web.viewport` y `browser.viewport` permiten otros tamaños acotados y los restauran tras el
 handoff. El visor separa el render lógico de la presentación física: **Encajar** usa una
 escala uniforme y **1:1** desplaza una `View` recortada sin cambiar la página. El broker
-privado usa revisión 19 y el catálogo MCP contiene 100 tools. Las nueve operaciones
-aditivas de v1.7.0 se ejecutan como trabajos observables sobre el mismo broker.
+privado usa revisión 22 y el catálogo MCP contiene 113 tools. Las operaciones de v1.7.0
+siguen disponibles como trabajos individuales. En 1.8.0, un coordinador FIFO acotado
+ordena efectos por sesión y permite que sesiones independientes avancen juntas; captura
+motion conserva una exclusión global. Control humano y cierre eluden la cola ordinaria.
 
 ## Documentos y descargas
 
@@ -122,3 +124,10 @@ delete y stage pueden verificar assets administrados por streaming hasta 1 GiB.
 Configuración, proyectos, confianza y onboarding usan schemas versionados y escrituras
 atómicas. Las migraciones nunca conceden nuevas capacidades. Claves locales se cifran con
 el almacén de Windows y no se incluyen en exportaciones portables.
+
+Los lotes 1.8 reutilizan `AnalysisJobSupervisor`, el runner de validación y los
+controladores; no crean otro ejecutor. `task-batches.sqlite` persiste primero la relación
+padre/hijo, dependencias, huellas, estados, cobertura, métricas y recibos. Las
+especificaciones viven solo en memoria. Tras reinicio, trabajo no terminal queda
+interrumpido y nunca se reproduce automáticamente. Una caída de este journal aísla
+`task.*`; las tools individuales, Git, terminal y navegadores continúan.

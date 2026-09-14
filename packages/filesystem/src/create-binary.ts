@@ -45,6 +45,27 @@ export interface WorkspaceBinaryStreamWriter {
   write(chunk: Uint8Array): Promise<void>;
 }
 
+/**
+ * Validates an exclusive binary destination without creating directories or
+ * bytes. Long/compound effects use this before they mutate external state;
+ * publication still repeats every check under the mutation lock.
+ */
+export async function preflightWorkspaceBinaryFileCreate(
+  workspace: AuthorizedWorkspace,
+  relativePath: string,
+  options: { readonly expectedBytes?: number; readonly maximumBytes?: number } = {},
+): Promise<{ readonly path: string; readonly exists: false }> {
+  if (options.expectedBytes !== undefined) {
+    if (!Number.isSafeInteger(options.expectedBytes) || options.expectedBytes < 0) throw new LocalBridgeError('INVALID_INPUT');
+    const maximumBytes = validatedLimit(options.maximumBytes, workspace.limits.maxFileBytes, MAX_TRUSTED_BINARY_BYTES);
+    if (options.expectedBytes > maximumBytes) throw new LocalBridgeError('FILE_TOO_LARGE');
+  }
+  const target = await resolveWriteTarget(workspace.rootPath, relativePath, { createParentDirs: false });
+  if (isPathDenied(target.relativePath, workspace.denyPatterns)) throw new LocalBridgeError('PATH_DENIED');
+  if (target.exists) throw new LocalBridgeError('FILE_ALREADY_EXISTS');
+  return { path: target.relativePath, exists: false };
+}
+
 function validatedLimit(value: number | undefined, fallback: number, ceiling: number): number {
   const limit = value ?? fallback;
   if (!Number.isSafeInteger(limit) || limit < 1 || limit > ceiling) throw new LocalBridgeError("INVALID_INPUT");

@@ -6,6 +6,64 @@ Releases.
 
 ## [Unreleased]
 
+## [1.8.1] — 2026-09-14
+
+### Corregido
+
+- **Conectar** recuerda la clave de runtime después de confirmar una conexión válida y la
+  reutiliza al volver a abrir LocalBridge. El renderer recibe únicamente el estado de la
+  credencial; el secreto descifrado permanece en el proceso principal.
+- Las credenciales históricas de una instalación con un único perfil se migran al archivo
+  cifrado del perfil sin sobrescribir destinos ni adivinar entre varios perfiles.
+- Un fallo de guardado conserva el túnel activo y restaura la credencial anterior; la UI
+  diferencia ausencia, cifrado no disponible, blob ilegible y error de lectura.
+- Actividad permite plegar sesiones, log, cobertura documental, auditoría, lotes y grupos
+  de terminales. Las intervenciones permanecen visibles y `Contraer todo` no detiene nada.
+
+### Compatibilidad
+
+- Mantiene las 113 tools, permisos, jobs, cuotas, límites y contratos MCP de 1.8.0.
+- Solo persiste cuatro booleanos de presentación de Actividad; no guarda IDs de recursos,
+  contenido operativo ni secretos en `localStorage`.
+
+## [1.8.0] — 2026-09-12
+
+### Añadido
+
+- Inspección acotada de estilos y estado, secuencias de teclado, acciones con captura y
+  recarga explícita para navegadores locales y de Internet.
+- Espera de estabilidad, eventos de consola estructurados, lectura de terminal con espera
+  y regiones paginadas en diferencias visuales.
+- Cinco tools `task.*` para admitir, observar, esperar, retomar y cancelar lotes de
+  análisis y validaciones finitas sobre los supervisores existentes.
+- Actividad muestra lotes, hijos, causas de espera, progreso parcial y cancelación sin
+  asociar el trabajo a una sola conversación.
+
+### Corregido
+
+- Las comparaciones temporales pueden alinear por scroll observado y advierten cuando
+  posición, tiempo, visibilidad, reducción de movimiento o calidad de captura no son
+  comparables.
+- `browser.press` y su equivalente web conservan errores tipados; las secuencias detienen
+  el siguiente paso si el foco llega a un campo sensible o comienza control humano.
+- La recarga separa navegación actual de historial y los límites agotados indican recurso,
+  alcance, recuperación y acción recomendada.
+
+### Seguridad, continuidad y rendimiento
+
+- El broker privado usa revisión 22 y el catálogo suma 113 tools; las 100 anteriores se
+  conservan.
+- La admisión de lotes prevalida todos los hijos antes del recibo y del primer efecto,
+  deduplica intenciones concurrentes y guarda solo metadata/huellas/recibos. El trabajo
+  incompleto no se reproduce tras reinicio.
+- El runtime ordena efectos por identidad de navegador, conserva exclusión global para
+  motion y da prioridad a control humano y cierre. Validaciones reutilizan el mutex por
+  workspace y pueden solaparse entre workspaces distintos.
+- Límites: 24 hijos por lote, 32 lotes y 256 hijos no terminales, 32 esperas, 2 MiB por
+  resultado de validación, 16 MiB agregados y hasta 512 lotes durante siete días.
+- El benchmark conserva los pools anteriores: no se ampliaron contadores sin demostrar
+  beneficio y equivalencia.
+
 ## [1.7.0] — 2026-09-11
 
 ### Añadido

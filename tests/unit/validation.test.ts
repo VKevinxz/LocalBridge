@@ -74,6 +74,19 @@ describe('runValidationCommand — proceso real', () => {
 
     expect(result.stdout).toContain('marker.txt');
   });
+
+  it('cancela el árbol finito administrado sin esperar el timeout global', async () => {
+    const controller = new AbortController();
+    let signalStarted!: () => void;
+    const started = new Promise<void>((resolve) => { signalStarted = resolve; });
+    const pending = runValidationCommand(
+      nodeCommand('setInterval(() => process.stdout.write("alive\\n"), 50);'),
+      { cwd: workspace.root, signal: controller.signal, onStarted: signalStarted },
+    );
+    await started;
+    controller.abort();
+    await expect(pending).rejects.toMatchObject({ code: 'ANALYSIS_CANCELLED' });
+  });
 });
 
 describe('runValidationCommand — envoltorios .cmd de Windows (regresión)', () => {
@@ -181,5 +194,27 @@ describe('runValidation — resolución de perfil', () => {
     void a;
 
     expect(marks).toEqual(['lento', 'rapido']);
+  });
+
+  it('expone adquisición/liberación del lock y permite avanzar a workspaces independientes', async () => {
+    let activeLocks = 0;
+    let maximumActiveLocks = 0;
+    const command = nodeCommand('setTimeout(() => process.exit(0), 150);');
+    const first = buildWorkspace({ id: 'ws_validation_a', rootPath: workspace.root, validationProfiles: { qa: command } });
+    const otherRoot = path.join(workspace.root, 'other');
+    await mkdir(otherRoot);
+    const second = buildWorkspace({ id: 'ws_validation_b', rootPath: otherRoot, validationProfiles: { qa: command } });
+    const lifecycle = () => ({
+      onLockAcquired: () => {
+        activeLocks += 1;
+        maximumActiveLocks = Math.max(maximumActiveLocks, activeLocks);
+      },
+      onLockReleased: () => { activeLocks -= 1; },
+    });
+
+    await Promise.all([runValidation(first, 'qa', lifecycle()), runValidation(second, 'qa', lifecycle())]);
+
+    expect(maximumActiveLocks).toBe(2);
+    expect(activeLocks).toBe(0);
   });
 });

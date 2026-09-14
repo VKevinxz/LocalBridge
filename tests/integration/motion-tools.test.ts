@@ -125,7 +125,27 @@ function pngBytes(red: number): Buffer {
   return PNG.sync.write(png);
 }
 
-async function writeMotionBundle(root: string, bundle: string, reds: readonly number[], progress = [0, 0.5, 1]) {
+interface MotionBundleOverrides {
+  readonly progress?: readonly number[];
+  readonly scrollY?: readonly number[];
+  readonly captureMode?: 'stepped' | 'screencast';
+  readonly temporalFidelity?: 'sampled' | 'continuous';
+  readonly visibility?: string;
+  readonly prefersReducedMotion?: boolean;
+  readonly durationMs?: number;
+  readonly droppedFrames?: number;
+}
+
+async function writeMotionBundle(
+  root: string,
+  bundle: string,
+  reds: readonly number[],
+  overrides: MotionBundleOverrides | readonly number[] = {},
+) {
+  const options: MotionBundleOverrides = Array.isArray(overrides)
+    ? { progress: [...overrides] as number[] }
+    : overrides as MotionBundleOverrides;
+  const progress = options.progress ?? [0, 0.5, 1];
   const frameDir = path.join(root, bundle, 'frames');
   await mkdir(frameDir, { recursive: true });
   const samples = [];
@@ -134,7 +154,8 @@ async function writeMotionBundle(root: string, bundle: string, reds: readonly nu
     const framePath = `frames/frame-${String(index).padStart(3, '0')}.png`;
     await writeFile(path.join(root, bundle, framePath), bytes);
     samples.push({
-      index, progress: progress[index], elapsedMs: index * 400, scrollX: 0, scrollY: index * 400,
+      index, progress: progress[index], elapsedMs: index * 400, scrollX: 0,
+      scrollY: options.scrollY?.[index] ?? index * 400,
       path: framePath, sha256: createHash('sha256').update(bytes).digest('hex'), size: bytes.length,
       activeAnimationCount: index === 1 ? 1 : 0,
     });
@@ -142,9 +163,14 @@ async function writeMotionBundle(root: string, bundle: string, reds: readonly nu
   const manifest = {
     formatVersion: 1, kind: 'localbridge-motion-trace', sourceFamily: 'browser', source: { path: '/' },
     viewport: { width: 8, height: 6, deviceScaleFactor: 1 },
-    environment: { prefersReducedMotion: false, visibility: 'visible', captureMode: 'stepped', temporalFidelity: 'sampled' },
-    trajectory: { axis: 'y', start: 0, end: 800, durationMs: 800, progress },
-    samples, droppedFrames: 0, warnings: [], truncated: false,
+    environment: {
+      prefersReducedMotion: options.prefersReducedMotion ?? false,
+      visibility: options.visibility ?? 'visible',
+      captureMode: options.captureMode ?? 'stepped',
+      temporalFidelity: options.temporalFidelity ?? 'sampled',
+    },
+    trajectory: { axis: 'y', start: 0, end: 800, durationMs: options.durationMs ?? 800, progress },
+    samples, droppedFrames: options.droppedFrames ?? 0, warnings: [], truncated: false,
   };
   await writeFile(path.join(root, bundle, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`);
 }
@@ -205,5 +231,70 @@ describe('visual.motion.compare', () => {
       operationId: 'motion_tampered_1',
     });
     expect(tampered.parsed.error).toMatchObject({ code: 'MOTION_BUNDLE_INVALID' });
+  });
+
+  it('advierte cuando el progreso nominal oculta scroll real o entornos distintos', async () => {
+    const root = path.join(os.tmpdir(), `localbridge-motion-evidence-${randomUUID()}`);
+    const configPath = path.join(root, 'workspaces.json');
+    await writeRegistryFile(configPath, [buildWorkspace({ id: 'ws_motion_evidence', rootPath: root, permissions: {
+      read: true, write: true, overwrite: false, gitRead: false, validations: false, gitWrite: false,
+    } })]);
+    await writeMotionBundle(root, 'reference.lbmotion', [10, 20, 30], {
+      scrollY: [0, 400, 800], captureMode: 'screencast', temporalFidelity: 'continuous', droppedFrames: 90,
+    });
+    await writeMotionBundle(root, 'candidate.lbmotion', [10, 20, 30], {
+      scrollY: [0, 417, 800], visibility: 'hidden', prefersReducedMotion: true, durationMs: 900,
+    });
+    harness = await createHarness({ pinProtocol: TARGET_PROTOCOL_REVISION, workspaceConfigPath: configPath });
+
+    const result = await callToolJson(harness.client, 'visual.motion.compare', {
+      workspaceId: 'ws_motion_evidence', referenceManifestPath: 'reference.lbmotion/manifest.json',
+      candidateManifestPath: 'candidate.lbmotion/manifest.json', path: 'evidence-diff.lbmotion',
+      operationId: 'motion_evidence_1',
+    });
+
+    expect(result.isError).toBe(false);
+    expect(result.parsed).toMatchObject({ averageMismatchRatio: 0, maximumMismatchRatio: 0 });
+    expect(result.parsed.warnings).toEqual(expect.arrayContaining([
+      expect.stringContaining('17 CSS px'),
+      expect.stringContaining('capture modes differ'),
+      expect.stringContaining('durations differ'),
+      expect.stringContaining('visibility differs'),
+      expect.stringContaining('reduced-motion preference differs'),
+      expect.stringContaining('90 intermediate screencast events'),
+    ]));
+    const report = JSON.parse(await readFile(path.join(root, 'evidence-diff.lbmotion', 'report.json'), 'utf8')) as { warnings: string[] };
+    expect(report.warnings).toEqual(result.parsed.warnings);
+  });
+
+  it('alinea por scroll observado sin reutilizar ni interpolar muestras', async () => {
+    const root = path.join(os.tmpdir(), `localbridge-motion-position-${randomUUID()}`);
+    await mkdir(root, { recursive: true });
+    await writeMotionBundle(root, 'reference.lbmotion', [10, 20, 30, 40], { scrollY: [0, 100, 200, 300], progress: [0, 0.33, 0.66, 1] });
+    await writeMotionBundle(root, 'candidate.lbmotion', [10, 20, 30, 40], { scrollY: [0, 102, 200, 450], progress: [0, 0.25, 0.75, 1] });
+    const configPath = path.join(root, 'workspaces.json');
+    await writeRegistryFile(configPath, [buildWorkspace({ id: 'ws_motion_position', rootPath: root, permissions: {
+      read: true, write: true, overwrite: false, gitRead: false, validations: false, gitWrite: false,
+    } })]);
+    harness = await createHarness({ pinProtocol: TARGET_PROTOCOL_REVISION, workspaceConfigPath: configPath });
+
+    const result = await callToolJson(harness.client, 'visual.motion.compare', {
+      workspaceId: 'ws_motion_position', referenceManifestPath: 'reference.lbmotion/manifest.json',
+      candidateManifestPath: 'candidate.lbmotion/manifest.json', path: 'position-diff.lbmotion',
+      alignment: 'scroll-position', scrollTolerancePx: 2, operationId: 'motion_position_1',
+    });
+
+    expect(result.isError).toBe(false);
+    expect(result.parsed).toMatchObject({
+      alignment: 'scroll-position', frameCount: 3,
+      coverage: {
+        matchedPairs: 3, referenceSamples: 4, candidateSamples: 4,
+        unmatchedReference: [3], unmatchedCandidate: [3], fitness: 'incomplete',
+      },
+      quality: { reference: 'unknown', candidate: 'unknown' },
+    });
+    const differences = result.parsed['differences'] as Array<Record<string, unknown>>;
+    expect(differences.map((item) => [item['referenceIndex'], item['candidateIndex']])).toEqual([[0, 0], [1, 1], [2, 2]]);
+    expect(JSON.stringify(result.parsed['warnings'])).toContain('unmatched samples');
   });
 });

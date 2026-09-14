@@ -5,6 +5,8 @@ import type { TerminalSupervisor } from './terminal-supervisor.js';
 import type { ResolvedTerminalListener } from './terminal-supervisor.js';
 import { DEVELOPMENT_BROKER_PROTOCOL } from './protocol.js';
 import type { AnalysisJobRequest, AnalysisJobSnapshot } from './analysis-job-supervisor.js';
+import type { TaskBatchRequest, TaskBatchSnapshot } from './task-batch-supervisor.js';
+import { RuntimeResourceCoordinator, runtimeResourceKey } from './runtime-resource-coordinator.js';
 
 export type BrowserCondition =
   | { readonly kind: 'path'; readonly value: string; readonly operator: 'equals' | 'contains' }
@@ -13,13 +15,17 @@ export type BrowserCondition =
   | { readonly kind: 'element'; readonly snapshotId: string; readonly elementRef: string; readonly state: 'attached' | 'visible' | 'enabled' | 'checked' | 'selected'; readonly expected: boolean }
   | { readonly kind: 'response'; readonly path: string; readonly status?: number; readonly afterCursor: number }
   | { readonly kind: 'no-console-errors'; readonly afterCursor: number }
-  | { readonly kind: 'dialog'; readonly state: 'open' | 'closed' };
+  | { readonly kind: 'dialog'; readonly state: 'open' | 'closed' }
+  | { readonly kind: 'stable'; readonly snapshotId: string; readonly elementRef: string; readonly intervalMs: number; readonly tolerancePx: number };
+
+export type BrowserAssertionCondition = Exclude<BrowserCondition, { readonly kind: 'stable' }>;
 
 export type WebWaitCondition =
   | { readonly kind: 'load' }
   | { readonly kind: 'url'; readonly value: string; readonly operator: 'equals' | 'contains' }
   | { readonly kind: 'title'; readonly value: string; readonly operator: 'equals' | 'contains' }
-  | { readonly kind: 'text'; readonly value: string; readonly state: 'present' | 'absent' };
+  | { readonly kind: 'text'; readonly value: string; readonly state: 'present' | 'absent' }
+  | { readonly kind: 'stable'; readonly snapshotId: string; readonly elementRef: string; readonly intervalMs: number; readonly tolerancePx: number };
 
 export interface BrowserApplicationListenerInput {
   readonly service: string;
@@ -50,6 +56,13 @@ export interface DevelopmentRuntimeHandlerOptions {
     status(workspaceId: string, jobId: string, cursor: number, maxItems: number): unknown;
     cancel(workspaceId: string, jobId: string): AnalysisJobSnapshot;
   };
+  readonly tasks?: {
+    runMany(request: TaskBatchRequest): Promise<TaskBatchSnapshot>;
+    list(workspaceId: string, cursor: number, limit: number): unknown;
+    statusMany(workspaceId: string, batchId: string, localIds: readonly string[] | undefined, cursor: number, limit: number): unknown;
+    waitMany(workspaceId: string, batchId: string, afterRevision: number, condition: 'changed' | 'all_finished', waitMs: number): Promise<unknown>;
+    cancelMany(workspaceId: string, batchId: string, localIds: readonly string[] | undefined, operationId: string): TaskBatchSnapshot;
+  };
   readonly browser?: {
     start(workspaceId: string, profile: string, operationId?: string): Promise<unknown>;
     startFromProcess(workspaceId: string, listener: ResolvedProcessListener, operationId?: string): Promise<unknown>;
@@ -57,19 +70,26 @@ export interface DevelopmentRuntimeHandlerOptions {
     startApplication(workspaceId: string, application: string, listeners: readonly BrowserApplicationListenerInput[], operationId?: string): Promise<unknown>;
     list(workspaceId: string): Promise<unknown>;
     navigate(workspaceId: string, sessionId: string, path: string, operationId?: string): Promise<unknown>;
+    reload(workspaceId: string, sessionId: string, mode: 'normal' | 'ignore-cache', operationId: string): Promise<unknown>;
     snapshot(workspaceId: string, sessionId: string, maxDepth: number, maxElements: number): Promise<unknown>;
-    screenshot(workspaceId: string, sessionId: string): Promise<unknown>;
-    saveScreenshot(workspaceId: string, sessionId: string, path: string, operationId: string): Promise<unknown>;
+    screenshot(workspaceId: string, sessionId: string, settleMs?: number): Promise<unknown>;
+    saveScreenshot(workspaceId: string, sessionId: string, path: string, operationId: string, settleMs?: number): Promise<unknown>;
     inspectMotion(workspaceId: string, sessionId: string, maxAnimations: number): Promise<unknown>;
     captureMotion(workspaceId: string, sessionId: string, path: string, trajectory: MotionTrajectoryInput, settleBeforeMs: number, captureMode: 'auto' | 'stepped' | 'screencast', operationId: string): Promise<unknown>;
     setViewport(workspaceId: string, sessionId: string, width: number, height: number, mobile: boolean, operationId?: string): Promise<unknown>;
-    events(workspaceId: string, sessionId: string, cursor: number, maxBytes: number): Promise<unknown>;
-    assert(workspaceId: string, sessionId: string, condition: BrowserCondition): Promise<unknown>;
+    events(workspaceId: string, sessionId: string, cursor: number, maxBytes: number, scope: 'history' | 'current-navigation'): Promise<unknown>;
+    inspect(workspaceId: string, sessionId: string, target: 'element' | 'active', snapshotId: string | undefined, elementRef: string | undefined, cssProperties: readonly string[], cssVariables: readonly string[]): Promise<unknown>;
+    assert(workspaceId: string, sessionId: string, condition: BrowserAssertionCondition): Promise<unknown>;
     wait(workspaceId: string, sessionId: string, condition: BrowserCondition, timeoutMs: number): Promise<unknown>;
     click(workspaceId: string, sessionId: string, snapshotId: string, elementRef: string, operationId?: string): Promise<unknown>;
     fill(workspaceId: string, sessionId: string, snapshotId: string, elementRef: string, text: string, operationId?: string): Promise<unknown>;
     hover(workspaceId: string, sessionId: string, snapshotId: string, elementRef: string, operationId?: string): Promise<unknown>;
     press(workspaceId: string, sessionId: string, snapshotId: string, elementRef: string, key: string, operationId?: string): Promise<unknown>;
+    keyboardSequence(workspaceId: string, sessionId: string, snapshotId: string, elementRef: string, keys: readonly string[], operationId: string): Promise<unknown>;
+    actionCapture(workspaceId: string, sessionId: string, snapshotId: string, elementRef: string,
+      action: { readonly kind: 'click' | 'hover' } | { readonly kind: 'key'; readonly key: string },
+      wait: { readonly kind: 'delay'; readonly settleMs: number } | { readonly kind: 'stable'; readonly intervalMs: number; readonly tolerancePx: number; readonly timeoutMs: number; readonly allowUnstable: boolean },
+      output: { readonly kind: 'inline' } | { readonly kind: 'save'; readonly workspaceId: string; readonly path: string }, operationId: string): Promise<unknown>;
     scroll(workspaceId: string, sessionId: string, direction: 'up' | 'down' | 'left' | 'right', amount: number, operationId?: string): Promise<unknown>;
     select(workspaceId: string, sessionId: string, snapshotId: string, elementRef: string, value: string, operationId?: string): Promise<unknown>;
     drag(workspaceId: string, sessionId: string, snapshotId: string, elementRef: string, targetElementRef: string, operationId?: string): Promise<unknown>;
@@ -88,10 +108,12 @@ export interface DevelopmentRuntimeHandlerOptions {
     open(sessionId: string, url: string, operationId?: string): Promise<unknown>;
     closeTab(sessionId: string, tabId: string, operationId?: string): Promise<unknown>;
     navigate(sessionId: string, tabId: string, url: string, operationId?: string): Promise<unknown>;
+    reload(sessionId: string, tabId: string, mode: 'normal' | 'ignore-cache', operationId: string): Promise<unknown>;
     back(sessionId: string, tabId: string, operationId?: string): Promise<unknown>;
     snapshot(sessionId: string, tabId: string, maxDepth: number, maxElements: number): Promise<unknown>;
-    screenshot(sessionId: string, tabId: string): Promise<unknown>;
-    saveScreenshot(sessionId: string, tabId: string, workspaceId: string, path: string, operationId: string): Promise<unknown>;
+    inspect(sessionId: string, tabId: string, target: 'element' | 'active', snapshotId: string | undefined, elementRef: string | undefined, cssProperties: readonly string[], cssVariables: readonly string[]): Promise<unknown>;
+    screenshot(sessionId: string, tabId: string, settleMs?: number): Promise<unknown>;
+    saveScreenshot(sessionId: string, tabId: string, workspaceId: string, path: string, operationId: string, settleMs?: number): Promise<unknown>;
     inspectMotion(sessionId: string, tabId: string, maxAnimations: number): Promise<unknown>;
     captureMotion(sessionId: string, tabId: string, workspaceId: string, path: string, trajectory: MotionTrajectoryInput, settleBeforeMs: number, captureMode: 'auto' | 'stepped' | 'screencast', operationId: string): Promise<unknown>;
     extract(sessionId: string, tabId: string, maxChars: number): Promise<unknown>;
@@ -103,6 +125,11 @@ export interface DevelopmentRuntimeHandlerOptions {
     select(sessionId: string, tabId: string, snapshotId: string, elementRef: string, value: string, operationId?: string): Promise<unknown>;
     scroll(sessionId: string, tabId: string, direction: 'up' | 'down' | 'left' | 'right', amount: number, operationId?: string): Promise<unknown>;
     press(sessionId: string, tabId: string, snapshotId: string, elementRef: string, key: string, operationId?: string): Promise<unknown>;
+    keyboardSequence(sessionId: string, tabId: string, snapshotId: string, elementRef: string, keys: readonly string[], operationId: string): Promise<unknown>;
+    actionCapture(sessionId: string, tabId: string, snapshotId: string, elementRef: string,
+      action: { readonly kind: 'click' } | { readonly kind: 'key'; readonly key: string },
+      wait: { readonly kind: 'delay'; readonly settleMs: number } | { readonly kind: 'stable'; readonly intervalMs: number; readonly tolerancePx: number; readonly timeoutMs: number; readonly allowUnstable: boolean },
+      output: { readonly kind: 'inline' } | { readonly kind: 'save'; readonly workspaceId: string; readonly path: string }, operationId: string): Promise<unknown>;
     wait(sessionId: string, tabId: string, condition: WebWaitCondition, timeoutMs: number): Promise<unknown>;
     requestHumanControl(sessionId: string, reason: 'sign_in' | 'file_selection' | 'manual_step', operationId: string): Promise<unknown>;
     humanControlStatus(sessionId: string): Promise<unknown>;
@@ -110,9 +137,11 @@ export interface DevelopmentRuntimeHandlerOptions {
 }
 
 export function createDevelopmentRuntimeHandler(options: DevelopmentRuntimeHandlerOptions): BrokerHandler {
+  const resources = new RuntimeResourceCoordinator();
   return async ({ method, params }) => {
     const input = params as Record<string, unknown>;
     const workspaceId = String(input['workspaceId'] ?? '');
+    const dispatch = async (): Promise<unknown> => {
     switch (method) {
       case 'broker.ping':
         return { ready: true, protocol: DEVELOPMENT_BROKER_PROTOCOL };
@@ -137,6 +166,21 @@ export function createDevelopmentRuntimeHandler(options: DevelopmentRuntimeHandl
       case 'analysis.cancel':
         if (options.analysis === undefined) break;
         return options.analysis.cancel(workspaceId, String(input['jobId']));
+      case 'task.runMany':
+        if (options.tasks === undefined) break;
+        return options.tasks.runMany(params as TaskBatchRequest);
+      case 'task.list':
+        if (options.tasks === undefined) break;
+        return options.tasks.list(workspaceId, Number(input['cursor']), Number(input['limit']));
+      case 'task.statusMany':
+        if (options.tasks === undefined) break;
+        return options.tasks.statusMany(workspaceId, String(input['batchId']), input['localIds'] as string[] | undefined, Number(input['cursor']), Number(input['limit']));
+      case 'task.waitMany':
+        if (options.tasks === undefined) break;
+        return options.tasks.waitMany(workspaceId, String(input['batchId']), Number(input['afterRevision']), input['condition'] as 'changed' | 'all_finished', Number(input['waitMs']));
+      case 'task.cancelMany':
+        if (options.tasks === undefined) break;
+        return options.tasks.cancelMany(workspaceId, String(input['batchId']), input['localIds'] as string[] | undefined, String(input['operationId']));
       case 'terminal.start':
         if (options.terminals === undefined) break;
         return options.terminals.start(String(input['projectId']), input['operationId'] as string | undefined);
@@ -148,7 +192,7 @@ export function createDevelopmentRuntimeHandler(options: DevelopmentRuntimeHandl
         return options.terminals.write(String(input['projectId']), String(input['sessionId']), String(input['text']), input['operationId'] as string | undefined);
       case 'terminal.read':
         if (options.terminals === undefined) break;
-        return options.terminals.read(String(input['projectId']), String(input['sessionId']), Number(input['cursor']), Number(input['maxBytes']));
+        return options.terminals.read(String(input['projectId']), String(input['sessionId']), Number(input['cursor']), Number(input['maxBytes']), Number(input['waitMs']));
       case 'terminal.status':
         if (options.terminals === undefined) break;
         return options.terminals.status(String(input['projectId']), String(input['sessionId']));
@@ -231,15 +275,18 @@ export function createDevelopmentRuntimeHandler(options: DevelopmentRuntimeHandl
       case 'browser.navigate':
         if (options.browser === undefined) break;
         return options.browser.navigate(workspaceId, String(input['sessionId']), String(input['path']), input['operationId'] as string | undefined);
+      case 'browser.reload':
+        if (options.browser === undefined) break;
+        return options.browser.reload(workspaceId, String(input['sessionId']), input['mode'] as 'normal' | 'ignore-cache', String(input['operationId']));
       case 'browser.snapshot':
         if (options.browser === undefined) break;
         return options.browser.snapshot(workspaceId, String(input['sessionId']), Number(input['maxDepth']), Number(input['maxElements']));
       case 'browser.screenshot':
         if (options.browser === undefined) break;
-        return options.browser.screenshot(workspaceId, String(input['sessionId']));
+        return options.browser.screenshot(workspaceId, String(input['sessionId']), Number(input['settleMs']));
       case 'browser.screenshot.save':
         if (options.browser === undefined) break;
-        return options.browser.saveScreenshot(workspaceId, String(input['sessionId']), String(input['path']), String(input['operationId']));
+        return options.browser.saveScreenshot(workspaceId, String(input['sessionId']), String(input['path']), String(input['operationId']), Number(input['settleMs']));
       case 'browser.motion.inspect':
         if (options.browser === undefined) break;
         return options.browser.inspectMotion(workspaceId, String(input['sessionId']), Number(input['maxAnimations']));
@@ -266,10 +313,21 @@ export function createDevelopmentRuntimeHandler(options: DevelopmentRuntimeHandl
         );
       case 'browser.events':
         if (options.browser === undefined) break;
-        return options.browser.events(workspaceId, String(input['sessionId']), Number(input['cursor']), Number(input['maxBytes']));
+        return options.browser.events(workspaceId, String(input['sessionId']), Number(input['cursor']), Number(input['maxBytes']), input['scope'] as 'history' | 'current-navigation');
+      case 'browser.inspect':
+        if (options.browser === undefined) break;
+        return options.browser.inspect(
+          workspaceId,
+          String(input['sessionId']),
+          input['target'] as 'element' | 'active',
+          input['snapshotId'] as string | undefined,
+          input['elementRef'] as string | undefined,
+          input['cssProperties'] as string[],
+          input['cssVariables'] as string[],
+        );
       case 'browser.assert':
         if (options.browser === undefined) break;
-        return options.browser.assert(workspaceId, String(input['sessionId']), input['condition'] as BrowserCondition);
+        return options.browser.assert(workspaceId, String(input['sessionId']), input['condition'] as BrowserAssertionCondition);
       case 'browser.wait':
         if (options.browser === undefined) break;
         return options.browser.wait(workspaceId, String(input['sessionId']), input['condition'] as BrowserCondition, Number(input['timeoutMs']));
@@ -285,6 +343,15 @@ export function createDevelopmentRuntimeHandler(options: DevelopmentRuntimeHandl
       case 'browser.press':
         if (options.browser === undefined) break;
         return options.browser.press(workspaceId, String(input['sessionId']), String(input['snapshotId']), String(input['elementRef']), String(input['key']), input['operationId'] as string | undefined);
+      case 'browser.keyboard.sequence':
+        if (options.browser === undefined) break;
+        return options.browser.keyboardSequence(workspaceId, String(input['sessionId']), String(input['snapshotId']), String(input['elementRef']), input['keys'] as string[], String(input['operationId']));
+      case 'browser.action.capture':
+        if (options.browser === undefined) break;
+        return options.browser.actionCapture(workspaceId, String(input['sessionId']), String(input['snapshotId']), String(input['elementRef']),
+          input['action'] as { kind: 'click' | 'hover' } | { kind: 'key'; key: string },
+          input['wait'] as { kind: 'delay'; settleMs: number } | { kind: 'stable'; intervalMs: number; tolerancePx: number; timeoutMs: number; allowUnstable: boolean },
+          input['output'] as { kind: 'inline' } | { kind: 'save'; workspaceId: string; path: string }, String(input['operationId']));
       case 'browser.scroll':
         if (options.browser === undefined) break;
         return options.browser.scroll(workspaceId, String(input['sessionId']), input['direction'] as 'up' | 'down' | 'left' | 'right', Number(input['amount']), input['operationId'] as string | undefined);
@@ -335,18 +402,32 @@ export function createDevelopmentRuntimeHandler(options: DevelopmentRuntimeHandl
       case 'web.navigate':
         if (options.web === undefined) break;
         return options.web.navigate(String(input['sessionId']), String(input['tabId']), String(input['url']), input['operationId'] as string | undefined);
+      case 'web.reload':
+        if (options.web === undefined) break;
+        return options.web.reload(String(input['sessionId']), String(input['tabId']), input['mode'] as 'normal' | 'ignore-cache', String(input['operationId']));
       case 'web.back':
         if (options.web === undefined) break;
         return options.web.back(String(input['sessionId']), String(input['tabId']), input['operationId'] as string | undefined);
       case 'web.snapshot':
         if (options.web === undefined) break;
         return options.web.snapshot(String(input['sessionId']), String(input['tabId']), Number(input['maxDepth']), Number(input['maxElements']));
+      case 'web.inspect':
+        if (options.web === undefined) break;
+        return options.web.inspect(
+          String(input['sessionId']),
+          String(input['tabId']),
+          input['target'] as 'element' | 'active',
+          input['snapshotId'] as string | undefined,
+          input['elementRef'] as string | undefined,
+          input['cssProperties'] as string[],
+          input['cssVariables'] as string[],
+        );
       case 'web.screenshot':
         if (options.web === undefined) break;
-        return options.web.screenshot(String(input['sessionId']), String(input['tabId']));
+        return options.web.screenshot(String(input['sessionId']), String(input['tabId']), Number(input['settleMs']));
       case 'web.screenshot.save':
         if (options.web === undefined) break;
-        return options.web.saveScreenshot(String(input['sessionId']), String(input['tabId']), String(input['workspaceId']), String(input['path']), String(input['operationId']));
+        return options.web.saveScreenshot(String(input['sessionId']), String(input['tabId']), String(input['workspaceId']), String(input['path']), String(input['operationId']), Number(input['settleMs']));
       case 'web.motion.inspect':
         if (options.web === undefined) break;
         return options.web.inspectMotion(String(input['sessionId']), String(input['tabId']), Number(input['maxAnimations']));
@@ -389,6 +470,15 @@ export function createDevelopmentRuntimeHandler(options: DevelopmentRuntimeHandl
       case 'web.press':
         if (options.web === undefined) break;
         return options.web.press(String(input['sessionId']), String(input['tabId']), String(input['snapshotId']), String(input['elementRef']), String(input['key']), input['operationId'] as string | undefined);
+      case 'web.keyboard.sequence':
+        if (options.web === undefined) break;
+        return options.web.keyboardSequence(String(input['sessionId']), String(input['tabId']), String(input['snapshotId']), String(input['elementRef']), input['keys'] as string[], String(input['operationId']));
+      case 'web.action.capture':
+        if (options.web === undefined) break;
+        return options.web.actionCapture(String(input['sessionId']), String(input['tabId']), String(input['snapshotId']), String(input['elementRef']),
+          input['action'] as { kind: 'click' } | { kind: 'key'; key: string },
+          input['wait'] as { kind: 'delay'; settleMs: number } | { kind: 'stable'; intervalMs: number; tolerancePx: number; timeoutMs: number; allowUnstable: boolean },
+          input['output'] as { kind: 'inline' } | { kind: 'save'; workspaceId: string; path: string }, String(input['operationId']));
       case 'web.wait':
         if (options.web === undefined) break;
         return options.web.wait(String(input['sessionId']), String(input['tabId']), input['condition'] as WebWaitCondition, Number(input['timeoutMs']));
@@ -402,5 +492,12 @@ export function createDevelopmentRuntimeHandler(options: DevelopmentRuntimeHandl
         break;
     }
     throw new DevelopmentBrokerError('FEATURE_UNAVAILABLE', 'La capacidad todavía no está disponible.');
+    };
+    if (method === 'browser.human.request') resources.cancelPending(`browser:${workspaceId}:${String(input['sessionId'])}`, 'HUMAN_CONTROL_ACTIVE');
+    if (method === 'web.human.request') resources.cancelPending(`web:${String(input['sessionId'])}`, 'HUMAN_CONTROL_ACTIVE');
+    if (method === 'browser.stop') resources.cancelPending(`browser:${workspaceId}:${String(input['sessionId'])}`, 'SESSION_NOT_FOUND');
+    if (method === 'web.stop') resources.cancelPending(`web:${String(input['sessionId'])}`, 'SESSION_NOT_FOUND');
+    const resource = runtimeResourceKey(method, input);
+    return resource === undefined ? dispatch() : resources.run(resource, dispatch);
   };
 }

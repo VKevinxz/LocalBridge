@@ -34,9 +34,17 @@ function client(ctx: ToolContext) {
   return ctx.developmentClient;
 }
 
-function mapBrokerError(error: unknown): unknown {
+function mapBrokerError(error: unknown, rateLimit?: Record<string, unknown>): unknown {
   if (!(error instanceof DevelopmentBrokerError)) return error;
-  if ((ERROR_CODES as readonly string[]).includes(error.code)) return new LocalBridgeError(error.code as ErrorCode);
+  if ((ERROR_CODES as readonly string[]).includes(error.code)) {
+    const causeCode = error.causeCode !== undefined && (ERROR_CODES as readonly string[]).includes(error.causeCode)
+      ? error.causeCode
+      : undefined;
+    return new LocalBridgeError(error.code as ErrorCode, {
+      ...(causeCode === undefined ? {} : { causeCode }),
+      ...(error.code === 'RATE_LIMITED' && rateLimit !== undefined ? { rateLimit } : {}),
+    });
+  }
   return new LocalBridgeError('INTERNAL_ERROR');
 }
 
@@ -66,7 +74,10 @@ export function registerProcessStartTool(server: McpServer, ctx: ToolContext): v
       const result = await client(ctx).call('process.start', { workspaceId, profile, operationId });
       return toolSuccess(processSummarySchema.parse(result), { context: auditBase, logger: ctx.logger });
     } catch (error) {
-      return toolError(mapBrokerError(error), ctx.logger, { tool: 'process.start', workspaceId, profile }, auditBase);
+      return toolError(mapBrokerError(error, {
+        resource: 'managed-processes', scope: 'project',
+        recoveryTool: 'process.list', action: 'list-and-reuse',
+      }), ctx.logger, { tool: 'process.start', workspaceId, profile }, auditBase);
     }
   });
 }
@@ -75,7 +86,7 @@ export function registerProcessListTool(server: McpServer, ctx: ToolContext): vo
   const outputSchema = z.object({ processes: z.array(processSummarySchema) });
   server.registerTool('process.list', {
     title: 'List development processes',
-    description: 'Lists LocalBridge-managed processes for one authorized workspace without exposing operating-system PIDs or commands. Requires the processes capability.',
+    description: 'Lists LocalBridge-managed processes for one authorized workspace. Call it before process.start after reconnecting or from another conversation, reuse a compatible running profile, and call process.listeners for current listener references. running means the managed process is active, not idle or safe to replace. It exposes no operating-system PIDs or commands. Requires the processes capability.',
     inputSchema: z.object(workspaceInput).strict(),
     outputSchema,
     annotations: { readOnlyHint: true, idempotentHint: true, destructiveHint: false, openWorldHint: false },
@@ -120,7 +131,7 @@ export function registerProcessLogsTool(server: McpServer, ctx: ToolContext): vo
   });
   server.registerTool('process.logs', {
     title: 'Read bounded process logs',
-    description: 'Reads a bounded cursor-based window of stdout/stderr from a LocalBridge-managed process. Requires the processes capability.',
+    description: 'Reads a bounded cursor-based window of stdout/stderr from a LocalBridge-managed process. A quiet running process has not thereby completed; use its terminal state or a finite validation/profile result when an exit code is required. Requires the processes capability.',
     inputSchema: z.object({ ...workspaceInput, processId: processIdSchema, cursor: z.number().int().nonnegative().default(0), maxBytes: z.number().int().min(1).max(65_536).default(65_536) }).strict(),
     outputSchema,
     annotations: { readOnlyHint: true, idempotentHint: true, destructiveHint: false, openWorldHint: false },

@@ -577,6 +577,44 @@ export interface ErrorPayload {
     readonly message: string;
     readonly recoverable: boolean;
     readonly causeCode?: ErrorCode;
+    readonly rateLimit?: {
+      readonly resource: 'local-browser-sessions' | 'internet-browser-sessions' | 'internet-browser-tabs' |
+        'terminal-sessions' | 'terminal-output-waits' | 'managed-processes' | 'analysis-jobs' |
+        'visual-comparisons' | 'idempotent-operations';
+      readonly scope: 'global' | 'project' | 'session' | 'profile';
+      readonly capacity?: number;
+      readonly recoveryTool: 'browser.list' | 'web.list' | 'web.tabs' | 'terminal.list' | 'terminal.read' |
+        'process.list' | 'analysis.list';
+      readonly action: 'list-and-reuse' | 'immediate-read' | 'wait-and-retry';
+    };
+  };
+}
+
+const RATE_LIMIT_RESOURCES = new Set([
+  'local-browser-sessions', 'internet-browser-sessions', 'internet-browser-tabs', 'terminal-sessions',
+  'terminal-output-waits', 'managed-processes', 'analysis-jobs', 'visual-comparisons', 'idempotent-operations',
+]);
+const RATE_LIMIT_SCOPES = new Set(['global', 'project', 'session', 'profile']);
+const RATE_LIMIT_RECOVERY_TOOLS = new Set([
+  'browser.list', 'web.list', 'web.tabs', 'terminal.list', 'terminal.read', 'process.list', 'analysis.list',
+]);
+const RATE_LIMIT_ACTIONS = new Set(['list-and-reuse', 'immediate-read', 'wait-and-retry']);
+
+function safeRateLimitDetails(value: unknown): NonNullable<ErrorPayload['error']['rateLimit']> | undefined {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const input = value as Record<string, unknown>;
+  if (typeof input['resource'] !== 'string' || !RATE_LIMIT_RESOURCES.has(input['resource']) ||
+      typeof input['scope'] !== 'string' || !RATE_LIMIT_SCOPES.has(input['scope']) ||
+      typeof input['recoveryTool'] !== 'string' || !RATE_LIMIT_RECOVERY_TOOLS.has(input['recoveryTool']) ||
+      typeof input['action'] !== 'string' || !RATE_LIMIT_ACTIONS.has(input['action'])) return undefined;
+  const capacity = input['capacity'];
+  if (capacity !== undefined && (typeof capacity !== 'number' || !Number.isSafeInteger(capacity) || capacity < 1 || capacity > 100_000)) return undefined;
+  return {
+    resource: input['resource'] as NonNullable<ErrorPayload['error']['rateLimit']>['resource'],
+    scope: input['scope'] as NonNullable<ErrorPayload['error']['rateLimit']>['scope'],
+    ...(capacity === undefined ? {} : { capacity }),
+    recoveryTool: input['recoveryTool'] as NonNullable<ErrorPayload['error']['rateLimit']>['recoveryTool'],
+    action: input['action'] as NonNullable<ErrorPayload['error']['rateLimit']>['action'],
   };
 }
 
@@ -617,6 +655,9 @@ export function toErrorPayload(value: unknown): ErrorPayload {
   const causeCode = typeof rawCause === 'string' && (ERROR_CODES as readonly string[]).includes(rawCause)
     ? rawCause as ErrorCode
     : undefined;
+  const rateLimit = code === 'RATE_LIMITED' && isLocalBridgeError(value)
+    ? safeRateLimitDetails(value.details?.['rateLimit'])
+    : undefined;
 
   return {
     ok: false,
@@ -625,6 +666,7 @@ export function toErrorPayload(value: unknown): ErrorPayload {
       message: definition.message,
       recoverable: definition.recoverable,
       ...(causeCode === undefined ? {} : { causeCode }),
+      ...(rateLimit === undefined ? {} : { rateLimit }),
     },
   };
 }

@@ -165,6 +165,54 @@ describe('TunnelSupervisor.connect', () => {
     expect(ctx.onStatusChange).toHaveBeenCalledWith('connected', undefined);
   });
 
+  it('resuelve la espera acotada únicamente al alcanzar connected', async () => {
+    const ctx = makeSupervisor();
+    ctx.supervisor.connect(CONNECT_OPTIONS);
+    const connected = ctx.supervisor.waitForConnection();
+
+    ctx.fakeChild.stdout.emit('data', Buffer.from('🟢 tunnel-client started\n'));
+
+    await expect(connected).resolves.toBeUndefined();
+    expect(ctx.pendingTimerCount()).toBe(0);
+  });
+
+  it('rechaza la espera si el proceso falla antes de conectar', async () => {
+    const ctx = makeSupervisor();
+    ctx.supervisor.connect(CONNECT_OPTIONS);
+    const connected = ctx.supervisor.waitForConnection();
+
+    ctx.fakeChild.emit('exit', 1, null);
+
+    await expect(connected).rejects.toMatchObject({
+      code: 'TUNNEL_CONNECTION_FAILED',
+    });
+  });
+
+  it('cancela la espera y olvida la clave en memoria al desconectar', async () => {
+    const ctx = makeSupervisor();
+    ctx.supervisor.connect(CONNECT_OPTIONS);
+    const connected = ctx.supervisor.waitForConnection();
+
+    ctx.supervisor.disconnect();
+
+    await expect(connected).rejects.toMatchObject({
+      code: 'TUNNEL_CONNECTION_CANCELLED',
+    });
+    expect(ctx.supervisor.getEffectiveGitApprovalMode()).toBeUndefined();
+  });
+
+  it('expira una espera sin atribuir una conexión no observada', async () => {
+    const ctx = makeSupervisor();
+    ctx.supervisor.connect(CONNECT_OPTIONS);
+    const connected = ctx.supervisor.waitForConnection(1_000);
+
+    ctx.fireScheduledTimers();
+
+    await expect(connected).rejects.toMatchObject({
+      code: 'TUNNEL_CONNECTION_TIMEOUT',
+    });
+  });
+
   it('reenvía cada línea de stdout/stderr a onLog', () => {
     const ctx = makeSupervisor();
     ctx.supervisor.connect(CONNECT_OPTIONS);

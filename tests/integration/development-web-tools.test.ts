@@ -19,6 +19,31 @@ afterEach(async () => {
 });
 
 describe("web.* vía broker privado", () => {
+  it("recarga la pestaña actual sin aceptar URL ni omitir operationId", async () => {
+    const calls: Array<{ method: string; params: unknown }> = [];
+    broker = await startDevelopmentBroker({ handler: async (request) => {
+      calls.push(request);
+      return {
+        tabId: "webtab_bbbbbbbbbbbbbbbbbbbbbbbb", title: "Fixture", url: "https://example.com/", state: "ready",
+        openedAt: "2026-09-12T00:00:00.000Z", viewport: { width: 1920, height: 1080, mobile: false },
+        blockedNativeDownloads: 0, blockedFileChoosers: 0, blockedDialogs: 0,
+      };
+    } });
+    harness = await createHarness({ pinProtocol: TARGET_PROTOCOL_REVISION,
+      developmentBrokerEndpoint: broker.endpoint, developmentBrokerToken: broker.token });
+    const result = await callToolJson(harness.client, "web.reload", {
+      sessionId: "websession_aaaaaaaaaaaaaaaaaaaaaaaa", tabId: "webtab_bbbbbbbbbbbbbbbbbbbbbbbb",
+      mode: "ignore-cache", operationId: "reload_web_1",
+    });
+    expect(result.isError).toBe(false);
+    expect(calls).toEqual([expect.objectContaining({ method: "web.reload", params: expect.objectContaining({ mode: "ignore-cache" }) })]);
+    for (const invalid of [
+      { sessionId: "websession_aaaaaaaaaaaaaaaaaaaaaaaa", tabId: "webtab_bbbbbbbbbbbbbbbbbbbbbbbb", mode: "normal" },
+      { sessionId: "websession_aaaaaaaaaaaaaaaaaaaaaaaa", tabId: "webtab_bbbbbbbbbbbbbbbbbbbbbbbb", mode: "normal", operationId: "reload_web_2", url: "https://other.example/" },
+    ]) expect((await harness.client.callTool({ name: "web.reload", arguments: invalid })).isError).toBe(true);
+    expect(calls).toHaveLength(1);
+  });
+
   it("descarga solo por referencia observada y conserva destino relativo", async () => {
     const calls: Array<{ method: string; params: unknown }> = [];
     broker = await startDevelopmentBroker({ handler: async (request) => {

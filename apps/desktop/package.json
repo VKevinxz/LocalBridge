@@ -1,6 +1,6 @@
 {
   "name": "@localbridge/desktop",
-  "version": "1.7.0",
+  "version": "1.8.1",
   "private": true,
   "license": "UNLICENSED",
   "author": "VKevinXZ",
@@ -33,6 +33,7 @@
     "@localbridge/mcp-server": "workspace:^",
     "@localbridge/permissions": "workspace:*",
     "@localbridge/shared": "workspace:*",
+    "@localbridge/validation": "workspace:*",
     "@localbridge/workspace": "workspace:*",
     "pngjs": "7.0.0"
   },

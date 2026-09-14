@@ -149,6 +149,7 @@ function onboardingAt(
 function makeApi(overrides: Partial<DesktopApi> = {}): DesktopApi {
   return {
     cancelAnalysisJob: vi.fn(async () => undefined),
+    cancelTaskBatch: vi.fn(async () => undefined),
     setBrowserViewport: vi.fn(async () => undefined),
     setWebViewport: vi.fn(async () => undefined),
     setBrowserLiveViewerPresentation: vi.fn(async () => undefined),
@@ -263,16 +264,15 @@ function makeApi(overrides: Partial<DesktopApi> = {}): DesktopApi {
     listPendingApprovals: vi.fn(async () => []),
     pickTunnelBinary: vi.fn(async () => undefined),
     pickTunnelProfileDir: vi.fn(async () => undefined),
-    connectTunnel: vi.fn(async () => undefined),
+    connectTunnel: vi.fn(async (input) => ({ connected: true as const, remembered: input.remember })),
     initializeTunnelProfile: vi.fn(async () => undefined),
-    diagnoseTunnel: vi.fn(async () => ({ ok: true, output: 'OK' })),
+    diagnoseTunnel: vi.fn(async () => ({ ok: true, output: 'OK', keyPersistence: 'remembered' as const })),
     disconnectTunnel: vi.fn(async () => undefined),
     getTunnelStatus: vi.fn(async (): Promise<TunnelStatus> => 'disconnected'),
     getEffectiveGitApprovalMode: vi.fn(async () => undefined),
     onTunnelStatusChange: vi.fn(() => () => undefined),
     onTunnelLog: vi.fn(() => () => undefined),
-    getSavedTunnelKey: vi.fn(async () => undefined),
-    saveTunnelKey: vi.fn(async () => undefined),
+    getTunnelKeyState: vi.fn(async () => ({ status: 'absent' as const })),
     forgetTunnelKey: vi.fn(async () => undefined),
     ...overrides,
   };
@@ -785,6 +785,127 @@ describe('renderer desktop — proyectos y confianza v1.0', () => {
     expect(document.body.textContent).toContain('Revisar preparación guiada');
     expect(document.querySelector('.state-danger')?.textContent).toBe('Control total');
   });
+
+  it('distingue en Actividad perfiles revisados y propuestas detectadas', async () => {
+    await boot({
+      listDevelopmentActivity: vi.fn(async () => ({
+        processes: [], browsers: [], applications: [],
+        availability: [{
+          projectId,
+          projectName: 'Producto completo',
+          terminalAvailable: true,
+          reviewed: { processes: 0, validations: 1, browser: 0 },
+          detectedProposal: { state: 'detected-awaiting-review' as const, processes: 1, validations: 2 },
+        }],
+      })),
+    });
+    click('[data-section="activity"]');
+
+    expect(document.body.textContent).toContain('Terminal autorizada disponible independientemente de los perfiles');
+    expect(document.body.textContent).toContain('perfiles revisados disponibles: 0 servidor(es), 1 validación(es)');
+    expect(document.body.textContent).toContain('propuesta detectada pendiente: 1 servidor(es), 2 validación(es)');
+    expect(document.body.textContent).toContain('Una propuesta detectada no es un perfil revisado');
+  });
+
+  it('agrupa lotes, explica esperas y permite cancelar un hijo sin confundirlo con el servidor', async () => {
+    const cancelTaskBatch = vi.fn(async () => undefined);
+    await boot({
+      cancelTaskBatch,
+      listDevelopmentActivity: vi.fn(async () => ({
+        processes: [], browsers: [], applications: [],
+        taskBatchAvailability: { available: true as const },
+        taskBatches: [{
+          batchId: `batch_${'a'.repeat(24)}`, workspaceId: 'ws_demo', operationId: 'batch_ux',
+          state: 'running' as const, revision: 4, createdAt: '2026-09-12T10:00:00.000Z', updatedAt: '2026-09-12T10:00:01.000Z', deliveryMs: 1,
+          children: [{
+            localId: 'visual-check', operationKind: 'artifact.hash' as const, sourcePath: 'reference.png',
+            state: 'waiting_resource' as const, stage: 'waiting_for_analysis_capacity', effectState: 'not_started' as const,
+            coverage: 'unknown' as const,
+            timing: { admissionMs: 3, dependencyWaitMs: 0, capacityWaitMs: 120, lockWaitMs: 0, lockHoldMs: 0, executionMs: 0, persistenceMs: 2, clientWaitMs: 0 as const },
+            resultAvailable: false, resultExpired: false,
+          }],
+        }],
+      })),
+    });
+    click('[data-section="activity"]');
+
+    expect(document.body.textContent).toContain('LOTE');
+    expect(document.body.textContent).toContain('Espera una plaza de análisis disponible');
+    expect(document.body.textContent).toContain('Cancelar paso');
+    click('[data-task-child="visual-check"]');
+    await vi.waitFor(() => expect(cancelTaskBatch).toHaveBeenCalledWith('ws_demo', `batch_${'a'.repeat(24)}`, 'visual-check'));
+  });
+
+  it('contrae la actividad vacía, conserva solo cuatro preferencias generales y restaura el foco', async () => {
+    await boot();
+    click('[data-section="activity"]');
+
+    expect(document.querySelector<HTMLElement>('#activity-runtime-panel')?.hidden).toBe(true);
+    expect(document.querySelector<HTMLElement>('#activity-technical-log-panel')?.hidden).toBe(true);
+    expect(document.querySelector<HTMLElement>('#activity-documents-panel')?.hidden).toBe(true);
+    expect(document.querySelector<HTMLElement>('#activity-audit-panel')?.hidden).toBe(true);
+
+    click('#activity-toggle-runtime');
+    expect(document.querySelector<HTMLElement>('#activity-runtime-panel')?.hidden).toBe(false);
+    expect(document.querySelector('#activity-toggle-runtime')?.getAttribute('aria-expanded')).toBe('true');
+    expect(document.activeElement?.id).toBe('activity-toggle-runtime');
+    const stored = JSON.parse(window.localStorage.getItem('localbridge.activityDisclosure.v1') ?? '{}') as Record<string, unknown>;
+    expect(stored).toEqual({ runtime: true, technicalLog: false, documents: false, audit: false });
+    expect(Object.keys(stored)).toHaveLength(4);
+  });
+
+  it('mantiene visibles las intervenciones y permite contraer todo el detalle', async () => {
+    await boot({
+      listDevelopmentActivity: vi.fn(async () => ({
+        processes: [], applications: [], terminals: [],
+        browsers: [{
+          workspaceId: 'ws_demo', sessionId: `session_${'a'.repeat(24)}`, profile: 'dev', state: 'running' as const,
+          title: 'Acceso requerido', path: '/', startedAt: '2026-09-13T10:00:00.000Z',
+          controlState: 'waiting_for_human' as const, humanReason: 'sign_in' as const,
+        }],
+      })),
+    });
+    click('[data-section="activity"]');
+    expect(document.querySelector<HTMLElement>('#activity-runtime-panel')?.hidden).toBe(false);
+
+    click('#activity-collapse-all');
+    expect(document.querySelector<HTMLElement>('#activity-runtime-panel')?.hidden).toBe(true);
+    const intervention = document.querySelector<HTMLElement>('.activity-intervention');
+    expect(intervention).not.toBeNull();
+    expect(intervention?.closest('[hidden]')).toBeNull();
+    expect(intervention?.textContent).toContain('requieren tu intervención');
+    click('.activity-intervention [data-activity-filter="browsers"]');
+    expect(document.querySelector<HTMLElement>('#activity-runtime-panel')?.hidden).toBe(false);
+    expect(document.querySelector('#activity-filter-browsers')?.getAttribute('aria-pressed')).toBe('true');
+  });
+
+  it('conserva en memoria el plegado de un lote sin persistir su identificador', async () => {
+    const batchId = `batch_${'b'.repeat(24)}`;
+    await boot({
+      listDevelopmentActivity: vi.fn(async () => ({
+        processes: [], browsers: [], applications: [],
+        taskBatches: [{
+          batchId, workspaceId: 'ws_demo', operationId: 'batch_disclosure', state: 'running' as const,
+          revision: 1, createdAt: '2026-09-13T10:00:00.000Z', updatedAt: '2026-09-13T10:00:01.000Z', deliveryMs: 1,
+          children: [{
+            localId: 'read', operationKind: 'artifact.inspect' as const, sourcePath: 'large.bin', state: 'running' as const,
+            stage: 'reading', effectState: 'not_started' as const, coverage: 'unknown' as const,
+            timing: { admissionMs: 1, dependencyWaitMs: 0, capacityWaitMs: 0, lockWaitMs: 0, lockHoldMs: 0, executionMs: 1, persistenceMs: 0, clientWaitMs: 0 as const },
+            resultAvailable: false, resultExpired: false,
+          }],
+        }],
+      })),
+    });
+    click('[data-section="activity"]');
+    const selector = `[data-activity-item-toggle="batch:${batchId}"]`;
+    expect(document.querySelector(selector)?.getAttribute('aria-expanded')).toBe('true');
+    click(selector);
+    expect(document.querySelector(selector)?.getAttribute('aria-expanded')).toBe('false');
+    click('#activity-filter-browsers');
+    click('#activity-filter-all');
+    expect(document.querySelector(selector)?.getAttribute('aria-expanded')).toBe('false');
+    expect(window.localStorage.getItem('localbridge.activityDisclosure.v1') ?? '').not.toContain(batchId);
+  });
 });
 
 describe('renderer desktop — configuración y errores', () => {
@@ -813,7 +934,7 @@ describe('renderer desktop — configuración y errores', () => {
   });
 
   it('presenta el resultado de doctor dentro de la ventana', async () => {
-    const api = await boot({ diagnoseTunnel: vi.fn(async () => ({ ok: true, output: 'CHECK profile_load PASS' })) });
+    const api = await boot({ diagnoseTunnel: vi.fn(async () => ({ ok: true, output: 'CHECK profile_load PASS', keyPersistence: 'remembered' as const })) });
 
     setValue('input[name="tunnelId"]', 'tunnel_0123456789abcdef0123456789abcdef');
     setValue('#api-key', 'clave-de-prueba');
@@ -821,10 +942,8 @@ describe('renderer desktop — configuración y errores', () => {
 
     await vi.waitFor(() => expect(document.querySelector('#diagnostic-output')?.textContent).toContain('profile_load PASS'));
     expect(document.querySelector('#global-feedback')?.textContent).toContain('sin fallos');
-    expect(api.saveTunnelKey).toHaveBeenCalledWith('clave-de-prueba');
-    expect(vi.mocked(api.diagnoseTunnel).mock.invocationCallOrder[0]).toBeLessThan(
-      vi.mocked(api.saveTunnelKey).mock.invocationCallOrder[0] ?? 0,
-    );
+    expect(api.diagnoseTunnel).toHaveBeenCalledWith('clave-de-prueba');
+    expect(document.querySelector<HTMLInputElement>('#api-key')?.value).toBe('');
   });
 
   it('detiene el flujo y explica el ID inválido sin mostrar errores internos', async () => {
@@ -840,12 +959,11 @@ describe('renderer desktop — configuración y errores', () => {
     expect(document.activeElement).toBe(document.querySelector('input[name="tunnelId"]'));
     expect(api.saveSettings).not.toHaveBeenCalled();
     expect(api.diagnoseTunnel).not.toHaveBeenCalled();
-    expect(api.saveTunnelKey).not.toHaveBeenCalled();
   });
 
   it('conserva la clave guardada si una candidata no supera el diagnóstico', async () => {
     const api = await boot({
-      getSavedTunnelKey: vi.fn(async () => 'clave-anterior'),
+      getTunnelKeyState: vi.fn(async () => ({ status: 'available' as const })),
       diagnoseTunnel: vi.fn(async () => ({ ok: false, output: 'HTTP 401 unauthorized' })),
     });
 
@@ -854,9 +972,8 @@ describe('renderer desktop — configuración y errores', () => {
     click('#diagnose-tunnel');
 
     await vi.waitFor(() => expect(api.diagnoseTunnel).toHaveBeenCalledWith('clave-candidata'));
-    expect(api.saveTunnelKey).not.toHaveBeenCalled();
     expect(document.querySelector('#global-feedback')?.textContent).toContain('clave de runtime fue rechazada');
-    expect(document.body.textContent).toContain('se conserva la clave anterior');
+    expect(document.body.textContent).toContain('se conserva la anterior');
   });
 
   it('redacta una excepción técnica del diagnóstico', async () => {
@@ -912,16 +1029,65 @@ describe('renderer desktop — configuración y errores', () => {
     expect(document.querySelector('#global-feedback')?.getAttribute('role')).toBe('alert');
   });
 
-  it('no persiste una clave nueva al iniciar conexión sin diagnóstico previo', async () => {
+  it('recuerda una clave nueva desde el flujo normal después de conectar', async () => {
     const api = await boot();
 
     setValue('input[name="tunnelId"]', 'tunnel_0123456789abcdef0123456789abcdef');
     setValue('#api-key', 'clave-candidata');
     click('#connect-tunnel');
 
-    await vi.waitFor(() => expect(api.connectTunnel).toHaveBeenCalledWith('clave-candidata'));
-    expect(api.saveTunnelKey).not.toHaveBeenCalled();
-    expect(document.querySelector('#global-feedback')?.textContent).toContain('clave sin guardar');
+    await vi.waitFor(() => expect(api.connectTunnel).toHaveBeenCalledWith({ apiKey: 'clave-candidata', remember: true }));
+    expect(document.querySelector('#global-feedback')?.textContent).toContain('guardada y cifrada');
+    expect(document.querySelector<HTMLInputElement>('#api-key')?.value).toBe('');
+  });
+
+  it('reutiliza una clave guardada sin precargar ni devolver el secreto al DOM', async () => {
+    const api = await boot({ getTunnelKeyState: vi.fn(async () => ({ status: 'available' as const })) });
+
+    setValue('input[name="tunnelId"]', 'tunnel_0123456789abcdef0123456789abcdef');
+    expect(document.querySelector<HTMLInputElement>('#api-key')?.value).toBe('');
+    click('#connect-tunnel');
+
+    await vi.waitFor(() => expect(api.connectTunnel).toHaveBeenCalledWith({ remember: true }));
+    expect(document.querySelector('#global-feedback')?.textContent).toContain('guardada y cifrada');
+    expect(document.body.innerHTML).not.toContain('sk-guardada');
+  });
+
+  it('usa una clave nueva de forma efímera y borra el borrador tras conectar', async () => {
+    const api = await boot();
+
+    setValue('input[name="tunnelId"]', 'tunnel_0123456789abcdef0123456789abcdef');
+    setValue('#api-key', 'clave-efimera');
+    click('#remember-tunnel-key');
+    click('#connect-tunnel');
+
+    await vi.waitFor(() => expect(api.connectTunnel).toHaveBeenCalledWith({ apiKey: 'clave-efimera', remember: false }));
+    expect(document.querySelector('#global-feedback')?.textContent).toContain('temporal para esta sesión');
+    expect(document.querySelector<HTMLInputElement>('#api-key')?.value).toBe('');
+    expect(window.localStorage.length).toBe(0);
+  });
+
+  it('mantiene el túnel conectado y explica un fallo de persistencia sin perder el estado anterior', async () => {
+    await boot({
+      getTunnelKeyState: vi.fn(async () => ({ status: 'available' as const })),
+      connectTunnel: vi.fn(async () => ({ connected: true as const, remembered: false, warningCode: 'KEY_STORE_WRITE_FAILED' as const })),
+    });
+
+    setValue('input[name="tunnelId"]', 'tunnel_0123456789abcdef0123456789abcdef');
+    setValue('#api-key', 'clave-nueva');
+    click('#connect-tunnel');
+
+    await vi.waitFor(() => expect(document.querySelector('#global-feedback')?.textContent).toContain('la clave anterior se conserva'));
+    expect(document.querySelector('#global-feedback')?.classList.contains('feedback-warning')).toBe(true);
+    expect(document.body.textContent).toContain('guardada y cifrada por Windows');
+  });
+
+  it('diferencia un almacén ilegible de una clave ausente sin exponer datos', async () => {
+    await boot({ getTunnelKeyState: vi.fn(async () => ({ status: 'unreadable' as const })) });
+
+    expect(document.body.textContent).toContain('clave guardada ilegible');
+    expect(document.querySelector<HTMLInputElement>('#api-key')?.value).toBe('');
+    expect(document.querySelector<HTMLButtonElement>('#forget-key')?.disabled).toBe(false);
   });
 
   it('un log vivo no interrumpe el texto que el usuario está editando', async () => {
@@ -964,7 +1130,7 @@ describe('renderer desktop — onboarding reanudable', () => {
     const api = await boot({
       getSettings: vi.fn(async () => onboardingSettings(2)),
       getOnboardingSnapshot: vi.fn(async () => connection),
-      diagnoseOnboardingConnection: vi.fn(async () => ({ report: { ok: true, output: 'ready' }, snapshot: validated })),
+      diagnoseOnboardingConnection: vi.fn(async () => ({ report: { ok: true, output: 'ready', keyPersistence: 'remembered' as const }, snapshot: validated })),
     }, '#diagnose-tunnel');
 
     expect(document.body.textContent).toContain('Validar el túnel');
@@ -1126,14 +1292,15 @@ describe('renderer desktop — portabilidad y confianza', () => {
     const api = await boot({
       getSettings: vi.fn(async () => ({ ...second, activeConnectionProfileId: 'profile_default0', tunnelId: '' })),
       selectConnectionProfile: vi.fn(async () => second),
-      getSavedTunnelKey: vi.fn(async () => 'clave-trabajo'),
+      getTunnelKeyState: vi.fn(async () => ({ status: 'available' as const })),
     });
     click('#nav-settings');
     click('[data-select-profile="profile_work0000"]');
 
     await vi.waitFor(() => expect(api.selectConnectionProfile).toHaveBeenCalledWith('profile_work0000'));
     await vi.waitFor(() => expect(document.body.textContent).toContain('Clave secreta de runtime de Trabajo'));
-    expect(document.querySelector<HTMLInputElement>('#api-key')?.value).toBe('clave-trabajo');
+    expect(document.querySelector<HTMLInputElement>('#api-key')?.value).toBe('');
+    expect(document.body.textContent).toContain('guardada y cifrada por Windows');
   });
 
   it('prueba un proyecto y presenta checks accionables', async () => {
