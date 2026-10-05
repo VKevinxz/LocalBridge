@@ -52,7 +52,7 @@
     "@localbridge/workspace": "workspace:^",
     "@modelcontextprotocol/client": "^2.0.0",
     "@modelcontextprotocol/server": "^2.0.0",
-    "@types/node": "^22.9.0",
+    "@types/node": "^26.5.1",
     "@types/pngjs": "6.0.5",
     "happy-dom": "^20.11.6",
     "oxlint": "^1.79.0",
